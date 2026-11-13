@@ -55,8 +55,7 @@ impl LocalZmqKernel {
     pub fn spawn(spec: KernelLaunchSpec) -> Self {
         let connection_file = spec.existing_connection_file.clone().or_else(|| {
             Some(
-                jupyter_zmq_client::runtime_dir()
-                    .join(format!("nb-{}.json", uuid::Uuid::new_v4())),
+                crate::paths::runtime_dir().join(format!("nb-{}.json", uuid::Uuid::new_v4())),
             )
         });
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -1030,17 +1029,8 @@ async fn prepare_kernel(
         signature_scheme: "hmac-sha256".to_owned(),
         kernel_name: Some(resolved.kernel_name.clone()),
     };
-    if let Some(parent) = connection_file.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating runtime directory {}", parent.display()))?;
-    }
-    tokio::fs::write(
-        connection_file,
-        serde_json::to_vec(&connection_info).context("serializing connection info")?,
-    )
-    .await
-    .with_context(|| format!("writing connection file {}", connection_file.display()))?;
+    let bytes = serde_json::to_vec(&connection_info).context("serializing connection info")?;
+    write_private(connection_file, &bytes).await?;
 
     let Some(argv0) = resolved.argv.first() else {
         return Err(anyhow!("kernelspec has an empty argv"));
@@ -2010,6 +2000,40 @@ fn subshell_frames(
         frames.push_back(buffer);
     }
     Ok(frames)
+}
+
+/// Write a connection file readable only by its owner, as Jupyter does: it
+/// holds the key that signs messages, so anyone who can read it can run
+/// code in the kernel. Missing directories are created owner-only too.
+async fn write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let hint = "set JUPYTER_RUNTIME_DIR to a writable directory";
+    if let Some(parent) = path.parent() {
+        let mut dirs = tokio::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        dirs.mode(0o700);
+        dirs.create(parent)
+            .await
+            .with_context(|| format!("creating runtime directory {} ({hint})", parent.display()))?;
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .await
+        .with_context(|| format!("writing connection file {} ({hint})", path.display()))?;
+    // `mode` only applies to new files; a restart rewrites the same path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    Ok(())
 }
 
 #[allow(unsafe_code)]

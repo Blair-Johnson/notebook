@@ -6,6 +6,7 @@
 pub mod client;
 pub mod discovery;
 pub mod fake;
+pub mod paths;
 pub mod protocol;
 pub mod router;
 pub mod zmq_actor;
