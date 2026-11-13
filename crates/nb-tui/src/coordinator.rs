@@ -2167,7 +2167,7 @@ impl Coordinator {
             }
         }
         let valid = self.nb_row_cell.as_ref() == Some(&self.selected_cell)
-            && stops.contains(&self.nb_row)
+            && stops.binary_search(&self.nb_row).is_ok()
             && Self::part_of(self.nb_row, outputs_top) == self.selected_part;
         if !valid {
             self.nb_row = match (self.selected_part, outputs_top) {
@@ -2201,32 +2201,46 @@ impl Coordinator {
         };
         let forward = delta > 0;
         let len = self.document.order().len();
-        for _ in 0..delta.unsigned_abs() {
-            let Some((stops, _)) = self.nb_layout(index) else {
-                break;
-            };
-            let next = if forward {
-                stops.iter().copied().find(|&stop| stop > row)
+        let mut remaining = delta.unsigned_abs() as usize;
+        let Some((mut stops, _)) = self.nb_layout(index) else {
+            return;
+        };
+        // Each step moves to the next stop, or into the neighbor cell when
+        // the cell has none left. Within a cell, count stops at once (an
+        // output in full view can have 100k of them).
+        while remaining > 0 {
+            if forward {
+                let ahead = stops.partition_point(|&stop| stop <= row);
+                let available = stops.len() - ahead;
+                if remaining <= available {
+                    row = stops[ahead + remaining - 1];
+                    break;
+                }
+                remaining -= available;
+                if available > 0 {
+                    row = stops[stops.len() - 1];
+                }
             } else {
-                stops.iter().rev().copied().find(|&stop| stop < row)
-            };
-            if let Some(stop) = next {
-                row = stop;
-                continue;
+                let available = stops.partition_point(|&stop| stop < row);
+                if remaining <= available {
+                    row = stops[available - remaining];
+                    break;
+                }
+                remaining -= available;
+                row = stops[0].min(row);
             }
             let neighbor = if forward {
                 (index + 1 < len).then_some(index + 1)
             } else {
                 index.checked_sub(1)
             };
-            let Some(neighbor) = neighbor else {
+            let Some((next_stops, _)) = neighbor.and_then(|next| self.nb_layout(next)) else {
                 break;
             };
-            let Some((stops, _)) = self.nb_layout(neighbor) else {
-                break;
-            };
-            index = neighbor;
+            index = neighbor.expect("checked above");
+            stops = next_stops;
             row = if forward { stops[0] } else { stops[stops.len() - 1] };
+            remaining -= 1;
         }
         self.nb_set(index, row);
     }

@@ -234,3 +234,58 @@ fn entering_and_leaving_a_cell_mid_notebook_keeps_the_view() {
     press(&mut c, KeyCode::Esc);
     assert_eq!(c.scroll_row, scroll);
 }
+
+fn screen(c: &mut Coordinator) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+    terminal.draw(|frame| c.draw(frame)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// A counted move lands where that many single steps would, across
+/// sources, long outputs and cell boundaries, in both directions.
+#[test]
+fn counted_moves_match_single_steps() {
+    let long = lines(12, "out");
+    let cells: &[(&str, &str)] = &[
+        ("a = 1\nb = 2", &long),
+        ("c = 3", ""),
+        ("d = 4\ne = 5\nf = 6", "x\ny\n"),
+        ("g = 7", ""),
+    ];
+    let full = |c: &mut Coordinator| {
+        c.settings.set_value(
+            &nb_sdk::SettingId("display.output_default_view".into()),
+            nb_sdk::SettingValue::Text("full".into()),
+            &c.registry,
+        );
+        draw(c);
+    };
+    let counts = [1, 2, 3, 5, 8, 13, 21, 34];
+    for (count, back) in counts.into_iter().flat_map(|n| [(n, false), (n, true)]) {
+        let (step, motion) = if back { ("k", "k") } else { ("j", "j") };
+        let mut counted = coordinator(cells);
+        let mut single = coordinator(cells);
+        full(&mut counted);
+        full(&mut single);
+        if back {
+            keys(&mut counted, "G");
+            keys(&mut single, "G");
+        }
+        keys(&mut counted, &format!("{count}{motion}"));
+        for _ in 0..count {
+            keys(&mut single, step);
+        }
+        let position = |c: &Coordinator| c.document.position_of(&c.selected_cell);
+        assert_eq!(position(&counted), position(&single), "{count}{motion}");
+        assert_eq!(counted.selected_part, single.selected_part, "{count}{motion}");
+        assert_eq!(screen(&mut counted), screen(&mut single), "{count}{motion}");
+    }
+}
