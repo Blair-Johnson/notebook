@@ -141,6 +141,7 @@ pub fn render_app(
         row_hits: Vec::new(),
         scrollbar: None,
         cursor: None,
+        text_x: areas.notebook_area.x,
     };
 
     let cell_cursor = cells::draw_cells(

@@ -154,6 +154,12 @@ impl CellCtx<'_> {
         // Source rows.
         let lines = &self.cached.wrapped_source;
         let segments = editing_mode.map(|_| self.segments());
+        // Raw source rows map 1:1 onto wrap segments; rendered markdown doesn't.
+        let hit_segments = segments
+            .clone()
+            .or_else(|| (self.cell.kind != CellKind::Markdown).then(|| self.segments()))
+            .filter(|segs| segs.len() == lines.len());
+        geometry.text_x = self.area.x + GUTTER_COLS;
         let mut cursor = None;
         for (index, line) in lines.iter().enumerate() {
             let Some(y) = self.screen_y(1 + index as u32) else {
@@ -188,7 +194,10 @@ impl CellCtx<'_> {
                 target: HitTarget::CellSource {
                     cell_id: self.cell.id.clone(),
                     line: logical,
-                    char_col: 0,
+                    char_col: hit_segments
+                        .as_ref()
+                        .and_then(|segs| segs.get(index))
+                        .map_or(0, |seg| seg.1),
                 },
             });
         }

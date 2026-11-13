@@ -124,7 +124,22 @@ impl Plugin for BuiltinsPlugin {
             false,
             None,
         );
-        context(reg, "cell.insert", "Cell Insert Mode", &[], true, None);
+        context(
+            reg,
+            "text.insert",
+            "Text Entry Editing Keys",
+            &[],
+            true,
+            None,
+        );
+        context(
+            reg,
+            "cell.insert",
+            "Cell Insert Mode",
+            &["text.insert"],
+            true,
+            None,
+        );
         context(
             reg,
             "output.stream",
@@ -141,7 +156,14 @@ impl Plugin for BuiltinsPlugin {
             false,
             None,
         );
-        context(reg, "pdb.input", "PDB Debugger Input", &[], true, None);
+        context(
+            reg,
+            "pdb.input",
+            "PDB Debugger Input",
+            &["text.insert"],
+            true,
+            None,
+        );
         context(
             reg,
             "modal.generic",
@@ -404,6 +426,14 @@ impl Plugin for BuiltinsPlugin {
             "Delete character",
             false,
         );
+        for (order, id, title) in [
+            (81, "edit.backspace", "Delete character before cursor"),
+            (82, "edit.delete_word_back", "Delete word before cursor"),
+            (83, "edit.delete_to_line_start", "Delete to start of line"),
+            (84, "edit.delete_to_line_end", "Delete to end of line"),
+        ] {
+            action(reg, id, ActionKind::Command, "Editing", order, title, false);
+        }
         action(
             reg,
             "edit.replace_char",

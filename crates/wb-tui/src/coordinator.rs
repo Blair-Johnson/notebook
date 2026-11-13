@@ -453,24 +453,67 @@ impl Coordinator {
         let Some(target) = self.last_geometry.hit_at(mouse.column, mouse.row).cloned() else {
             return;
         };
+        if matches!(self.focus.top(), FocusLayer::Modal(_)) {
+            return;
+        }
+        self.follow_focus = true;
         match target {
-            HitTarget::CellHeader { cell_id } => self.select_cell(cell_id),
+            HitTarget::CellHeader { cell_id } => {
+                self.leave_cell_layers();
+                self.select_cell(cell_id);
+            }
             HitTarget::CellSource {
                 cell_id,
                 line,
                 char_col,
             } => {
-                self.select_cell(cell_id.clone());
+                // The cursor always follows the click: one cell is focused.
+                let editing_here = matches!(
+                    self.focus.top(),
+                    FocusLayer::CellEdit { cell_id: current, .. } if current == &cell_id
+                );
+                if !editing_here {
+                    self.leave_cell_layers();
+                    self.select_cell(cell_id.clone());
+                    self.begin_cell_edit(CellMode::Normal);
+                } else if let FocusLayer::CellEdit {
+                    mode: CellMode::Visual(_),
+                    ..
+                } = self.focus.top()
+                {
+                    self.set_cell_mode(CellMode::Normal);
+                }
                 if let Some(cell) = self.document.cell_mut(&cell_id) {
-                    cell.buffer.set_cursor(CursorPos {
-                        row: line,
-                        col: char_col,
-                    });
+                    // `char_col` is where this wrapped row starts; walk the
+                    // clicked display offset across the row's characters.
+                    let dx = usize::from(mouse.column.saturating_sub(self.last_geometry.text_x));
+                    let mut col = char_col;
+                    let mut used = 0usize;
+                    for ch in cell.buffer.line(line).unwrap_or("").chars().skip(char_col) {
+                        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if used + width > dx {
+                            break;
+                        }
+                        used += width;
+                        col += 1;
+                    }
+                    let insert = matches!(
+                        self.focus.top(),
+                        FocusLayer::CellEdit {
+                            mode: CellMode::Insert,
+                            ..
+                        }
+                    );
+                    let len = cell.buffer.line_char_len(line);
+                    let col = if insert { col } else { col.min(len.saturating_sub(1)) };
+                    cell.buffer.clear_selection();
+                    cell.buffer.set_cursor(CursorPos { row: line, col });
                 }
             }
             HitTarget::CellOutput {
                 cell_id, output_id, ..
             } => {
+                self.leave_cell_layers();
                 self.select_cell(cell_id.clone());
                 if let Some(view) = self.output_views.get(&output_id) {
                     if let Some(context) = view.key_context() {
@@ -1185,6 +1228,13 @@ impl Coordinator {
                 self.send_command(KernelCmd::Interrupt);
                 self.pop_pdb();
             }
+            ResolvedInput::Command { id, .. } if is_text_edit_command(id.0.as_ref()) => {
+                pdb.composer.checkpoint();
+                apply_text_edit(&mut pdb.composer, id.0.as_ref());
+            }
+            ResolvedInput::Move { motion, .. } => {
+                apply_text_motion(&mut pdb.composer, motion.0.as_ref());
+            }
             _ => {}
         }
     }
@@ -1421,6 +1471,15 @@ impl Coordinator {
             }
             ResolvedInput::RollbackChars(count) => {
                 self.mutate_cell_buffer(cell_id, |buffer| buffer.rollback_chars(count));
+            }
+            ResolvedInput::Move { motion, count } => {
+                self.move_cell_cursor(cell_id, motion.0.as_ref(), count);
+                self.completion = None;
+            }
+            ResolvedInput::Command { id, .. } if is_text_edit_command(id.0.as_ref()) => {
+                let id = id.0.to_string();
+                self.mutate_cell_buffer(cell_id, |buffer| apply_text_edit(buffer, &id));
+                self.refilter_completion(cell_id);
             }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "edit.newline" => {
                 self.mutate_cell_buffer(cell_id, |buffer| buffer.insert_newline());
@@ -1884,6 +1943,17 @@ impl Coordinator {
         let id = self.selected_cell.clone();
         self.cell_baselines
             .insert(id.clone(), self.cell_source(&id));
+        // Vim normal mode never rests past the last character of a line.
+        if matches!(mode, CellMode::Normal) {
+            if let Some(cell) = self.document.cell_mut(&id) {
+                let cursor = cell.buffer.cursor();
+                let len = cell.buffer.line_char_len(cursor.row);
+                cell.buffer.set_cursor(CursorPos {
+                    row: cursor.row,
+                    col: cursor.col.min(len.saturating_sub(1)),
+                });
+            }
+        }
         self.focus.push(FocusLayer::CellEdit {
             cell_id: id,
             mode,
@@ -1897,6 +1967,27 @@ impl Coordinator {
             });
     }
 
+    /// Commit and close any cell edit or output focus, returning to the
+    /// notebook level (modals and pdb are left alone).
+    fn leave_cell_layers(&mut self) {
+        loop {
+            match self.focus.top().clone() {
+                FocusLayer::CellEdit { cell_id, .. } => {
+                    if let Some(cell) = self.document.cell_mut(&cell_id) {
+                        cell.buffer.clear_selection();
+                    }
+                    self.commit_cell(&cell_id);
+                    self.focus.pop();
+                }
+                FocusLayer::OutputFocus { .. } => {
+                    self.focus.pop();
+                }
+                _ => break,
+            }
+        }
+        self.completion = None;
+        self.signature = None;
+    }
     fn set_cell_mode(&mut self, mode: CellMode) {
         if let FocusLayer::CellEdit { mode: current, .. } = self.focus.top_mut() {
             *current = mode;
@@ -1957,7 +2048,8 @@ impl Coordinator {
         }
     }
 
-    fn after_cell_insert(&mut self, cell_id: &CellId) {
+    /// Narrow (or close) the open completion list after the text changed.
+    fn refilter_completion(&mut self, cell_id: &CellId) {
         let source = self.cell_source(cell_id);
         if let Some(completion) = self.completion.as_mut() {
             let cursor = self
@@ -1968,6 +2060,11 @@ impl Coordinator {
                 self.completion = None;
             }
         }
+    }
+
+    fn after_cell_insert(&mut self, cell_id: &CellId) {
+        self.refilter_completion(cell_id);
+        let source = self.cell_source(cell_id);
         if self.settings.snapshot().core.complete_on_dot && source.ends_with('.') {
             self.request_completion(cell_id);
         }
@@ -2900,6 +2997,93 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+/// Editing commands bound in `text.insert`, shared by every text entry.
+fn is_text_edit_command(id: &str) -> bool {
+    matches!(
+        id,
+        "edit.backspace"
+            | "edit.delete_char"
+            | "edit.delete_word_back"
+            | "edit.delete_to_line_start"
+            | "edit.delete_to_line_end"
+    )
+}
+
+/// Apply one `text.insert` editing command at the cursor.
+fn apply_text_edit(buffer: &mut wb_core::TextBuffer, id: &str) {
+    let cursor = buffer.cursor();
+    match id {
+        "edit.backspace" => buffer.delete_char_backward(),
+        "edit.delete_char" => buffer.delete_char_forward(),
+        "edit.delete_word_back" => {
+            // At a line start this joins with the previous line, like readline.
+            if cursor.col == 0 {
+                buffer.delete_char_backward();
+            } else {
+                let back = buffer.word_back(1);
+                let target = if back.row == cursor.row {
+                    back
+                } else {
+                    CursorPos { row: cursor.row, col: 0 }
+                };
+                buffer.delete_span(target, cursor);
+            }
+        }
+        "edit.delete_to_line_start" => {
+            let start = CursorPos { row: cursor.row, col: 0 };
+            if start == cursor {
+                buffer.delete_char_backward();
+            } else {
+                buffer.delete_span(start, cursor);
+            }
+        }
+        "edit.delete_to_line_end" => {
+            let end = CursorPos {
+                row: cursor.row,
+                col: buffer.line_char_len(cursor.row),
+            };
+            if end == cursor {
+                buffer.delete_char_forward();
+            } else {
+                buffer.delete_span(cursor, end);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Insert-mode cursor movement for plain text entries (pdb input).
+fn apply_text_motion(buffer: &mut wb_core::TextBuffer, motion: &str) {
+    let cursor = buffer.cursor();
+    let last_row = buffer.line_count().saturating_sub(1);
+    let target = match motion {
+        "motion.left" => CursorPos {
+            row: cursor.row,
+            col: cursor.col.saturating_sub(1),
+        },
+        "motion.right" => CursorPos {
+            row: cursor.row,
+            col: cursor.col + 1,
+        },
+        "motion.up" => CursorPos {
+            row: cursor.row.saturating_sub(1),
+            col: cursor.col,
+        },
+        "motion.down" => CursorPos {
+            row: (cursor.row + 1).min(last_row),
+            col: cursor.col,
+        },
+        "motion.line_start" => CursorPos { row: cursor.row, col: 0 },
+        "motion.line_end" => CursorPos {
+            row: cursor.row,
+            col: buffer.line_char_len(cursor.row),
+        },
+        "motion.word_back" => buffer.word_back(1),
+        "motion.word_next" => buffer.word_next(1),
+        _ => cursor,
+    };
+    buffer.set_cursor(target);
+}
 fn cursor_at_char_offset(buffer: &wb_core::TextBuffer, offset: usize) -> CursorPos {
     let mut remaining = offset;
     for (row, line) in buffer.as_str().split('\n').enumerate() {

@@ -48,6 +48,9 @@ pub struct FrameGeometry {
     pub scrollbar: Option<ScrollbarGeometry>,
     /// Screen cell of the edit cursor, when a cell or input is being edited.
     pub cursor: Option<(u16, u16)>,
+    /// Screen x where cell text begins (right of the gutter); clicks map
+    /// `x - text_x` display columns onto a `CellSource` row's characters.
+    pub text_x: u16,
 }
 
 impl FrameGeometry {

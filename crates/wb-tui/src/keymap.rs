@@ -233,6 +233,11 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<Key> {
 
     match event.code {
         KeyCode::Char(mut c) => {
+            // Legacy terminals send ctrl+/ as 0x1f, which crossterm reports
+            // as ctrl+7 (or a bare unit-separator char); ctrl+_ is the same byte.
+            if c == '\u{1f}' || (control && matches!(c, '7' | '_' | '/')) {
+                return Some(Key::Ctrl('/'));
+            }
             if c.is_ascii_control() && !control && !alt {
                 if (1..=26).contains(&(c as u8)) {
                     return Some(Key::Ctrl((b'a' + c as u8 - 1) as char));
@@ -261,6 +266,9 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<Key> {
         KeyCode::Esc => modified_special('\u{1b}', control, alt).or(Some(Key::Esc)),
         KeyCode::Left if !control && !alt => Some(Key::Left),
         KeyCode::Right if !control && !alt => Some(Key::Right),
+        // Word-wise arrows map onto the readline keys (alt+b / alt+f).
+        KeyCode::Left => Some(Key::Alt('b')),
+        KeyCode::Right => Some(Key::Alt('f')),
         KeyCode::Up if !control && !alt => Some(Key::Up),
         KeyCode::Down if !control && !alt => Some(Key::Down),
         KeyCode::Home if !control && !alt => Some(Key::Home),
