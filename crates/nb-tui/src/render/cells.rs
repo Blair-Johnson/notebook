@@ -19,7 +19,7 @@ use super::style::mode_color;
 use super::{AppView, RunState};
 use crate::focus::{CellMode, CellPart, FocusLayer};
 use crate::layout::{
-    CachedCellLayout, CardRows, GUTTER_COLS, LayoutCache, OutputSection, SectionKind, output_cap,
+    CachedCellLayout, CardRows, GUTTER_COLS, LayoutCache, OutputSection, SectionKind,
     output_sections,
 };
 use crate::vim::{OutputText, segment_of, wrap_segments};
@@ -579,20 +579,21 @@ impl CellCtx<'_> {
             return self.draw_output_text(frame, out, mode, top + 1, region, look, geometry);
         }
 
-        let cap = output_cap(display, self.view.settings.max_output_rows);
         let viewport_end = self.view.scroll_row + u32::from(self.area.height);
         let mut local = top;
         let mut text_row = 0u32;
         for section in &sections {
+            // Measured when the layout was cached (keyed by the outputs'
+            // revisions): drawing reads the rows instead of measuring again.
             let measured: Vec<(u32, u32)> = section
                 .items
                 .iter()
-                .map(|output| match output_views.get_mut(&output.id) {
-                    Some(view) => {
-                        let metrics = view.measure(output, self.text_w, theme, cap);
-                        (metrics.shown_rows.max(1), metrics.total_rows)
-                    }
-                    None => (1, 1),
+                .map(|output| {
+                    self.cached
+                        .output_rows
+                        .iter()
+                        .find(|rows| rows.output_id == output.id)
+                        .map_or((1, 1), |rows| (rows.shown.max(1), rows.total))
                 })
                 .collect();
             if let Some(y) = self.screen_y(local) {
