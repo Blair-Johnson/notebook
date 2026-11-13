@@ -3191,6 +3191,8 @@ fn is_text_edit_command(id: &str) -> bool {
             | "edit.delete_word_back"
             | "edit.delete_to_line_start"
             | "edit.delete_to_line_end"
+            | "edit.indent"
+            | "edit.dedent"
     )
 }
 
@@ -3220,6 +3222,28 @@ fn apply_text_edit(buffer: &mut wb_core::TextBuffer, id: &str) {
                 buffer.delete_char_backward();
             } else {
                 buffer.delete_span(start, cursor);
+            }
+        }
+        // Tab: spaces up to the next 4-column stop (mixing literal tabs
+        // into space-indented Python raises TabError).
+        "edit.indent" => {
+            let width = 4 - cursor.col % 4;
+            buffer.insert_str(&" ".repeat(width));
+        }
+        // Shift+Tab: remove up to one indent level from the line's start.
+        "edit.dedent" => {
+            let line = buffer.line(cursor.row).unwrap_or("");
+            let remove = line.chars().take(4).take_while(|c| *c == ' ').count();
+            let remove = if remove == 0 && line.starts_with('\t') { 1 } else { remove };
+            if remove > 0 {
+                buffer.delete_span(
+                    CursorPos { row: cursor.row, col: 0 },
+                    CursorPos { row: cursor.row, col: remove },
+                );
+                buffer.set_cursor(CursorPos {
+                    row: cursor.row,
+                    col: cursor.col.saturating_sub(remove),
+                });
             }
         }
         "edit.delete_to_line_end" => {

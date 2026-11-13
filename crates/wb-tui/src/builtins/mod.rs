@@ -456,6 +456,8 @@ impl Plugin for BuiltinsPlugin {
             (82, "edit.delete_word_back", "Delete word before cursor"),
             (83, "edit.delete_to_line_start", "Delete to start of line"),
             (84, "edit.delete_to_line_end", "Delete to end of line"),
+            (101, "edit.indent", "Indent (insert spaces to the next tab stop)"),
+            (102, "edit.dedent", "Dedent the current line"),
         ] {
             action(reg, id, ActionKind::Command, "Editing", order, title, false);
         }

@@ -238,6 +238,10 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<Key> {
             if c == '\u{1f}' || (control && matches!(c, '7' | '_' | '/')) {
                 return Some(Key::Ctrl('/'));
             }
+            // Many terminals send ctrl+space as NUL.
+            if c == '\0' {
+                return Some(Key::Ctrl(' '));
+            }
             if c.is_ascii_control() && !control && !alt {
                 if (1..=26).contains(&(c as u8)) {
                     return Some(Key::Ctrl((b'a' + c as u8 - 1) as char));

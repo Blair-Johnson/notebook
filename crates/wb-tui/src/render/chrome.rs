@@ -134,6 +134,7 @@ fn hint_actions(
         } => &[
             ("focus.up", "normal"),
             ("edit.newline", "newline"),
+            ("edit.indent", "indent"),
             ("intel.complete", "complete"),
             ("cell.toggle_expand_split", "expand"),
         ],

@@ -174,7 +174,9 @@
 [keys."cell.insert"]
 "focus.up" = ["esc", "j j"]
 "edit.newline" = ["enter", "ctrl+j", "alt+enter"]
-"intel.complete" = ["tab"]
+"edit.indent" = ["tab"]
+"edit.dedent" = ["backtab"]
+"intel.complete" = ["ctrl+space"]
 "cell.toggle_expand_split" = ["ctrl+o"]
 
 [keys."pdb.input"]

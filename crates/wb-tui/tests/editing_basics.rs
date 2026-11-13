@@ -248,3 +248,19 @@ fn one_undo_reverts_a_whole_insert_session() {
     keys(&mut c, "u");
     assert_eq!(source(&c, 0), "base");
 }
+
+#[test]
+fn tab_indents_and_shift_tab_dedents_in_insert_mode() {
+    let mut c = coordinator(&["x"]);
+    keys(&mut c, "i");
+    keys(&mut c, "I");
+    press(&mut c, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(source(&c, 0), "    x");
+    keys(&mut c, "ab");
+    press(&mut c, KeyCode::Tab, KeyModifiers::NONE);
+    // From column 6 the next stop is column 8.
+    assert_eq!(source(&c, 0), "    ab  x");
+    press(&mut c, KeyCode::BackTab, KeyModifiers::SHIFT);
+    assert_eq!(source(&c, 0), "ab  x");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
+}
