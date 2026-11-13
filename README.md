@@ -2,7 +2,7 @@
 
 ![nb showing a notebook with code cells and their outputs](docs/images/screenshot.png)
 
-Jupyter notebooks in the terminal, with vim keys.
+Jupyter notebooks in the terminal, with vim motions.
 
 ## Install
 
