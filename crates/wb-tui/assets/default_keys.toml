@@ -39,7 +39,10 @@
 "cell.append_end" = ["A"]
 "cell.insert_below" = ["a", "o"]
 "cell.insert_above" = ["b", "O"]
-"cell.run" = ["enter", "space"]
+"cell.run" = ["enter"]
+# On a selected output: cycle preview / full / hidden. On a source: run.
+"output.cycle_view" = ["space"]
+"output.next_tab" = ["tab"]
 "cell.run_and_advance" = ["r"]
 "cell.run_all" = ["X"]
 "cell.toggle_kind" = ["t"]
@@ -124,6 +127,7 @@
 # Outputs are read-only text: every motion, visual mode, and yank.
 [keys."output.normal"]
 "output.jump" = ["enter"]
+"output.next_tab" = ["tab"]
 
 [keys."output.visual"]
 "visual.swap_ends" = ["o"]

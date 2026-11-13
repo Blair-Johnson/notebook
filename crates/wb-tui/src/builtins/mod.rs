@@ -474,6 +474,8 @@ impl Plugin for BuiltinsPlugin {
             (96, "edit.open_above", "Open line above (O)"),
             (97, "visual.swap_ends", "Swap selection ends (o)"),
             (98, "output.jump", "Jump to the traceback line's cell"),
+            (99, "output.cycle_view", "Cycle output view: preview, full, hidden (runs a source)"),
+            (100, "output.next_tab", "Switch the stdout / stderr tab"),
         ] {
             action(reg, id, ActionKind::Command, "Editing", order, title, false);
         }

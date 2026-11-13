@@ -332,7 +332,8 @@ impl Coordinator {
                             let row = output_region.map_or(0, |(cursor_row, scroll, _)| {
                                 cursor_row.saturating_sub(scroll)
                             });
-                            (outputs_top + row, outputs_top + row + 1)
+                            // The text starts below the block's header divider.
+                            (outputs_top + 1 + row, outputs_top + row + 2)
                         }
                         _ if self.selected_part == CellPart::Output => (
                             outputs_top,
@@ -367,6 +368,7 @@ impl Coordinator {
             .map_or(1, |cached| cached.wrapped_source.len() as u32);
         let region = CardRows::from_total(heights.height(index), source_rows)
             .outputs
+            .saturating_sub(1)
             .max(1);
         let segments = vim::wrap_segments(out.buffer.as_str(), text_w);
         let cursor_row = vim::segment_of(&segments, out.buffer.cursor()) as u32;
@@ -1476,6 +1478,28 @@ impl Coordinator {
                 self.run_selected();
                 Effect::None
             }
+            // Space: on an output, cycle preview → full → hidden; on a
+            // cell's source, run it.
+            "output.next_tab" => {
+                if self.selected_part == CellPart::Output {
+                    self.next_stream_tab(&self.selected_cell.clone());
+                }
+                Effect::None
+            }
+            "output.cycle_view" => {
+                if self.selected_part == CellPart::Output {
+                    let id = self.selected_cell.clone();
+                    if let Some(cell) = self.document.cell_mut(&id) {
+                        let next = cell.output_display().next();
+                        cell.set_output_display(next);
+                        self.document.dirty_source = true;
+                    }
+                    self.follow_focus = true;
+                } else {
+                    self.run_selected();
+                }
+                Effect::None
+            }
             "cell.run_and_advance" => {
                 self.run_selected();
                 // Advance to the next cell, past this cell's outputs.
@@ -1788,6 +1812,11 @@ impl Coordinator {
                     }
                 }
                 "output.jump" => self.jump_from_output(),
+                "output.next_tab" => {
+                    if let Some(cell_id) = self.output_text.as_ref().map(|out| out.cell_id.clone()) {
+                        self.next_stream_tab(&cell_id);
+                    }
+                }
                 id => {
                     let id = id.to_string();
                     self.with_output_vim(|vim, buf| {
@@ -1887,7 +1916,7 @@ impl Coordinator {
             .cached(id)
             .map_or(1, |cached| cached.wrapped_source.len() as u32);
         let rows = CardRows::from_total(total as u32, source);
-        let source_rows = rows.divider() as usize;
+        let source_rows = rows.outputs_top() as usize;
         match part {
             CellPart::Source => source_rows.min(total),
             CellPart::Output => total.saturating_sub(source_rows).max(1),
@@ -2400,7 +2429,8 @@ impl Coordinator {
         self.update_views_for_cell(&cell_id);
     }
 
-    fn remount_output_views(&mut self) {
+    /// Mount a view for every output (call after changing outputs directly).
+    pub fn remount_output_views(&mut self) {
         self.output_views.clear();
         let outputs = self
             .document
@@ -2544,6 +2574,22 @@ impl Coordinator {
         self.remount_output_views();
     }
 
+    /// Switch a cell's stream section between stdout and stderr.
+    fn next_stream_tab(&mut self, cell_id: &CellId) {
+        let Some(cell) = self.document.cell_mut(cell_id) else {
+            return;
+        };
+        if !crate::layout::has_stream_tabs(cell) {
+            return;
+        }
+        cell.stream_tab = match cell.stream_tab {
+            StreamKind::Stdout => StreamKind::Stderr,
+            StreamKind::Stderr => StreamKind::Stdout,
+        };
+        cell.bump_chrome();
+        self.follow_focus = true;
+    }
+
     /// Enter a cell's outputs as read-only text in normal mode.
     fn enter_output(&mut self, cell_id: CellId) {
         let Some(cell) = self.document.cell(&cell_id) else {
@@ -2553,6 +2599,13 @@ impl Coordinator {
             return;
         }
         let text = vim::OutputText::new(cell);
+        // Reading a hidden output shows it first.
+        if let Some(cell) = self.document.cell_mut(&cell_id) {
+            if cell.output_display() == wb_core::OutputDisplay::Hidden {
+                cell.set_output_display(wb_core::OutputDisplay::Preview);
+                self.document.dirty_source = true;
+            }
+        }
         self.leave_cell_layers();
         self.selected_cell = cell_id.clone();
         self.selected_part = CellPart::Output;

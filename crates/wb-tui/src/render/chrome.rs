@@ -96,8 +96,19 @@ pub fn draw_top_bar(
 
 /// Curated key hints per focus level: (action id, label). Keys come from the
 /// live keymap, so rebinding an action updates its hint.
-fn hint_actions(focus: &FocusLayer) -> &'static [(&'static str, &'static str)] {
+fn hint_actions(
+    focus: &FocusLayer,
+    part: crate::focus::CellPart,
+) -> &'static [(&'static str, &'static str)] {
     match focus {
+        FocusLayer::NotebookNormal if part == crate::focus::CellPart::Output => &[
+            ("cell.enter_normal", "read"),
+            ("output.cycle_view", "preview/full/hide"),
+            ("output.next_tab", "stdout/stderr"),
+            ("op.yank", "copy"),
+            ("op.delete", "clear"),
+            ("cell.run", "run"),
+        ],
         FocusLayer::NotebookNormal => &[
             ("cell.enter_normal", "edit"),
             ("cell.run", "run"),
@@ -131,8 +142,10 @@ fn hint_actions(focus: &FocusLayer) -> &'static [(&'static str, &'static str)] {
             ..
         } => &[("op.delete", "delete"), ("op.yank", "yank"), ("focus.up", "cancel")],
         FocusLayer::OutputFocus { .. } => &[
-            ("motion.down", "down"),
-            ("motion.up", "up"),
+            ("visual.char", "select"),
+            ("op.yank", "yank"),
+            ("output.next_tab", "stdout/stderr"),
+            ("output.jump", "go to line"),
             ("focus.up", "back"),
         ],
         FocusLayer::PdbInput => &[
@@ -266,7 +279,7 @@ pub fn draw_status_bar(
                 .collect(),
             other => {
                 let context = other.key_context();
-                hint_actions(other)
+                hint_actions(other, view.selected_part)
                     .iter()
                     .filter_map(|(action, label)| {
                         let keys = keymap.keys_for(&context, action);

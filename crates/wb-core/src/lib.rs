@@ -14,7 +14,7 @@ pub mod ops;
 pub mod output;
 
 pub use buffer::{BufferSnapshot, CursorPos, Selection, TextBuffer, VisualKind};
-pub use cell::{Cell, CellKind, CellRevisions};
+pub use cell::{Cell, CellKind, CellRevisions, OutputDisplay};
 pub use codec::{CoreError, NotebookFormat};
 pub use document::{Document, ExternalReloadOutcome, FormatBacking};
 pub use motion::{Motion, MotionCtx, MotionKind, MotionTarget, Span, TextObject};

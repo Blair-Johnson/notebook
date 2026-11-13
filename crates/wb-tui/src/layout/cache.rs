@@ -1,7 +1,7 @@
 //! `CellId`-keyed layout cache with 64 MiB LRU eviction, idle resize warming, and per-line syntax cache.
 
 use crate::builtins::markdown::render_markdown_cell;
-use crate::layout::CardRows;
+use crate::layout::{CardRows, output_cap, output_sections};
 use crate::layout::fenwick::FenwickTree;
 use ratatui::{
     style::{Color, Style},
@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 use unicode_width::UnicodeWidthChar;
-use wb_core::{Cell, CellId, CellKind, CellRevisions, Document, OutputId};
+use wb_core::{Cell, CellId, CellKind, CellRevisions, Document, OutputDisplay, OutputId};
 use wb_sdk::{OutputView, Theme};
 
 pub const RENDER_CACHE_BUDGET_BYTES: usize = 64 << 20;
@@ -105,13 +105,17 @@ impl LayoutCache {
         if cell.collapsed {
             return CardRows { source: 1, outputs: 0 }.total();
         }
+        let outputs = match (cell.outputs.len(), cell.output_display()) {
+            (0, _) => 0,
+            (_, OutputDisplay::Hidden) => 1,
+            _ => output_sections(cell)
+                .iter()
+                .map(|section| 1 + section.items.len() as u32 * u32::from(max_output_rows.max(1)))
+                .sum(),
+        };
         CardRows {
             source: cell.buffer.line_count() as u32,
-            outputs: cell
-                .outputs
-                .iter()
-                .map(|_| u32::from(max_output_rows.max(1)))
-                .sum::<u32>(),
+            outputs,
         }
         .total()
     }
@@ -187,17 +191,27 @@ impl LayoutCache {
         let rows = if cell.collapsed {
             CardRows { source: 1, outputs: 0 }
         } else {
-            let outputs = cell
-                .outputs
-                .iter()
-                .map(|output| {
-                    output_views.get_mut(&output.id).map_or(1, |view| {
-                        view.measure(output, width, theme, Some(max_output_rows))
-                            .shown_rows
-                            .max(1)
+            let display = cell.output_display();
+            let cap = output_cap(display, max_output_rows);
+            let outputs = match (cell.outputs.len(), display) {
+                (0, _) => 0,
+                (_, OutputDisplay::Hidden) => 1,
+                // One divider per section, then its outputs' rows.
+                _ => output_sections(cell)
+                    .iter()
+                    .map(|section| {
+                        1 + section
+                            .items
+                            .iter()
+                            .map(|output| {
+                                output_views.get_mut(&output.id).map_or(1, |view| {
+                                    view.measure(output, width, theme, cap).shown_rows.max(1)
+                                })
+                            })
+                            .sum::<u32>()
                     })
-                })
-                .sum();
+                    .sum(),
+            };
             CardRows {
                 source: wrapped_source.len() as u32,
                 outputs,

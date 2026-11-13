@@ -644,17 +644,19 @@ impl OutputText {
     }
 }
 
-/// All of a cell's outputs as one block of plain text.
+/// A cell's outputs as one block of plain text, in the order and with the
+/// stream tab the card shows.
 pub fn outputs_text(cell: &wb_core::Cell) -> String {
-    cell.outputs
+    crate::layout::output_sections(cell)
         .iter()
-        .map(wb_core::OutputItem::plain_text)
+        .flat_map(|section| section.items.iter().map(|item| item.plain_text()))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn outputs_revision(cell: &wb_core::Cell) -> u64 {
-    cell.outputs.iter().fold(cell.outputs.len() as u64, |acc, output| {
+    let tab = cell.stream_tab as u64;
+    cell.outputs.iter().fold(cell.outputs.len() as u64 + tab, |acc, output| {
         acc.wrapping_mul(1_000_003).wrapping_add(output.rev)
     })
 }

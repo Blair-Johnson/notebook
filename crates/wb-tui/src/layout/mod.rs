@@ -2,9 +2,11 @@
 
 pub mod cache;
 pub mod fenwick;
+pub mod sections;
 
 pub use cache::{CachedCellLayout, CellLayoutKey, LayoutCache};
 pub use fenwick::FenwickTree;
+pub use sections::{OutputSection, SectionKind, has_stream_tabs, output_sections};
 
 use ratatui::layout::Rect;
 use wb_core::CellId;
@@ -28,11 +30,13 @@ pub fn text_width(notebook_width: u16) -> u16 {
 }
 
 /// Rows of a cell card, top to bottom: the top border (title), the source,
-/// then — only when there are outputs — a divider and the outputs, and the
+/// then the output block — one labeled divider per output followed by its
+/// rows, or a single summary divider when outputs are hidden — and the
 /// bottom border. Every module that maps rows to parts uses these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardRows {
     pub source: u32,
+    /// The whole output block, dividers included (0 without outputs).
     pub outputs: u32,
 }
 
@@ -40,28 +44,29 @@ impl CardRows {
     /// Row offset of the first source row (just below the top border).
     pub const SOURCE_TOP: u32 = 1;
 
-    /// Row offset of the first output row (below the divider).
+    /// Row offset of the output block (its first divider).
     pub fn outputs_top(self) -> u32 {
-        Self::SOURCE_TOP + self.source + 1
-    }
-
-    /// Row offset of the divider between source and outputs.
-    pub fn divider(self) -> u32 {
         Self::SOURCE_TOP + self.source
     }
 
     pub fn total(self) -> u32 {
-        let outputs = if self.outputs > 0 { 1 + self.outputs } else { 0 };
-        Self::SOURCE_TOP + self.source + outputs + 1
+        Self::SOURCE_TOP + self.source + self.outputs + 1
     }
 
     /// Recover the parts from a measured card height.
     pub fn from_total(total: u32, source: u32) -> Self {
-        let rest = total.saturating_sub(Self::SOURCE_TOP + source + 1);
         Self {
             source,
-            outputs: rest.saturating_sub(1),
+            outputs: total.saturating_sub(Self::SOURCE_TOP + source + 1),
         }
+    }
+}
+
+/// Row cap for each output under `display` (`None` shows every row).
+pub fn output_cap(display: wb_core::OutputDisplay, max_output_rows: u16) -> Option<u16> {
+    match display {
+        wb_core::OutputDisplay::Full => None,
+        _ => Some(max_output_rows.max(1)),
     }
 }
 
