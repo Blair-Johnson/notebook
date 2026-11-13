@@ -2716,6 +2716,12 @@ impl Coordinator {
             return;
         };
         let code = cell.buffer.as_str().to_string();
+        // A new run replaces the previous run's outputs, as in Jupyter.
+        let had_outputs = !cell.outputs.is_empty();
+        self.pending_clear_wait.remove(cell_id);
+        if had_outputs {
+            self.clear_outputs(cell_id);
+        }
         self.run_states.insert(cell_id.clone(), RunState::Queued);
         self.send_command(KernelCmd::Execute {
             target: TargetId::Cell(cell_id.clone()),

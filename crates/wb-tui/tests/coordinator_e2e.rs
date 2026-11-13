@@ -435,3 +435,41 @@ fn ex_command_saves_py_and_ipynb_and_recovers_autosave_sidecar() {
     let _ = fs::remove_file(&recovery_path);
     let _ = fs::remove_file(sidecar);
 }
+
+#[test]
+fn rerunning_a_cell_replaces_its_outputs() {
+    let (kernel, mut handle) = FakeKernel::pair();
+    let document =
+        document_with_sources(&["print('x')"], FormatBacking::PercentPy { header: None });
+    let cell_id = document.order()[0].clone();
+    let mut coordinator = Coordinator::headless(document, registry(), Box::new(kernel));
+    coordinator.apply_kernel_event(KernelEvent::Ready {
+        info: KernelSessionInfo {
+            generation: 1,
+            kernel_name: "python".into(),
+            display_name: "Python".into(),
+            spec_dir: PathBuf::new(),
+            connection_file: PathBuf::new(),
+            pid: None,
+            supports_subshells: false,
+            supports_debugger: false,
+        },
+    });
+    let now = Instant::now();
+    for run in ["first\n", "second\n"] {
+        coordinator.on_key(key(KeyCode::Enter), now);
+        let _ = handle.drain_commands();
+        coordinator.apply_kernel_event(KernelEvent::Output {
+            exec_id: None,
+            target: TargetId::Cell(cell_id.clone()),
+            late: false,
+            payload: WireOutput::Stream {
+                stream: wb_core::StreamKind::Stdout,
+                text: run.into(),
+            },
+        });
+    }
+    let outputs = &coordinator.document.cell(&cell_id).unwrap().outputs;
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].plain_text(), "second");
+}
