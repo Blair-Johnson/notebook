@@ -1,0 +1,23 @@
+# Default Workbench configuration (`$XDG_CONFIG_HOME/workbench/config.toml`).
+# Comments and formatting in your user config file are preserved when saving from `/config`.
+
+[display]
+theme = "terminal"
+syntect_theme = "base16-ocean.dark"
+max_output_rows = 18
+wheel_scroll_lines = 3
+
+[editor]
+insert_escape_chord_ms = 350
+composer_expanded_ratio_pct = 50
+mouse_capture = true
+formatter = "ruff format -"
+format_on_save = false
+
+[kernel]
+default_kernel = "python3"
+use_jedi = false
+complete_on_dot = true
+signature_help = true
+max_stream_lines = 10000
+autosave_secs = 30

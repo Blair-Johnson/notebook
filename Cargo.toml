@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/wb-core",
+    "crates/wb-kernel",
+    "crates/wb-sdk",
+    "crates/wb-tui",
+    "crates/workbench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+wb-core = { path = "crates/wb-core" }
+wb-kernel = { path = "crates/wb-kernel" }
+wb-sdk = { path = "crates/wb-sdk" }
+wb-tui = { path = "crates/wb-tui" }
+
+ansi-to-tui = "8.0"
+anyhow = "1.0"
+arboard = "3.4"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures = "0.3"
+jupyter-protocol = "2.0"
+jupyter-zmq-client = { version = "1.0", features = ["tokio-runtime"] }
+libc = "0.2"
+ratatui = "0.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syntect = "5.2"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal", "io-util", "fs"] }
+toml = "0.9"
+toml_edit = "0.23"
+unicode-width = "0.2"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
