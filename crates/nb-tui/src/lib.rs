@@ -6,6 +6,7 @@
 //! - `Theme`, `Keymap`, and `CoreSettings` flow via `ConfigSnapshot`, never globals.
 //! - Built-in outputs register through `nb_sdk::Plugin` via `builtins::BuiltinsPlugin`.
 
+pub mod ansi;
 pub mod builtins;
 pub mod config_store;
 pub mod coordinator;

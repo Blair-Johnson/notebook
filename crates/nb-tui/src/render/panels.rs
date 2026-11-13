@@ -7,7 +7,6 @@ use super::AppView;
 use crate::focus::{FocusLayer, ModalKind};
 use crate::keymap::Keymap;
 use crate::overlays::SettingsModalState;
-use ansi_to_tui::IntoText;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -444,11 +443,8 @@ fn draw_inspect(frame: &mut Frame<'_>, view: &AppView<'_>, theme: &Theme, screen
     };
     let area = modal_rect(screen, 110, 4);
     let inner = panel(frame, area, &pager.title, theme);
-    let text = pager
-        .ansi_text
-        .as_bytes()
-        .into_text()
-        .unwrap_or_else(|_| Text::raw(pager.ansi_text.clone()));
+    let text = crate::ansi::parse(&pager.ansi_text)
+        .unwrap_or_else(|| Text::raw(pager.ansi_text.clone()));
     frame.render_widget(
         Paragraph::new(text).scroll((pager.scroll_top.min(u16::MAX as usize) as u16, 0)),
         Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), inner.height.saturating_sub(1)),

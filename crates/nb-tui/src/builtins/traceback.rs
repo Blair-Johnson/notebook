@@ -1,6 +1,5 @@
 //! Built-in Python/JAX traceback output view supporting frame folding and cell-line jumps.
 
-use ansi_to_tui::IntoText;
 use nb_core::{CellId, OutputData, OutputItem};
 use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
@@ -403,7 +402,7 @@ fn parse_ansi_lines(
     frame: Option<usize>,
     cell_line: Option<usize>,
 ) -> Vec<RenderedTraceLine> {
-    let parsed = raw.into_text().ok();
+    let parsed = crate::ansi::parse(raw);
     let source_lines = parsed.as_ref().map(|text| text.lines.as_slice());
     let Some(source_lines) = source_lines else {
         return vec![RenderedTraceLine {

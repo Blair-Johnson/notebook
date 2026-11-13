@@ -1,6 +1,5 @@
 //! Built-in ANSI `stdout`/`stderr` stream output renderer with incremental row-slice wrapping.
 
-use ansi_to_tui::IntoText;
 use nb_core::output::TRUNCATION_MARKER;
 use nb_core::{OutputData, OutputItem, StreamBuffer};
 use nb_sdk::{
@@ -427,9 +426,9 @@ fn visible_chars(line: &str) -> impl Iterator<Item = (usize, char)> + '_ {
 /// and only the requested rows are built.
 pub(crate) fn render_rows(line: &str, width: u16, rows: Range<u32>, out: &mut Vec<Line<'static>>) {
     let spans: Vec<Span<'_>> = if line.contains('\u{1b}') {
-        match line.into_text() {
-            Ok(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
-            Err(_) => vec![Span::raw(line)],
+        match crate::ansi::parse(line) {
+            Some(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
+            None => vec![Span::raw(line)],
         }
     } else {
         vec![Span::raw(line)]
