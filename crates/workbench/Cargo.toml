@@ -24,5 +24,8 @@ futures.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

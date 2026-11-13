@@ -11,7 +11,7 @@ use crate::render::{AppView, FrameGeometry, render_app};
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use wb_core::{CellId, Document, OutputId};
 use wb_kernel::{KernelClient, KernelCmd, KernelEvent};
@@ -147,5 +147,55 @@ impl Coordinator {
     pub fn apply_kernel_event(&mut self, _event: KernelEvent) {
         let _ = KernelCmd::Interrupt;
         todo!("wb-tui::coordinator: apply KernelEvent, mount/update OutputViews, push PdbInput on stdin")
+    }
+
+    pub fn check_autosave_recovery(&mut self) {}
+
+    pub fn on_tick(&mut self, _now: Instant) -> bool {
+        false
+    }
+
+    pub fn on_autosave_tick(&mut self) {}
+
+    pub fn on_resize(&mut self) {}
+
+    pub fn on_focus_gained(&mut self) {}
+
+    pub fn on_signal(&mut self, _signal_name: &str) {
+        self.emergency_autosave();
+        self.should_quit = true;
+    }
+
+    pub fn emergency_autosave(&mut self) {}
+
+    pub fn apply_external_edit(&mut self, _cell_id: &CellId, _new_source: String) {}
+
+    /// Deterministic sidecar path under `$WORKBENCH_STATE_DIR` or `$XDG_STATE_HOME/workbench/autosave/`.
+    pub fn autosave_path_for(path: Option<&Path>) -> Option<PathBuf> {
+        let state_root = std::env::var_os("WORKBENCH_STATE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_STATE_HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|p| PathBuf::from(p).join("workbench"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local/state/workbench"))
+            })?;
+        let raw_key = match path {
+            Some(p) => {
+                let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                abs.to_string_lossy().replace('%', "%%").replace('/', "%")
+            }
+            None => "scratchpad".to_string(),
+        };
+        let capped = match raw_key.char_indices().rev().nth(199) {
+            Some((idx, _)) => raw_key[idx..].to_string(),
+            None => raw_key,
+        };
+        Some(state_root.join("autosave").join(format!("{capped}.ipynb")))
     }
 }
