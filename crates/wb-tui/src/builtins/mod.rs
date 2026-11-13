@@ -221,7 +221,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Application",
             20,
-            "Open command palette",
+            "Search commands and settings",
             false,
         );
         action(
@@ -239,7 +239,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Application",
             40,
-            "Show help",
+            "Show key help",
             false,
         );
         action(
@@ -265,7 +265,7 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "motion.up",
             ActionKind::Motion,
-            "Move up",
+            "Navigation",
             20,
             "Move up",
             false,
@@ -366,7 +366,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Motion,
             "Navigation",
             130,
-            "First nonblank",
+            "First non-blank character",
             false,
         );
         action(
@@ -452,59 +452,63 @@ impl Plugin for BuiltinsPlugin {
             false,
         );
         for (order, id, title) in [
-            (81, "edit.backspace", "Delete character before cursor"),
+            (81, "edit.backspace", "Delete previous character"),
             (82, "edit.delete_word_back", "Delete word before cursor"),
             (83, "edit.delete_to_line_start", "Delete to start of line"),
             (84, "edit.delete_to_line_end", "Delete to end of line"),
-            (101, "edit.indent", "Indent (insert spaces to the next tab stop)"),
-            (102, "edit.dedent", "Dedent the current line"),
+            (101, "edit.indent", "Indent"),
+            (102, "edit.dedent", "Dedent"),
+        ] {
+            action(reg, id, ActionKind::Command, "Typing", order, title, false);
+        }
+        for (order, id, title) in [
+            (85, "edit.delete_char_back", "Delete previous character"),
+            (86, "edit.substitute", "Change character"),
+            (87, "edit.substitute_line", "Change line"),
+            (88, "edit.delete_to_eol", "Delete to end of line"),
+            (89, "edit.change_to_eol", "Change to end of line"),
+            (90, "edit.yank_line", "Yank line"),
+            (91, "edit.toggle_case", "Toggle case"),
+            (92, "edit.join_lines", "Join lines"),
+            (93, "edit.insert_line_start", "Insert at line start"),
+            (94, "edit.append_line_end", "Insert at line end"),
+            (95, "edit.open_below", "New line below"),
+            (96, "edit.open_above", "New line above"),
+            (97, "visual.swap_ends", "Swap selection ends"),
         ] {
             action(reg, id, ActionKind::Command, "Editing", order, title, false);
         }
         for (order, id, title) in [
-            (85, "edit.delete_char_back", "Delete character before cursor (X)"),
-            (86, "edit.substitute", "Substitute character (s)"),
-            (87, "edit.substitute_line", "Substitute line (S)"),
-            (88, "edit.delete_to_eol", "Delete to end of line (D)"),
-            (89, "edit.change_to_eol", "Change to end of line (C)"),
-            (90, "edit.yank_line", "Yank line (Y)"),
-            (91, "edit.toggle_case", "Toggle case (~)"),
-            (92, "edit.join_lines", "Join lines (J)"),
-            (93, "edit.insert_line_start", "Insert at first non-blank (I)"),
-            (94, "edit.append_line_end", "Append at end of line (A)"),
-            (95, "edit.open_below", "Open line below (o)"),
-            (96, "edit.open_above", "Open line above (O)"),
-            (97, "visual.swap_ends", "Swap selection ends (o)"),
-            (98, "output.jump", "Jump to the traceback line's cell"),
-            (99, "output.cycle_view", "Cycle output view: preview, full, hidden (runs a source)"),
-            (100, "output.next_tab", "Switch the stdout / stderr tab"),
+            (98, "output.jump", "Go to traceback line"),
+            (99, "output.cycle_view", "Expand / collapse output"),
+            (100, "output.next_tab", "Switch stdout / stderr"),
         ] {
-            action(reg, id, ActionKind::Command, "Editing", order, title, false);
+            action(reg, id, ActionKind::Command, "Outputs", order, title, false);
         }
         for (order, id, title) in [
-            (60, "motion.current_line", "Current line, first non-blank (_)"),
-            (61, "motion.bigword_next", "Next WORD (W)"),
-            (62, "motion.bigword_back", "Previous WORD (B)"),
-            (63, "motion.bigword_end", "End of WORD (E)"),
-            (64, "motion.paragraph_next", "Next paragraph (})"),
-            (65, "motion.paragraph_prev", "Previous paragraph ({)"),
-            (66, "motion.match_pair", "Matching bracket (%)"),
-            (67, "motion.repeat_find", "Repeat f/t (;)"),
-            (68, "motion.repeat_find_reverse", "Repeat f/t backwards (,)"),
+            (60, "motion.current_line", "Current line"),
+            (61, "motion.bigword_next", "Next WORD"),
+            (62, "motion.bigword_back", "Previous WORD"),
+            (63, "motion.bigword_end", "End of WORD"),
+            (64, "motion.paragraph_next", "Next paragraph"),
+            (65, "motion.paragraph_prev", "Previous paragraph"),
+            (66, "motion.match_pair", "Matching bracket"),
+            (67, "motion.repeat_find", "Repeat find"),
+            (68, "motion.repeat_find_reverse", "Repeat find backward"),
         ] {
             action(reg, id, ActionKind::Motion, "Navigation", order, title, false);
         }
         for (order, id, title) in [
-            (70, "motion.find_forward", "Find character forward (f)"),
-            (71, "motion.find_backward", "Find character backward (F)"),
-            (72, "motion.till_forward", "Till character forward (t)"),
-            (73, "motion.till_backward", "Till character backward (T)"),
+            (70, "motion.find_forward", "Find character"),
+            (71, "motion.find_backward", "Find character backward"),
+            (72, "motion.till_forward", "Up to character"),
+            (73, "motion.till_backward", "Up to character backward"),
         ] {
             action(reg, id, ActionKind::CharArgMotion, "Navigation", order, title, false);
         }
         for (order, id, title) in [
-            (40, "op.indent", "Indent (>)"),
-            (41, "op.dedent", "Dedent (<)"),
+            (40, "op.indent", "Indent lines"),
+            (41, "op.dedent", "Dedent lines"),
         ] {
             action(reg, id, ActionKind::Operator, "Editing", order, title, false);
         }
@@ -543,9 +547,9 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "edit.newline",
             ActionKind::Command,
-            "Editing",
+            "Typing",
             100,
-            "Insert newline",
+            "New line",
             false,
         );
 
@@ -583,7 +587,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Navigation",
             150,
-            "Leave current focus",
+            "Back out one level",
             false,
         );
         action(
@@ -608,18 +612,18 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "visual.char",
             ActionKind::Command,
-            "Visual",
+            "Selection",
             10,
-            "Characterwise visual mode",
+            "Select characters",
             false,
         );
         action(
             reg,
             "visual.line",
             ActionKind::Command,
-            "Visual",
+            "Selection",
             20,
-            "Linewise visual mode",
+            "Select lines",
             false,
         );
         action(
@@ -665,7 +669,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             10,
-            "Enter cell normal mode",
+            "Open cell",
             false,
         );
         action(
@@ -674,7 +678,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             20,
-            "Enter cell insert mode",
+            "Insert at cursor",
             false,
         );
         action(
@@ -683,7 +687,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             30,
-            "Append at cell end",
+            "Insert at end of cell",
             false,
         );
         action(
@@ -692,7 +696,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             40,
-            "Append after cursor",
+            "Insert after cursor",
             false,
         );
         action(
@@ -701,7 +705,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             50,
-            "Insert cell below",
+            "New cell below",
             false,
         );
         action(
@@ -710,25 +714,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             60,
-            "Insert cell above",
-            false,
-        );
-        action(
-            reg,
-            "cell.open_line_below",
-            ActionKind::Command,
-            "Cells",
-            70,
-            "Open line below",
-            false,
-        );
-        action(
-            reg,
-            "cell.open_line_above",
-            ActionKind::Command,
-            "Cells",
-            80,
-            "Open line above",
+            "New cell above",
             false,
         );
         action(
@@ -746,7 +732,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             100,
-            "Run and advance",
+            "Run cell and select next",
             false,
         );
         action(
@@ -764,7 +750,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             120,
-            "Toggle cell kind",
+            "Switch code / markdown",
             false,
         );
         action(
@@ -773,16 +759,16 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             130,
-            "Toggle collapse",
+            "Fold / unfold cell",
             false,
         );
         action(
             reg,
             "cell.focus_output",
             ActionKind::Command,
-            "Cells",
+            "Outputs",
             140,
-            "Focus output",
+            "Read output",
             false,
         );
         action(
@@ -791,14 +777,14 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             150,
-            "Edit cell externally",
+            "Edit cell in $EDITOR",
             false,
         );
         action(
             reg,
             "cell.clear_outputs",
             ActionKind::Command,
-            "Cells",
+            "Outputs",
             160,
             "Clear outputs",
             false,
@@ -818,7 +804,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Cells",
             180,
-            "Toggle expanded split",
+            "Expand / shrink editor",
             false,
         );
         action(
@@ -837,7 +823,7 @@ impl Plugin for BuiltinsPlugin {
             ActionKind::Command,
             "Kernel",
             10,
-            "Interrupt kernel",
+            "Interrupt running cell",
             false,
         );
         action(
@@ -853,54 +839,54 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "pdb.submit",
             ActionKind::Command,
-            "Kernel",
+            "Debugger",
             30,
-            "Submit debugger input",
+            "Send input",
             false,
         );
         action(
             reg,
             "pdb.newline",
             ActionKind::Command,
-            "Kernel",
+            "Debugger",
             40,
-            "Insert debugger newline",
+            "New line in input",
             false,
         );
         action(
             reg,
             "pdb.history_prev",
             ActionKind::Command,
-            "Kernel",
+            "Debugger",
             50,
-            "Previous debugger history",
+            "Previous input",
             false,
         );
         action(
             reg,
             "pdb.history_next",
             ActionKind::Command,
-            "Kernel",
+            "Debugger",
             60,
-            "Next debugger history",
+            "Next input",
             false,
         );
         action(
             reg,
             "intel.inspect_doc",
             ActionKind::Command,
-            "Intelligence",
+            "Code help",
             10,
-            "Inspect documentation",
+            "Show documentation",
             false,
         );
         action(
             reg,
             "intel.complete",
             ActionKind::Command,
-            "Intelligence",
+            "Code help",
             20,
-            "Complete symbol",
+            "Complete",
             false,
         );
         action(
