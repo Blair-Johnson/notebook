@@ -2848,6 +2848,15 @@ impl Coordinator {
         if !still_typing {
             return;
         }
+        // An empty reply to a request a newer one replaced (or that timed
+        // out meanwhile): the newer reply will decide the popup.
+        let superseded = self
+            .pending_completions
+            .iter()
+            .any(|(id, newer)| *id > req_id && newer.cell_id == request.cell_id);
+        if items.is_empty() && superseded {
+            return;
+        }
         let from_kernel = !items.is_empty();
         if items.is_empty() {
             let sources = self
