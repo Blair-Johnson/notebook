@@ -73,6 +73,20 @@ fn i_opens_the_cell_in_normal_mode_and_enter_runs_it() {
 }
 
 #[test]
+fn i_on_an_empty_cell_starts_typing() {
+    let mut c = coordinator(&["", "  \n"]);
+    keys(&mut c, "i");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
+    keys(&mut c, "x = 1");
+    assert_eq!(source(&c, 0), "x = 1");
+    // A blank-only cell counts as empty too.
+    press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+    press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+    keys(&mut c, "ji");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
+}
+
+#[test]
 fn insert_mode_backspace_delete_and_arrows_edit_text() {
     let mut c = coordinator(&["hello"]);
     keys(&mut c, "i");

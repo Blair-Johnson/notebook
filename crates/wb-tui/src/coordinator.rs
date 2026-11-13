@@ -1446,6 +1446,13 @@ impl Coordinator {
             "cell.enter_normal" => {
                 if self.selected_part == CellPart::Output {
                     self.enter_output(self.selected_cell.clone());
+                } else if self
+                    .document
+                    .cell(&self.selected_cell)
+                    .is_some_and(|cell| cell.buffer.as_str().trim().is_empty())
+                {
+                    // Nothing to navigate in an empty cell: start typing.
+                    self.begin_cell_edit(CellMode::Insert);
                 } else {
                     self.begin_cell_edit(CellMode::Normal);
                 }
