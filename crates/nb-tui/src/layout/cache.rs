@@ -254,14 +254,15 @@ impl LayoutCache {
             // Preview and full only differ when some output is taller than
             // the preview rows.
             let preview = Some(max_output_rows.max(1));
-            let mut at_preview = HashMap::new();
-            for output in sections.iter().flat_map(|section| section.items.iter()) {
-                if let Some(view) = output_views.get_mut(&output.id) {
-                    let metrics = view.measure(output, width, theme, preview);
-                    clips |= metrics.total_rows > metrics.shown_rows;
-                    at_preview.insert(output.id, (metrics.shown_rows.max(1), metrics.total_rows));
-                }
-            }
+            clips = sections
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .any(|output| {
+                    output_views.get_mut(&output.id).is_some_and(|view| {
+                        let metrics = view.measure(output, width, theme, preview);
+                        metrics.total_rows > metrics.shown_rows
+                    })
+                });
             let display = cell
                 .output_display(self.default_output_view)
                 .effective(clips);
@@ -279,16 +280,10 @@ impl LayoutCache {
                     for section in &sections {
                         row += 1;
                         for output in &section.items {
-                            // Views keep the cap of their last measure, so
-                            // measure again only for a different cap.
-                            let (shown, total) = match output_views.get_mut(&output.id) {
-                                Some(_) if cap == preview => at_preview[&output.id],
-                                Some(view) => {
-                                    let metrics = view.measure(output, width, theme, cap);
-                                    (metrics.shown_rows.max(1), metrics.total_rows)
-                                }
-                                None => (1, 1),
-                            };
+                            let (shown, total) = output_views.get_mut(&output.id).map_or((1, 1), |view| {
+                                let metrics = view.measure(output, width, theme, cap);
+                                (metrics.shown_rows.max(1), metrics.total_rows)
+                            });
                             output_rows.push(OutputRows {
                                 output_id: output.id,
                                 first_row: row,
