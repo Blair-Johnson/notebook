@@ -58,10 +58,12 @@ fn source(coordinator: &Coordinator, index: usize) -> String {
 }
 
 #[test]
-fn enter_and_i_open_the_cell_in_normal_mode() {
+fn i_opens_the_cell_in_normal_mode_and_enter_runs_it() {
     let mut c = coordinator(&["abc"]);
     press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(mode(&c), Some(CellMode::Normal));
+    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    let id = c.document.order()[0].clone();
+    assert!(c.run_states.contains_key(&id), "enter queued the cell to run");
 
     let mut c = coordinator(&["abc"]);
     keys(&mut c, "i");
@@ -73,7 +75,7 @@ fn enter_and_i_open_the_cell_in_normal_mode() {
 #[test]
 fn insert_mode_backspace_delete_and_arrows_edit_text() {
     let mut c = coordinator(&["hello"]);
-    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut c, "i");
     keys(&mut c, "A");
     assert_eq!(mode(&c), Some(CellMode::Insert));
     press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
@@ -132,7 +134,7 @@ fn click_source(c: &mut Coordinator, cell: usize, line: usize, dx: u16) {
 #[test]
 fn clicking_another_cell_moves_focus_and_cursor_there() {
     let mut c = coordinator(&["first cell", "second\nthird line"]);
-    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut c, "i");
     keys(&mut c, "i");
     assert_eq!(mode(&c), Some(CellMode::Insert));
 
@@ -162,7 +164,7 @@ fn clicking_from_the_notebook_enters_the_clicked_cell() {
 #[test]
 fn global_commands_work_while_editing_a_cell() {
     let mut c = coordinator(&["x = 1"]);
-    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut c, "i");
     press(&mut c, KeyCode::Char('/'), KeyModifiers::CONTROL);
     assert!(matches!(c.focus.top(), FocusLayer::Modal(ModalKind::CommandPalette)));
     press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
@@ -174,7 +176,7 @@ fn global_commands_work_while_editing_a_cell() {
 /// Open cell 0 in normal mode with the cursor at `(row, col)`.
 fn editing(sources: &[&str], row: usize, col: usize) -> Coordinator {
     let mut c = coordinator(sources);
-    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut c, "i");
     let id = c.document.order()[0].clone();
     c.document
         .cell_mut(&id)

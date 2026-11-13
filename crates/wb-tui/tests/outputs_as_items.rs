@@ -83,8 +83,7 @@ fn j_and_k_stop_on_outputs_between_cells() {
 #[test]
 fn entering_an_output_gives_read_only_vim_navigation_and_yank() {
     let mut c = coordinator(&[("print(stuff)", "alpha beta\ngamma delta\n")]);
-    keys(&mut c, "j");
-    press(&mut c, KeyCode::Enter);
+    keys(&mut c, "ji");
     assert!(matches!(
         c.focus.top(),
         FocusLayer::OutputFocus {
@@ -148,8 +147,7 @@ fn enter_on_a_traceback_line_jumps_to_that_cell() {
             false,
         ));
     draw(&mut c);
-    keys(&mut c, "jjj");
-    press(&mut c, KeyCode::Enter);
+    keys(&mut c, "jjji");
     keys(&mut c, "j");
     press(&mut c, KeyCode::Enter);
     assert!(matches!(

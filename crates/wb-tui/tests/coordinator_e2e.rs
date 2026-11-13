@@ -68,7 +68,7 @@ fn counted_navigation_cell_edit_and_run_are_headless() {
     coordinator.on_key(key(KeyCode::Char('j')), now);
     assert_eq!(coordinator.selected_cell, coordinator.document.order()[3]);
 
-    coordinator.on_key(key(KeyCode::Enter), now);
+    coordinator.on_key(key(KeyCode::Char('i')), now);
     assert!(matches!(
         coordinator.focus.top(),
         FocusLayer::CellEdit {
