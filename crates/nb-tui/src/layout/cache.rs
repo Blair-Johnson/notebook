@@ -81,9 +81,17 @@ pub struct LayoutCache {
     last_width: u16,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    line_highlights: HashMap<(CellId, u64, usize, u64), Line<'static>>,
+    /// Highlighted code lines per cell, keyed by the line's text: an edit
+    /// re-highlights only the lines it changed. Each cell keeps just the
+    /// lines of its latest render, so memory follows the notebook size.
+    line_highlights: HashMap<CellId, LineHighlights>,
     /// `display.output_default_view`, set by the caller before syncing.
     pub default_output_view: OutputDisplay,
+}
+
+struct LineHighlights {
+    theme_rev: u64,
+    lines: HashMap<String, Line<'static>>,
 }
 
 impl Default for LayoutCache {
@@ -164,6 +172,7 @@ impl LayoutCache {
             return;
         }
         self.order = doc.order().to_vec();
+        self.line_highlights.retain(|cell_id, _| doc.cell(cell_id).is_some());
         self.heights = FenwickTree::with_len(doc.order().len());
         let default = self.default_output_view;
         for (index, cell_id) in doc.order().iter().enumerate() {
@@ -335,9 +344,22 @@ impl LayoutCache {
         // `split('\n')`, not `lines()`: a trailing empty line is a real row the
         // cursor can sit on.
         let source_lines: Vec<&str> = cell.buffer.as_str().split('\n').collect();
+        let mut previous = match self.line_highlights.remove(&cell.id) {
+            Some(cached) if cached.theme_rev == theme.revision => cached.lines,
+            _ => HashMap::new(),
+        };
+        let mut highlighted = HashMap::new();
         for (index, source_line) in source_lines.iter().enumerate() {
             let rendered = match cell.kind {
-                CellKind::Code => self.highlight_code_line(cell, index, source_line, theme),
+                CellKind::Code => {
+                    let line = highlighted
+                        .get(*source_line)
+                        .cloned()
+                        .or_else(|| previous.remove(*source_line))
+                        .unwrap_or_else(|| self.highlight_code_line(source_line, theme));
+                    highlighted.insert((*source_line).to_string(), line.clone());
+                    line
+                }
                 CellKind::Markdown => raw_markdown_line(source_line, theme),
                 CellKind::Raw => Line::from(Span::styled(
                     (*source_line).to_string(),
@@ -349,6 +371,15 @@ impl LayoutCache {
                 source_map.push(index);
             }
         }
+        if !highlighted.is_empty() {
+            self.line_highlights.insert(
+                cell.id.clone(),
+                LineHighlights {
+                    theme_rev: theme.revision,
+                    lines: highlighted,
+                },
+            );
+        }
         if lines.is_empty() {
             lines.push(Line::default());
             source_map.push(0);
@@ -356,17 +387,8 @@ impl LayoutCache {
         (lines, source_map)
     }
 
-    fn highlight_code_line(
-        &mut self,
-        cell: &Cell,
-        index: usize,
-        source: &str,
-        theme: &Theme,
-    ) -> Line<'static> {
-        let cache_key = (cell.id.clone(), cell.revs.source_rev, index, theme.revision);
-        if let Some(line) = self.line_highlights.get(&cache_key) {
-            return line.clone();
-        }
+    /// Highlight one line on its own (no state carried between lines).
+    fn highlight_code_line(&self, source: &str, theme: &Theme) -> Line<'static> {
         let syntax = self
             .syntax_set
             .find_syntax_by_extension("py")
@@ -377,7 +399,7 @@ impl LayoutCache {
             .get(&theme.syntect_theme)
             .or_else(|| self.theme_set.themes.get("base16-ocean.dark"))
             .or_else(|| self.theme_set.themes.values().next());
-        let line = if let Some(syntax_theme) = syntax_theme {
+        if let Some(syntax_theme) = syntax_theme {
             let mut highlighter = HighlightLines::new(syntax, syntax_theme);
             let source_with_newline = format!("{source}\n");
             let regions = highlighter
@@ -401,9 +423,7 @@ impl LayoutCache {
             )
         } else {
             Line::from(source.to_string())
-        };
-        self.line_highlights.insert(cache_key, line.clone());
-        line
+        }
     }
 
     /// Measure the cell at `index` now (at the last viewport width), for
@@ -485,6 +505,7 @@ impl LayoutCache {
                 break;
             };
             self.cells.remove(&cell_id);
+            self.line_highlights.remove(&cell_id);
         }
     }
 

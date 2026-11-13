@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
         registry,
         settings,
         Box::new(kernel),
-        Box::new(SystemClipboard),
+        Box::new(SystemClipboard::default()),
         Box::new(terminal::CrosstermTerminalEffects::default()),
     );
     coordinator.notice = config_warning;

@@ -1,9 +1,11 @@
 //! Three-tier clipboard copy (`arboard` -> `tmux set-buffer -w` / `load-buffer` -> OSC 52).
 
 use crate::platform::ClipboardSink;
+use crate::platform::process::run_with_timeout;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 const TMUX_ARGUMENT_LIMIT: usize = 64 * 1024;
 const OSC52_LIMIT: usize = 100 * 1024;
@@ -17,8 +19,15 @@ pub enum ClipboardBackend {
     Memory,
 }
 
+/// tmux answers in milliseconds; a hung server must not hang the UI.
+const TMUX_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
-pub struct SystemClipboard;
+pub struct SystemClipboard {
+    /// Kept for the session: creating one per copy is slow on X11, and on
+    /// X11 the copied text lives only as long as the instance.
+    native: Option<arboard::Clipboard>,
+}
 
 impl ClipboardSink for SystemClipboard {
     fn copy(&mut self, text: &str) -> Result<ClipboardBackend, String> {
@@ -31,26 +40,30 @@ impl ClipboardSink for SystemClipboard {
             });
         let mut native_error = None;
         if !remote {
-            match arboard::Clipboard::new()
-                .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
-            {
-                Ok(()) => return Ok(ClipboardBackend::NativeOs),
-                Err(error) => native_error = Some(error.to_string()),
+            if self.native.is_none() {
+                match arboard::Clipboard::new() {
+                    Ok(clipboard) => self.native = Some(clipboard),
+                    Err(error) => native_error = Some(error.to_string()),
+                }
+            }
+            if let Some(clipboard) = self.native.as_mut() {
+                match clipboard.set_text(text.to_owned()) {
+                    Ok(()) => return Ok(ClipboardBackend::NativeOs),
+                    Err(error) => {
+                        native_error = Some(error.to_string());
+                        self.native = None;
+                    }
+                }
             }
         }
 
         if std::env::var_os("TMUX").is_some() {
-            if text.len() <= TMUX_ARGUMENT_LIMIT {
-                let status = Command::new("tmux")
-                    .args(["set-buffer", "-w", "-b", TMUX_BUFFER_NAME, "--", text])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if status.is_ok_and(|status| status.success()) {
-                    return Ok(ClipboardBackend::TmuxBuffer);
-                }
+            if text.len() <= TMUX_ARGUMENT_LIMIT
+                && tmux(&["set-buffer", "-w", "-b", TMUX_BUFFER_NAME, "--", text], b"")
+            {
+                return Ok(ClipboardBackend::TmuxBuffer);
             }
-            if load_tmux_buffer(text).is_ok_and(|success| success) {
+            if tmux(&["load-buffer", "-b", TMUX_BUFFER_NAME, "-"], text.as_bytes()) {
                 return Ok(ClipboardBackend::TmuxBuffer);
             }
         }
@@ -78,22 +91,8 @@ impl ClipboardSink for SystemClipboard {
     }
 }
 
-fn load_tmux_buffer(text: &str) -> io::Result<bool> {
-    let mut child = Command::new("tmux")
-        .args(["load-buffer", "-b", TMUX_BUFFER_NAME, "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.wait();
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "tmux load-buffer stdin unavailable",
-        ));
-    };
-    let write_result = stdin.write_all(text.as_bytes());
-    drop(stdin);
-    write_result?;
-    child.wait().map(|status| status.success())
+/// Run a tmux command with `input` on stdin; true if it succeeded in time.
+fn tmux(args: &[&str], input: &[u8]) -> bool {
+    run_with_timeout(Command::new("tmux").args(args), input, TMUX_TIMEOUT)
+        .is_ok_and(|done| done.status.success())
 }

@@ -1,6 +1,7 @@
 //! Injectable terminal, clipboard, and `tmux` effects (no `#[cfg(test)]` inside prod structs).
 
 pub mod clipboard;
+pub mod process;
 pub mod tmux;
 
 pub use clipboard::{ClipboardBackend, SystemClipboard};

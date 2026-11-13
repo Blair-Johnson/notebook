@@ -25,9 +25,9 @@ use ratatui::layout::Rect;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use crate::platform::process::run_with_timeout;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 use nb_core::codec::ipynb::{parse_ipynb, serialize_ipynb};
 use nb_core::codec::{reload_external, save_path, write_atomic};
@@ -40,6 +40,10 @@ use nb_sdk::{
     ExtensionRegistry, InputOutcome, Key, KeyContextId, MotionOrObject, MountCtx, OutputHost,
     OutputView, ResolvedInput,
 };
+
+/// A formatter that has not finished by then is killed: formatting runs on
+/// the UI thread.
+const FORMATTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a status-bar notice stays before the key hints come back.
 fn notice_ttl(core: &crate::config_store::CoreSettings) -> Duration {
@@ -152,6 +156,11 @@ pub struct Coordinator {
     pending_clear_wait: HashSet<CellId>,
     observed_file_mtime: Option<SystemTime>,
     last_autosave: Option<Instant>,
+    /// Fingerprint of the cells the last autosave wrote, to skip rewriting
+    /// a notebook that has not changed since.
+    autosaved_stamp: Option<u64>,
+    /// The periodic autosave's write and fsync, off the UI thread.
+    autosave_write: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Coordinator {
@@ -238,6 +247,8 @@ impl Coordinator {
             pending_clear_wait: HashSet::new(),
             observed_file_mtime: None,
             last_autosave: None,
+            autosaved_stamp: None,
+            autosave_write: None,
         };
         coordinator.sync_settings();
         coordinator.observed_file_mtime = coordinator.path.as_deref().and_then(file_mtime);
@@ -999,18 +1010,66 @@ impl Coordinator {
     }
 
     pub fn on_autosave_tick(&mut self) {
+        self.finish_autosave_write(false);
         let interval = self.settings.snapshot().core.autosave_secs;
         if self.document.dirty_source || self.document.dirty_outputs {
             let due = interval == 0
                 || self
                     .last_autosave
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(interval));
-            if due {
-                self.emergency_autosave();
+            let stamp = self.content_stamp();
+            if due && self.autosave_write.is_none() && self.autosaved_stamp != Some(stamp) {
+                self.start_autosave_write();
+                self.autosaved_stamp = Some(stamp);
                 self.last_autosave = Some(Instant::now());
             }
         }
         self.check_external_disk_change();
+    }
+
+    /// Changes whenever any cell's source or outputs change, or cells are
+    /// added, removed or moved.
+    fn content_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for cell in self.document.cells_in_order() {
+            cell.id.hash(&mut hasher);
+            cell.revs.source_rev.hash(&mut hasher);
+            cell.revs.output_rev.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Serialize here, then write and fsync on a background thread.
+    fn start_autosave_write(&mut self) {
+        let Some(path) = Self::autosave_path_for(self.path.as_deref()) else {
+            return;
+        };
+        let Ok(bytes) = serialize_ipynb(&self.document, true) else {
+            self.notice = Some("could not serialize autosave".into());
+            return;
+        };
+        self.autosave_write = Some(std::thread::spawn(move || {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            write_atomic(&path, bytes.as_bytes()).is_ok()
+        }));
+    }
+
+    /// Collect a finished background autosave (or wait for it).
+    fn finish_autosave_write(&mut self, wait: bool) {
+        let Some(write) = self.autosave_write.take() else {
+            return;
+        };
+        if !wait && !write.is_finished() {
+            self.autosave_write = Some(write);
+            return;
+        }
+        if !write.join().unwrap_or(false) {
+            self.notice = Some("could not write autosave".into());
+            self.autosaved_stamp = None;
+        }
     }
 
     pub fn on_resize(&mut self) {}
@@ -1028,6 +1087,7 @@ impl Coordinator {
     }
 
     pub fn emergency_autosave(&mut self) {
+        self.finish_autosave_write(true);
         let Some(path) = Self::autosave_path_for(self.path.as_deref()) else {
             return;
         };
@@ -3131,24 +3191,9 @@ impl Coordinator {
         let id = self.selected_cell.clone();
         let source = self.cell_source(&id);
         let formatter = self.settings.snapshot().core.formatter.clone();
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(formatter)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                self.notice = Some(format!("formatter failed to start: {error}"));
-                return;
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(source.as_bytes());
-        }
-        match child.wait_with_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(formatter);
+        match run_with_timeout(&mut command, source.as_bytes(), FORMATTER_TIMEOUT) {
             Ok(output) if output.status.success() => {
                 let formatted = String::from_utf8_lossy(&output.stdout).to_string();
                 if formatted != source {
@@ -3451,6 +3496,9 @@ impl Coordinator {
     }
 
     fn delete_autosave(&mut self) {
+        // A write still in flight would bring the sidecar back.
+        self.finish_autosave_write(true);
+        self.autosaved_stamp = None;
         if let Some(path) = Self::autosave_path_for(self.path.as_deref()) {
             let _ = fs::remove_file(path);
         }
