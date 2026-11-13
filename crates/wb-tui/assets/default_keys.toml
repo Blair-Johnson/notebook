@@ -33,8 +33,9 @@
 "app.quit" = ["q"]
 "doc.save" = ["w"]
 "doc.save_force" = ["W"]
-"cell.enter_normal" = ["enter", "l"]
-"cell.enter_insert" = ["i"]
+# `i` opens the cell in normal mode too: the cursor position is unknown
+# from here, so typing straight away would rarely land where intended.
+"cell.enter_normal" = ["enter", "l", "i"]
 "cell.append_end" = ["A"]
 "cell.insert_below" = ["a", "o"]
 "cell.insert_above" = ["b", "O"]

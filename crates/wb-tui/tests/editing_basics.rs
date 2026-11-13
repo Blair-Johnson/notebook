@@ -58,10 +58,16 @@ fn source(coordinator: &Coordinator, index: usize) -> String {
 }
 
 #[test]
-fn enter_opens_the_cell_in_normal_mode() {
+fn enter_and_i_open_the_cell_in_normal_mode() {
     let mut c = coordinator(&["abc"]);
     press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(mode(&c), Some(CellMode::Normal));
+
+    let mut c = coordinator(&["abc"]);
+    keys(&mut c, "i");
+    assert_eq!(mode(&c), Some(CellMode::Normal));
+    keys(&mut c, "i");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
 }
 
 #[test]
