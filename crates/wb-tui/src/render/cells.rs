@@ -4,8 +4,9 @@
 use super::geometry::{FrameGeometry, HitTarget, RowHit, ScrollbarGeometry};
 use super::style::mode_color;
 use super::{AppView, RunState};
-use crate::focus::{CellMode, FocusLayer};
+use crate::focus::{CellMode, CellPart, FocusLayer};
 use crate::layout::{CachedCellLayout, GUTTER_COLS, LayoutCache};
+use crate::vim::{OutputText, segment_of, wrap_segments};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -16,7 +17,7 @@ use ratatui::{
 use std::collections::HashMap;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use wb_core::{Cell, CellKind, OutputId, VisualKind};
+use wb_core::{Cell, CellKind, OutputId, TextBuffer, VisualKind};
 use wb_sdk::{OutputView, Theme};
 
 /// Draw every visible cell; returns the screen position for the terminal
@@ -94,18 +95,20 @@ impl CellCtx<'_> {
         let view = self.view;
         let theme = self.theme;
         let p = &theme.palette;
-        let selected = view.selected_cell == &self.cell.id;
         let base = view.focus.base();
         let editing_mode = match base {
             FocusLayer::CellEdit { cell_id, mode, .. } if cell_id == &self.cell.id => Some(*mode),
             _ => None,
         };
-        let output_focused = match base {
-            FocusLayer::OutputFocus { cell_id, output_id, .. } if cell_id == &self.cell.id => {
-                Some(*output_id)
-            }
+        let output_mode = match base {
+            FocusLayer::OutputFocus { cell_id, mode } if cell_id == &self.cell.id => Some(*mode),
             _ => None,
         };
+        let cell_selected = view.selected_cell == &self.cell.id;
+        // The source and the outputs are separate selectable items.
+        let outputs_selected = cell_selected
+            && (output_mode.is_some() || view.selected_part == CellPart::Output);
+        let selected = cell_selected && !outputs_selected;
         let accent = mode_color(base, theme);
         let bar = |frame: &mut Frame<'_>, y: u16, glyph: &str, color| {
             frame.render_widget(
@@ -181,9 +184,17 @@ impl CellCtx<'_> {
                         .set_style(rect, Style::default().bg(p.surface));
                 }
                 if let Some(selection) = self.cell.buffer.selection() {
-                    self.paint_selection(frame, rect, index, segments, selection);
+                    paint_selection(
+                        frame,
+                        rect,
+                        index,
+                        segments,
+                        &self.cell.buffer,
+                        selection,
+                        theme,
+                    );
                 }
-                if let Some((row, col)) = self.cursor_visual(segments) {
+                if let Some((row, col)) = cursor_visual(&self.cell.buffer, segments) {
                     if row == index {
                         cursor = Some((rect.x + col.min(self.text_w.saturating_sub(1)), y));
                     }
@@ -203,7 +214,30 @@ impl CellCtx<'_> {
         }
 
         // Outputs, directly below the source at the same indent.
-        let mut local = 1u32.saturating_add(lines.len() as u32);
+        let outputs_top = 1u32.saturating_add(lines.len() as u32);
+        let mut local = outputs_top;
+        let entered = output_mode.zip(
+            view.output_text
+                .filter(|out| out.cell_id == self.cell.id),
+        );
+        if let Some((mode, out)) = entered {
+            let region: u32 = self
+                .cell
+                .outputs
+                .iter()
+                .map(|output| {
+                    output_views.get_mut(&output.id).map_or(1, |output_view| {
+                        output_view
+                            .measure(output, self.text_w, theme, Some(view.settings.max_output_rows))
+                            .shown_rows
+                            .max(1)
+                    })
+                })
+                .sum();
+            let position =
+                self.draw_output_text(frame, out, mode, outputs_top, region, accent, geometry);
+            return position.or(cursor);
+        }
         for output in &self.cell.outputs {
             let Some(output_view) = output_views.get_mut(&output.id) else {
                 local = local.saturating_add(1);
@@ -213,17 +247,16 @@ impl CellCtx<'_> {
                 .measure(output, self.text_w, theme, Some(view.settings.max_output_rows))
                 .shown_rows
                 .max(1);
-            let focused = output_focused == Some(output.id);
             let mut rendered = Vec::new();
-            output_view.render_slice(output, self.text_w, 0..shown, focused, theme, &mut rendered);
+            output_view.render_slice(output, self.text_w, 0..shown, false, theme, &mut rendered);
             for row in 0..shown {
                 let Some(y) = self.screen_y(local + row) else {
                     continue;
                 };
-                if focused {
+                if outputs_selected {
                     bar(frame, y, "▌", accent);
-                } else if selected {
-                    bar(frame, y, "▏", accent);
+                } else if cell_selected {
+                    bar(frame, y, "▏", p.border);
                 }
                 if let Some(mut line) = rendered.get(row as usize).cloned() {
                     if row == 0 && output.transient_late {
@@ -242,7 +275,8 @@ impl CellCtx<'_> {
                     target: HitTarget::CellOutput {
                         cell_id: self.cell.id.clone(),
                         output_id: output.id,
-                        local_row: row,
+                        // Row within the whole output block (≈ its text row).
+                        local_row: local - outputs_top + row,
                     },
                 });
             }
@@ -303,103 +337,149 @@ impl CellCtx<'_> {
     /// Per wrapped source row: (logical line, char range) — mirrors the
     /// layout cache's character wrapping.
     fn segments(&self) -> Vec<(usize, usize, usize)> {
-        let width = usize::from(self.text_w.max(1));
-        let mut out = Vec::new();
-        for (row, line) in self.cell.buffer.as_str().split('\n').enumerate() {
-            let mut start = 0usize;
-            let mut used = 0usize;
-            for (index, ch) in line.chars().enumerate() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if cw > 0 && used > 0 && used + cw > width {
-                    out.push((row, start, index));
-                    start = index;
-                    used = 0;
-                }
-                used += cw;
-            }
-            out.push((row, start, line.chars().count()));
-        }
-        out
+        wrap_segments(self.cell.buffer.as_str(), self.text_w)
     }
 
-    /// Wrapped (row index, display column) of the edit cursor.
-    fn cursor_visual(&self, segments: &[(usize, usize, usize)]) -> Option<(usize, u16)> {
-        let cursor = self.cell.buffer.cursor();
-        let line = self.cell.buffer.line(cursor.row).unwrap_or("");
-        let chars: Vec<char> = line.chars().collect();
-        let rows: Vec<usize> = segments
-            .iter()
-            .enumerate()
-            .filter(|(_, (row, _, _))| *row == cursor.row)
-            .map(|(index, _)| index)
-            .collect();
-        let first = *rows.first()?;
-        // The segment holding the cursor: the last one starting at or before it.
-        let index = rows
-            .iter()
-            .copied()
-            .filter(|index| segments[*index].1 <= cursor.col)
-            .last()
-            .unwrap_or(first);
-        let start = segments[index].1;
-        let col: usize = chars
-            .iter()
-            .skip(start)
-            .take(cursor.col.saturating_sub(start))
-            .map(|c| UnicodeWidthChar::width(*c).unwrap_or(0))
-            .sum();
-        Some((index, col as u16))
-    }
-
-    fn paint_selection(
+    /// An entered output: its plain text with cursor, selection and its own
+    /// scroll, drawn in the rows the output views normally occupy.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_output_text(
         &self,
         frame: &mut Frame<'_>,
-        rect: Rect,
-        row_index: usize,
-        segments: &[(usize, usize, usize)],
-        selection: wb_core::Selection,
-    ) {
-        let Some(&(line, seg_start, seg_end)) = segments.get(row_index) else {
-            return;
-        };
-        let (start, end) = if (selection.anchor.row, selection.anchor.col)
-            <= (selection.head.row, selection.head.col)
-        {
-            (selection.anchor, selection.head)
-        } else {
-            (selection.head, selection.anchor)
-        };
-        if line < start.row || line > end.row {
-            return;
-        }
-        let (from, to) = match selection.kind {
-            VisualKind::Line => (seg_start, seg_end.max(seg_start + 1)),
-            VisualKind::Char => {
-                let from = if line == start.row { start.col } else { 0 };
-                let to = if line == end.row { end.col + 1 } else { usize::MAX };
-                (from.max(seg_start), to.min(seg_end.max(seg_start + 1)))
+        out: &OutputText,
+        mode: CellMode,
+        first_local: u32,
+        region: u32,
+        accent: ratatui::style::Color,
+        geometry: &mut FrameGeometry,
+    ) -> Option<(u16, u16)> {
+        let p = &self.theme.palette;
+        let buf = &out.buffer;
+        let segments = wrap_segments(buf.as_str(), self.text_w);
+        let cursor_at = cursor_visual(buf, &segments);
+        let output_id = self.cell.outputs.first().map(|item| item.id)?;
+        let mut cursor = None;
+        for row in 0..region {
+            let Some(y) = self.screen_y(first_local + row) else {
+                continue;
+            };
+            let index = (out.scroll + row) as usize;
+            self.gutter(frame, y, "▌", accent);
+            let rect = self.text_rect(y);
+            frame.buffer_mut().set_style(rect, Style::default().bg(p.surface));
+            if let Some(&(line, start, end)) = segments.get(index) {
+                let text: String = buf
+                    .line(line)
+                    .unwrap_or("")
+                    .chars()
+                    .skip(start)
+                    .take(end - start)
+                    .collect();
+                frame.render_widget(
+                    Paragraph::new(Span::styled(text, Style::default().fg(p.fg))),
+                    rect,
+                );
+                if line == buf.cursor().row && !matches!(mode, CellMode::Visual(_)) {
+                    frame
+                        .buffer_mut()
+                        .set_style(rect, Style::default().bg(p.panel_selection));
+                }
+                if let Some(selection) = buf.selection() {
+                    paint_selection(frame, rect, index, &segments, buf, selection, self.theme);
+                }
+                if let Some((cursor_row, col)) = cursor_at {
+                    if cursor_row == index {
+                        cursor = Some((rect.x + col.min(self.text_w.saturating_sub(1)), y));
+                    }
+                }
             }
-        };
-        if from >= to {
-            return;
+            geometry.row_hits.push(RowHit {
+                screen_y: y,
+                target: HitTarget::CellOutput {
+                    cell_id: self.cell.id.clone(),
+                    output_id,
+                    local_row: index as u32,
+                },
+            });
         }
-        let text = self.cell.buffer.line(line).unwrap_or("");
-        let width_of = |a: usize, b: usize| -> u16 {
-            text.chars()
-                .skip(a)
-                .take(b.saturating_sub(a))
-                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-                .sum::<usize>()
-                .max(usize::from(b > a && a >= text.chars().count())) as u16
-        };
-        let x = rect.x + width_of(seg_start, from);
-        let w = width_of(from, to).max(1);
-        let area = Rect::new(x, rect.y, w.min(rect.right().saturating_sub(x)), 1);
-        frame.buffer_mut().set_style(
-            area,
-            Style::default().bg(self.theme.palette.panel_selection),
+        cursor
+    }
+
+    fn gutter(&self, frame: &mut Frame<'_>, y: u16, glyph: &str, color: ratatui::style::Color) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(color))),
+            Rect::new(self.area.x, y, 1, 1),
         );
     }
+}
+
+/// Wrapped (row index, display column) of a buffer's cursor.
+fn cursor_visual(buf: &TextBuffer, segments: &[(usize, usize, usize)]) -> Option<(usize, u16)> {
+    let cursor = buf.cursor();
+    let index = segment_of(segments, cursor);
+    let &(row, start, _) = segments.get(index)?;
+    if row != cursor.row {
+        return None;
+    }
+    let col: usize = buf
+        .line(cursor.row)
+        .unwrap_or("")
+        .chars()
+        .skip(start)
+        .take(cursor.col.saturating_sub(start))
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    Some((index, col as u16))
+}
+
+fn paint_selection(
+    frame: &mut Frame<'_>,
+    rect: Rect,
+    row_index: usize,
+    segments: &[(usize, usize, usize)],
+    buf: &TextBuffer,
+    selection: wb_core::Selection,
+    theme: &Theme,
+) {
+    let Some(&(line, seg_start, seg_end)) = segments.get(row_index) else {
+        return;
+    };
+    let (start, end) = if (selection.anchor.row, selection.anchor.col)
+        <= (selection.head.row, selection.head.col)
+    {
+        (selection.anchor, selection.head)
+    } else {
+        (selection.head, selection.anchor)
+    };
+    if line < start.row || line > end.row {
+        return;
+    }
+    let (from, to) = match selection.kind {
+        VisualKind::Line => (seg_start, seg_end.max(seg_start + 1)),
+        VisualKind::Char => {
+            let from = if line == start.row { start.col } else { 0 };
+            let to = if line == end.row { end.col + 1 } else { usize::MAX };
+            (from.max(seg_start), to.min(seg_end.max(seg_start + 1)))
+        }
+    };
+    if from >= to {
+        return;
+    }
+    let text = buf.line(line).unwrap_or("");
+    let width_of = |a: usize, b: usize| -> u16 {
+        text.chars()
+            .skip(a)
+            .take(b.saturating_sub(a))
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>()
+            .max(usize::from(b > a && a >= text.chars().count())) as u16
+    };
+    let x = rect.x + width_of(seg_start, from);
+    let w = width_of(from, to).max(1);
+    let area = Rect::new(x, rect.y, w.min(rect.right().saturating_sub(x)), 1);
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(theme.palette.panel_selection));
 }
 
 fn fmt_elapsed(elapsed: Duration) -> String {

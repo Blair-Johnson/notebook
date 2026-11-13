@@ -473,6 +473,7 @@ impl Plugin for BuiltinsPlugin {
             (95, "edit.open_below", "Open line below (o)"),
             (96, "edit.open_above", "Open line above (O)"),
             (97, "visual.swap_ends", "Swap selection ends (o)"),
+            (98, "output.jump", "Jump to the traceback line's cell"),
         ] {
             action(reg, id, ActionKind::Command, "Editing", order, title, false);
         }

@@ -180,8 +180,9 @@ impl OutputView for StreamOutputView {
         self.rev = self.rev.wrapping_add(1);
     }
 
+    /// Plain text: entering the output gives vim navigation over it instead.
     fn is_focusable(&self) -> bool {
-        true
+        false
     }
 
     fn key_context(&self) -> Option<KeyContextId> {

@@ -1,7 +1,7 @@
 //! Central `Coordinator` state machine and `Effect` chokepoint.
 
 use crate::config_store::{ConfigSnapshot, SettingsStore};
-use crate::focus::{CellMode, FocusLayer, FocusStack, ModalKind};
+use crate::focus::{CellMode, CellPart, FocusLayer, FocusStack, ModalKind};
 use crate::grammar::{GrammarStep, VimGrammar};
 use crate::intelligence::{
     CompletionPopup, InspectPager, SignaturePopup, scan_notebook_identifiers,
@@ -71,6 +71,10 @@ pub struct Coordinator {
     pub path: Option<PathBuf>,
     pub document: Document,
     pub selected_cell: CellId,
+    /// Whether the selection is on the cell's source or its outputs.
+    pub selected_part: CellPart,
+    /// The entered output's read-only text, while `OutputFocus` is active.
+    pub output_text: Option<vim::OutputText>,
     pub focus: FocusStack,
     pub grammar: VimGrammar,
     pub scroll_row: u32,
@@ -146,6 +150,8 @@ impl Coordinator {
             path,
             document,
             selected_cell,
+            selected_part: CellPart::Source,
+            output_text: None,
             focus: FocusStack::default(),
             grammar: VimGrammar::default(),
             scroll_row: 0,
@@ -209,13 +215,21 @@ impl Coordinator {
         )
     }
 
+    /// Text in the unnamed register (last yank or delete).
+    pub fn vim_register_text(&self) -> &str {
+        &self.vim.register.text
+    }
+
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let snap = self.settings.snapshot().clone();
+        self.reconcile_outputs();
         self.keep_focus_visible(frame.area(), &snap);
         let view = AppView {
             path: self.path.as_deref(),
             document: &self.document,
             selected_cell: &self.selected_cell,
+            selected_part: self.selected_part,
+            output_text: self.output_text.as_ref(),
             focus: &self.focus,
             scroll_row: self.scroll_row,
             kernel_name: &self.kernel_name,
@@ -287,6 +301,7 @@ impl Coordinator {
         );
         let height = u32::from(viewport.height.max(1));
         self.vim.half_page = usize::from(viewport.height / 2).max(1);
+        let output_region = self.output_region_rows(text_w);
         if self.follow_focus {
             self.follow_focus = false;
             if let Some(index) = self.document.position_of(&self.selected_cell) {
@@ -294,11 +309,27 @@ impl Coordinator {
                 if index < heights.len() {
                     let top = heights.prefix_sum(index);
                     let cell_rows = heights.height(index);
+                    let source_rows = self
+                        .layout_cache
+                        .cached(&self.selected_cell)
+                        .map_or(1, |cached| cached.wrapped_source.len() as u32);
+                    let outputs_top = top + 1 + source_rows;
+                    let entered = matches!(self.focus.base(), FocusLayer::OutputFocus { .. });
                     let (want_top, want_bottom) = match editing.as_ref() {
                         Some(id) if id == &self.selected_cell => {
                             let row = top + 1 + self.cursor_visual_row(id, text_w);
                             (row, row + 1)
                         }
+                        _ if entered => {
+                            let row = output_region.map_or(0, |(cursor_row, scroll, _)| {
+                                cursor_row.saturating_sub(scroll)
+                            });
+                            (outputs_top + row, outputs_top + row + 1)
+                        }
+                        _ if self.selected_part == CellPart::Output => (
+                            outputs_top,
+                            (top + cell_rows).min(outputs_top + height),
+                        ),
                         _ => (top, top + cell_rows.min(height)),
                     };
                     if want_top < self.scroll_row {
@@ -311,6 +342,53 @@ impl Coordinator {
         }
         let total = self.layout_cache.heights().total_height();
         self.scroll_row = self.scroll_row.min(total.saturating_sub(height));
+    }
+
+    /// For an entered output: keep its cursor inside the output region by
+    /// scrolling the text, and return `(cursor text row, scroll, region rows)`.
+    fn output_region_rows(&mut self, text_w: u16) -> Option<(u32, u32, u32)> {
+        let out = self.output_text.as_mut()?;
+        let index = self.document.position_of(&out.cell_id)?;
+        let heights = self.layout_cache.heights();
+        if index >= heights.len() {
+            return None;
+        }
+        let source_rows = self
+            .layout_cache
+            .cached(&out.cell_id)
+            .map_or(1, |cached| cached.wrapped_source.len() as u32);
+        let region = heights.height(index).saturating_sub(1 + source_rows).max(1);
+        let segments = vim::wrap_segments(out.buffer.as_str(), text_w);
+        let cursor_row = vim::segment_of(&segments, out.buffer.cursor()) as u32;
+        let max_scroll = (segments.len() as u32).saturating_sub(region);
+        if cursor_row < out.scroll {
+            out.scroll = cursor_row;
+        } else if cursor_row >= out.scroll + region {
+            out.scroll = cursor_row + 1 - region;
+        }
+        out.scroll = out.scroll.min(max_scroll);
+        Some((cursor_row, out.scroll, region))
+    }
+
+    /// Keep the notebook-level selection and an entered output consistent
+    /// with the document (outputs can be cleared or arrive late).
+    fn reconcile_outputs(&mut self) {
+        let has_outputs = |doc: &Document, id: &CellId| {
+            doc.cell(id)
+                .is_some_and(|cell| !cell.outputs.is_empty() && !cell.collapsed)
+        };
+        if self.selected_part == CellPart::Output
+            && !has_outputs(&self.document, &self.selected_cell)
+        {
+            self.selected_part = CellPart::Source;
+        }
+        let Some(out) = self.output_text.as_mut() else {
+            return;
+        };
+        match self.document.cell(&out.cell_id) {
+            Some(cell) if !cell.outputs.is_empty() => out.refresh(cell),
+            _ => self.leave_cell_layers(),
+        }
     }
 
     /// Wrapped source row of the edit cursor within its cell (excluding the
@@ -516,17 +594,41 @@ impl Coordinator {
                 }
             }
             HitTarget::CellOutput {
-                cell_id, output_id, ..
+                cell_id, local_row, ..
             } => {
-                self.leave_cell_layers();
-                self.select_cell(cell_id.clone());
-                if let Some(view) = self.output_views.get(&output_id) {
-                    if let Some(context) = view.key_context() {
-                        self.focus.push(FocusLayer::OutputFocus {
-                            cell_id,
-                            output_id,
-                            context,
-                        });
+                let inside = matches!(
+                    self.focus.top(),
+                    FocusLayer::OutputFocus { cell_id: current, .. } if current == &cell_id
+                );
+                if !inside {
+                    self.enter_output(cell_id);
+                }
+                // `local_row` counts wrapped text rows of the output block.
+                let width = self.layout_cache.last_width();
+                let dx = usize::from(mouse.column.saturating_sub(self.last_geometry.text_x));
+                if let Some(out) = self.output_text.as_mut() {
+                    let segments = vim::wrap_segments(out.buffer.as_str(), width);
+                    if let Some(&(row, start, end)) = segments
+                        .get(local_row as usize)
+                        .or_else(|| segments.last())
+                    {
+                        let line = out.buffer.line(row).unwrap_or("");
+                        let mut col = start;
+                        let mut used = 0usize;
+                        for ch in line.chars().skip(start).take(end - start) {
+                            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            if used + width > dx {
+                                break;
+                            }
+                            used += width;
+                            col += 1;
+                        }
+                        out.buffer.clear_selection();
+                        out.buffer.set_cursor(CursorPos { row, col });
+                        vim::clamp_normal(&mut out.buffer);
+                    }
+                    if let FocusLayer::OutputFocus { mode, .. } = self.focus.top_mut() {
+                        *mode = CellMode::Normal;
                     }
                 }
             }
@@ -851,9 +953,7 @@ impl Coordinator {
             FocusLayer::CellEdit { cell_id, mode, .. } => {
                 self.dispatch_cell_edit(&cell_id, mode, input)
             }
-            FocusLayer::OutputFocus {
-                cell_id, output_id, ..
-            } => self.dispatch_output(&cell_id, output_id, input),
+            FocusLayer::OutputFocus { mode, .. } => self.dispatch_output(mode, input),
             FocusLayer::PdbInput => {
                 self.dispatch_pdb(input);
                 Effect::None
@@ -1321,10 +1421,15 @@ impl Coordinator {
                 Effect::None
             }
             "cell.enter_normal" => {
-                self.begin_cell_edit(CellMode::Normal);
+                if self.selected_part == CellPart::Output {
+                    self.enter_output(self.selected_cell.clone());
+                } else {
+                    self.begin_cell_edit(CellMode::Normal);
+                }
                 Effect::None
             }
             "cell.enter_insert" => {
+                self.selected_part = CellPart::Source;
                 self.begin_cell_edit(CellMode::Insert);
                 Effect::None
             }
@@ -1352,7 +1457,11 @@ impl Coordinator {
             }
             "cell.run_and_advance" => {
                 self.run_selected();
-                self.move_selected("motion.down", 1);
+                // Advance to the next cell, past this cell's outputs.
+                let next = self.selected_index() + 1;
+                if let Some(id) = self.document.order().get(next).cloned() {
+                    self.select_cell(id);
+                }
                 Effect::None
             }
             "cell.run_all" => {
@@ -1372,7 +1481,7 @@ impl Coordinator {
                 Effect::None
             }
             "cell.focus_output" => {
-                self.focus_first_output();
+                self.enter_output(self.selected_cell.clone());
                 Effect::None
             }
             "cell.edit_external" => Effect::OpenExternalEditor(self.selected_cell.clone()),
@@ -1613,79 +1722,196 @@ impl Coordinator {
         }
     }
 
-    fn dispatch_output(
-        &mut self,
-        cell_id: &CellId,
-        output_id: OutputId,
-        input: ResolvedInput,
-    ) -> Effect {
-        let Some(item) = self
+    /// Keys inside an entered output: vim motions, visual mode and yank over
+    /// read-only text.
+    fn dispatch_output(&mut self, mode: CellMode, input: ResolvedInput) -> Effect {
+        // Interactive plugin views (widgets, inspectors) get first refusal;
+        // anything they ignore is plain-text vim navigation.
+        if let Some(outcome) = self.offer_to_output_views(&input) {
+            if matches!(outcome, InputOutcome::PopFocus) {
+                self.leave_cell_layers();
+            }
+            if !matches!(outcome, InputOutcome::Ignored) {
+                return Effect::None;
+            }
+        }
+        let vim_mode = match mode {
+            CellMode::Visual(kind) => vim::Mode::Visual(kind),
+            _ => vim::Mode::Normal,
+        };
+        match input {
+            ResolvedInput::Move { motion, count, arg } => {
+                self.with_output_vim(|vim, buf| {
+                    vim.move_cursor(buf, vim_mode, motion.0.as_ref(), arg, count)
+                });
+            }
+            ResolvedInput::OperateSelf { op, count } => {
+                self.with_output_vim(|vim, buf| {
+                    vim.operate(buf, vim_mode, op.0.as_ref(), None, count, true)
+                });
+            }
+            ResolvedInput::Operate { op, target, count } => {
+                self.with_output_vim(|vim, buf| {
+                    vim.operate(buf, vim_mode, op.0.as_ref(), Some(&target), count, true)
+                });
+            }
+            ResolvedInput::Command { id, count, arg } => match id.0.as_ref() {
+                "focus.up" => {
+                    if matches!(mode, CellMode::Visual(_)) {
+                        if let Some(out) = self.output_text.as_mut() {
+                            out.buffer.clear_selection();
+                        }
+                        self.set_output_mode(CellMode::Normal);
+                    } else {
+                        self.leave_cell_layers();
+                    }
+                }
+                "output.jump" => self.jump_from_output(),
+                id => {
+                    let id = id.to_string();
+                    self.with_output_vim(|vim, buf| {
+                        vim.command(buf, vim_mode, &id, count.unwrap_or(1), arg, true)
+                    });
+                }
+            },
+            ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => {}
+        }
+        Effect::None
+    }
+
+    /// Offer a key to the entered cell's first focusable output view.
+    fn offer_to_output_views(&mut self, input: &ResolvedInput) -> Option<InputOutcome> {
+        let cell_id = self.output_text.as_ref()?.cell_id.clone();
+        let item = self
             .document
-            .cell(cell_id)
-            .and_then(|cell| cell.outputs.iter().find(|item| item.id == output_id))
-            .cloned()
-        else {
-            self.focus.pop();
-            return Effect::None;
-        };
+            .cell(&cell_id)?
+            .outputs
+            .iter()
+            .find(|item| {
+                self.output_views
+                    .get(&item.id)
+                    .is_some_and(|view| view.is_focusable())
+            })?
+            .clone();
+        let view = self.output_views.get_mut(&item.id)?;
         let mut jumped = None;
-        let outcome = if let Some(view) = self.output_views.get_mut(&output_id) {
-            let mut host = CoordinatorOutputHost {
-                kernel: &mut *self.kernel,
-                clipboard: &mut *self.clipboard,
-                selected_cell: &mut self.selected_cell,
-                notice: &mut self.notice,
-                jumped: &mut jumped,
-            };
-            view.handle_input(&item, input.clone(), &mut host)
-        } else {
-            InputOutcome::Ignored
+        let mut host = CoordinatorOutputHost {
+            kernel: &mut *self.kernel,
+            clipboard: &mut *self.clipboard,
+            selected_cell: &mut self.selected_cell,
+            notice: &mut self.notice,
+            jumped: &mut jumped,
         };
-        if let Some((jump_cell, line)) = jumped {
-            self.select_cell(jump_cell.clone());
-            if let Some(cell) = self.document.cell_mut(&jump_cell) {
+        let outcome = view.handle_input(&item, input.clone(), &mut host);
+        if let Some((cell, line)) = jumped {
+            self.leave_cell_layers();
+            self.select_cell(cell.clone());
+            self.begin_cell_edit(CellMode::Normal);
+            if let Some(cell) = self.document.cell_mut(&cell) {
                 cell.buffer.set_cursor(CursorPos {
                     row: line.unwrap_or(0),
                     col: 0,
                 });
             }
         }
-        if matches!(outcome, InputOutcome::PopFocus)
-            || matches!(input, ResolvedInput::Command { ref id, .. } if id.0.as_ref() == "focus.up")
-        {
-            self.focus.pop();
+        Some(outcome)
+    }
+
+    fn with_output_vim<F>(&mut self, edit: F) -> vim::Outcome
+    where
+        F: FnOnce(&mut vim::VimState, &mut wb_core::TextBuffer) -> vim::Outcome,
+    {
+        let Some(out) = self.output_text.as_mut() else {
+            return vim::Outcome::default();
+        };
+        let outcome = edit(&mut self.vim, &mut out.buffer);
+        if outcome.yanked {
+            self.yank_text = self.vim.register.text.clone();
+            let _ = self.clipboard.copy(&self.vim.register.text);
         }
-        Effect::None
+        if let Some(kind) = outcome.visual {
+            self.set_output_mode(CellMode::Visual(kind));
+        } else if outcome.normal {
+            self.set_output_mode(CellMode::Normal);
+        }
+        outcome
+    }
+
+    /// Selectable notebook items in order: each cell's source, then its
+    /// outputs when it has any.
+    fn notebook_items(&self) -> Vec<(CellId, CellPart)> {
+        let mut items = Vec::with_capacity(self.document.order().len() * 2);
+        for cell in self.document.cells_in_order() {
+            items.push((cell.id.clone(), CellPart::Source));
+            if !cell.outputs.is_empty() && !cell.collapsed {
+                items.push((cell.id.clone(), CellPart::Output));
+            }
+        }
+        items
+    }
+
+    /// Screen rows an item occupies (header + source, or the output block).
+    fn item_rows(&self, id: &CellId, part: CellPart) -> usize {
+        let Some(index) = self.document.position_of(id) else {
+            return 1;
+        };
+        let heights = self.layout_cache.heights();
+        let total = if index < heights.len() {
+            heights.height(index) as usize
+        } else {
+            1
+        };
+        let source = 1 + self
+            .layout_cache
+            .cached(id)
+            .map_or(1, |cached| cached.wrapped_source.len());
+        match part {
+            CellPart::Source => source.min(total),
+            CellPart::Output => total.saturating_sub(source).max(1),
+        }
     }
 
     fn move_selected(&mut self, motion: &str, count: u32) {
-        let len = self.document.order().len();
-        if len == 0 {
+        let items = self.notebook_items();
+        if items.is_empty() {
             return;
         }
-        let current = self.selected_index();
+        let last = items.len() - 1;
+        let current = items
+            .iter()
+            .position(|(id, part)| id == &self.selected_cell && *part == self.selected_part)
+            .or_else(|| items.iter().position(|(id, _)| id == &self.selected_cell))
+            .unwrap_or(0);
+        let count = count.max(1) as usize;
+        let half = usize::from(self.last_geometry.viewport_rect.height / 2).max(1) * count;
         let next = match motion {
-            "motion.down" => current.saturating_add(count as usize).min(len - 1),
-            "motion.up" => current.saturating_sub(count as usize),
+            "motion.down" => (current + count).min(last),
+            "motion.up" => current.saturating_sub(count),
             "motion.top" => 0,
-            "motion.bottom" => len - 1,
-            "motion.half_page_down" => current
-                .saturating_add(
-                    (count as usize)
-                        .saturating_mul(self.last_geometry.viewport_rect.height as usize / 2)
-                        .max(1),
-                )
-                .min(len - 1),
-            "motion.half_page_up" => current.saturating_sub(
-                (count as usize)
-                    .saturating_mul(self.last_geometry.viewport_rect.height as usize / 2)
-                    .max(1),
-            ),
+            "motion.bottom" => last,
+            "motion.half_page_down" => {
+                let mut index = current;
+                let mut rows = 0;
+                while index < last && rows < half {
+                    rows += self.item_rows(&items[index].0, items[index].1);
+                    index += 1;
+                }
+                index
+            }
+            "motion.half_page_up" => {
+                let mut index = current;
+                let mut rows = 0;
+                while index > 0 && rows < half {
+                    index -= 1;
+                    rows += self.item_rows(&items[index].0, items[index].1);
+                }
+                index
+            }
             _ => current,
         };
-        if let Some(cell_id) = self.document.order().get(next).cloned() {
-            self.select_cell(cell_id);
-        }
+        let (id, part) = items[next].clone();
+        self.select_cell(id);
+        self.selected_part = part;
     }
 
     /// Insert-mode cursor keys: the cursor may sit after the last character.
@@ -1711,6 +1937,31 @@ impl Coordinator {
     }
 
     fn apply_notebook_operator(&mut self, op: &str, target: Option<MotionOrObject>, count: u32) {
+        // On an output, `yy` copies it and `dd` clears it.
+        if self.selected_part == CellPart::Output && target.is_none() {
+            let id = self.selected_cell.clone();
+            match op {
+                "op.yank" => {
+                    if let Some(cell) = self.document.cell(&id) {
+                        let mut text = vim::outputs_text(cell);
+                        text.push('\n');
+                        self.vim.register = vim::Register {
+                            text: text.clone(),
+                            linewise: true,
+                        };
+                        self.yank_text = text.clone();
+                        let _ = self.clipboard.copy(&text);
+                        self.notice = Some("copied output".into());
+                    }
+                }
+                "op.delete" => {
+                    self.clear_outputs(&id);
+                    self.selected_part = CellPart::Source;
+                }
+                _ => {}
+            }
+            return;
+        }
         let start = self.selected_index();
         let last = self.document.order().len().saturating_sub(1);
         let moving_up = matches!(
@@ -1809,6 +2060,7 @@ impl Coordinator {
                 }
                 FocusLayer::OutputFocus { .. } => {
                     self.focus.pop();
+                    self.output_text = None;
                 }
                 _ => break,
             }
@@ -2269,24 +2521,75 @@ impl Coordinator {
         self.remount_output_views();
     }
 
-    fn focus_first_output(&mut self) {
-        let id = self.selected_cell.clone();
-        let Some(cell) = self.document.cell(&id) else {
+    /// Enter a cell's outputs as read-only text in normal mode.
+    fn enter_output(&mut self, cell_id: CellId) {
+        let Some(cell) = self.document.cell(&cell_id) else {
             return;
         };
-        for item in &cell.outputs {
-            if let Some(view) = self.output_views.get(&item.id) {
-                if view.is_focusable() {
-                    if let Some(context) = view.key_context() {
-                        self.focus.push(FocusLayer::OutputFocus {
-                            cell_id: id,
-                            output_id: item.id,
-                            context,
-                        });
-                    }
-                    break;
-                }
-            }
+        if cell.outputs.is_empty() {
+            return;
+        }
+        let text = vim::OutputText::new(cell);
+        self.leave_cell_layers();
+        self.selected_cell = cell_id.clone();
+        self.selected_part = CellPart::Output;
+        self.output_text = Some(text);
+        self.focus.push(FocusLayer::OutputFocus {
+            cell_id,
+            mode: CellMode::Normal,
+        });
+        self.vim.reset_column();
+        self.follow_focus = true;
+    }
+
+    fn set_output_mode(&mut self, mode: CellMode) {
+        if let FocusLayer::OutputFocus { mode: current, .. } = self.focus.top_mut() {
+            *current = mode;
+        }
+    }
+
+    /// `Enter` on a traceback line such as `Cell In[3], line 7` (or the
+    /// older `<ipython-input-3-…>`, line 7) jumps to that cell and line.
+    fn jump_from_output(&mut self) {
+        let Some(out) = self.output_text.as_ref() else {
+            return;
+        };
+        let line = out.buffer.line(out.buffer.cursor().row).unwrap_or("").to_string();
+        let digits = |text: &str| -> Option<usize> {
+            let end = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+            text[..end].parse().ok()
+        };
+        let count = line
+            .split_once("Cell In[")
+            .or_else(|| line.split_once("ipython-input-"))
+            .and_then(|(_, rest)| digits(rest));
+        let row = line
+            .split_once("line ")
+            .and_then(|(_, rest)| digits(rest))
+            .map(|line| line.saturating_sub(1));
+        let target = count.and_then(|count| {
+            self.document
+                .cells_in_order()
+                .find(|cell| cell.execution_count == Some(count as i64))
+                .map(|cell| cell.id.clone())
+        });
+        let Some(target) = target else {
+            self.notice = Some("no notebook cell on this line".into());
+            return;
+        };
+        self.leave_cell_layers();
+        self.select_cell(target.clone());
+        self.begin_cell_edit(CellMode::Normal);
+        if let Some(cell) = self.document.cell_mut(&target) {
+            cell.buffer.set_cursor(CursorPos {
+                row: row.unwrap_or(0),
+                col: 0,
+            });
+            let col = cell.buffer.first_nonblank_col(cell.buffer.cursor().row);
+            cell.buffer.set_cursor(CursorPos {
+                row: cell.buffer.cursor().row,
+                col,
+            });
         }
     }
 
@@ -2445,6 +2748,7 @@ impl Coordinator {
     fn select_cell(&mut self, cell_id: CellId) {
         if self.document.cell(&cell_id).is_some() {
             self.selected_cell = cell_id;
+            self.selected_part = CellPart::Source;
             self.ensure_selected_visible();
         }
     }

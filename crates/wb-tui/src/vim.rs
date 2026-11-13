@@ -610,6 +610,85 @@ impl Outcome {
     }
 }
 
+/// A cell's outputs entered as read-only text.
+#[derive(Debug)]
+pub struct OutputText {
+    pub cell_id: wb_core::CellId,
+    pub buffer: TextBuffer,
+    /// First wrapped text row shown in the output region.
+    pub scroll: u32,
+    /// Output revision the text was built from.
+    pub revision: u64,
+}
+
+impl OutputText {
+    pub fn new(cell: &wb_core::Cell) -> Self {
+        Self {
+            cell_id: cell.id.clone(),
+            buffer: TextBuffer::new(outputs_text(cell)),
+            scroll: 0,
+            revision: outputs_revision(cell),
+        }
+    }
+
+    /// Rebuild after outputs changed (late output), keeping the cursor.
+    pub fn refresh(&mut self, cell: &wb_core::Cell) {
+        let revision = outputs_revision(cell);
+        if revision != self.revision {
+            let cursor = self.buffer.cursor();
+            self.buffer = TextBuffer::new(outputs_text(cell));
+            self.buffer.set_cursor(cursor);
+            clamp_normal(&mut self.buffer);
+            self.revision = revision;
+        }
+    }
+}
+
+/// All of a cell's outputs as one block of plain text.
+pub fn outputs_text(cell: &wb_core::Cell) -> String {
+    cell.outputs
+        .iter()
+        .map(wb_core::OutputItem::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn outputs_revision(cell: &wb_core::Cell) -> u64 {
+    cell.outputs.iter().fold(cell.outputs.len() as u64, |acc, output| {
+        acc.wrapping_mul(1_000_003).wrapping_add(output.rev)
+    })
+}
+
+/// Character-wrap `text` at `width` display columns: one
+/// `(logical row, start char, end char)` per screen row.
+pub fn wrap_segments(text: &str, width: u16) -> Vec<(usize, usize, usize)> {
+    let width = usize::from(width.max(1));
+    let mut out = Vec::new();
+    for (row, line) in text.split('\n').enumerate() {
+        let mut start = 0usize;
+        let mut used = 0usize;
+        for (index, ch) in line.chars().enumerate() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cw > 0 && used > 0 && used + cw > width {
+                out.push((row, start, index));
+                start = index;
+                used = 0;
+            }
+            used += cw;
+        }
+        out.push((row, start, line.chars().count()));
+    }
+    out
+}
+
+/// Screen row (index into `segments`) holding `pos`.
+pub fn segment_of(segments: &[(usize, usize, usize)], pos: CursorPos) -> usize {
+    segments
+        .iter()
+        .rposition(|&(row, start, _)| row == pos.row && start <= pos.col)
+        .unwrap_or(0)
+}
+
 /// Ids `command` treats as text edits (ignored, not unknown, when read-only).
 fn is_edit_command(id: &str) -> bool {
     id.starts_with("edit.") || matches!(id, "cell.enter_insert" | "cell.append_char")

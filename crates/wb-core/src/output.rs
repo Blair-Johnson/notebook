@@ -180,4 +180,65 @@ impl OutputItem {
     pub fn bump_rev(&mut self) {
         self.rev = self.rev.wrapping_add(1);
     }
+
+    /// The output as plain text, as a reader would copy it: stream text,
+    /// `text/plain` of rich outputs, or the traceback without ANSI colors.
+    pub fn plain_text(&self) -> String {
+        let text = match &self.data {
+            OutputData::Stream { buffer, .. } => buffer.as_str().to_string(),
+            OutputData::Rich { bundle, .. } => match bundle.get("text/plain") {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<String>(),
+                _ => bundle
+                    .keys()
+                    .next()
+                    .map_or_else(String::new, |mime| format!("<{mime}>")),
+            },
+            OutputData::Error {
+                ename,
+                evalue,
+                traceback,
+            } => {
+                if traceback.is_empty() {
+                    format!("{ename}: {evalue}")
+                } else {
+                    traceback.join("\n")
+                }
+            }
+        };
+        strip_ansi(text.trim_end_matches('\n'))
+    }
+}
+
+/// Remove ANSI CSI/OSC escape sequences.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

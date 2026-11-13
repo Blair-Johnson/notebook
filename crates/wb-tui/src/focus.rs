@@ -1,6 +1,6 @@
 //! Explicit `FocusStack` replacing ad-hoc `Option`-field modal cascades.
 
-use wb_core::{CellId, OutputId, VisualKind};
+use wb_core::{CellId, VisualKind};
 use wb_sdk::KeyContextId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -8,6 +8,15 @@ pub enum CellMode {
     Normal,
     Insert,
     Visual(VisualKind),
+}
+
+/// Which half of a cell the notebook-level selection is on. Outputs are
+/// selectable items in their own right, between their cell and the next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CellPart {
+    #[default]
+    Source,
+    Output,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,10 +39,10 @@ pub enum FocusLayer {
         mode: CellMode,
         expanded_split: bool,
     },
+    /// A cell's outputs, entered as read-only text (normal or visual mode).
     OutputFocus {
         cell_id: CellId,
-        output_id: OutputId,
-        context: KeyContextId,
+        mode: CellMode,
     },
     PdbInput,
     Modal(ModalKind),
@@ -46,7 +55,10 @@ impl FocusLayer {
             Self::CellEdit { mode: CellMode::Normal, .. } => KeyContextId::new_static("cell.normal"),
             Self::CellEdit { mode: CellMode::Insert, .. } => KeyContextId::new_static("cell.insert"),
             Self::CellEdit { mode: CellMode::Visual(_), .. } => KeyContextId::new_static("cell.visual"),
-            Self::OutputFocus { context, .. } => context.clone(),
+            Self::OutputFocus { mode: CellMode::Visual(_), .. } => {
+                KeyContextId::new_static("output.visual")
+            }
+            Self::OutputFocus { .. } => KeyContextId::new_static("output.normal"),
             Self::PdbInput => KeyContextId::new_static("pdb.input"),
             Self::Modal(ModalKind::Settings) => KeyContextId::new_static("modal.settings"),
             Self::Modal(_) => KeyContextId::new_static("modal.generic"),
@@ -59,6 +71,7 @@ impl FocusLayer {
             Self::CellEdit { mode: CellMode::Normal, .. } => "NORMAL",
             Self::CellEdit { mode: CellMode::Insert, .. } => "INSERT",
             Self::CellEdit { mode: CellMode::Visual(_), .. } => "VISUAL",
+            Self::OutputFocus { mode: CellMode::Visual(_), .. } => "VISUAL",
             Self::OutputFocus { .. } => "OUTPUT",
             Self::PdbInput => "DEBUGGER",
             Self::Modal(kind) => match kind {

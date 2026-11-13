@@ -301,6 +301,8 @@ fn renderer_populates_frame_geometry_on_test_backend_without_mutating_document()
         path: None,
         document: &document,
         selected_cell: &selected,
+        selected_part: wb_tui::focus::CellPart::Source,
+        output_text: None,
         focus: &focus,
         scroll_row: 0,
         kernel_name: "python3",

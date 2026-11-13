@@ -122,6 +122,7 @@
 
 # Outputs are read-only text: every motion, visual mode, and yank.
 [keys."output.normal"]
+"output.jump" = ["enter"]
 
 [keys."output.visual"]
 "visual.swap_ends" = ["o"]

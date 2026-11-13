@@ -46,6 +46,10 @@ pub struct AppView<'a> {
     pub path: Option<&'a Path>,
     pub document: &'a Document,
     pub selected_cell: &'a CellId,
+    /// Source or outputs of the selected cell (notebook level).
+    pub selected_part: crate::focus::CellPart,
+    /// The entered output's read-only text, if any.
+    pub output_text: Option<&'a crate::vim::OutputText>,
     pub focus: &'a FocusStack,
     pub scroll_row: u32,
     pub kernel_name: &'a str,
