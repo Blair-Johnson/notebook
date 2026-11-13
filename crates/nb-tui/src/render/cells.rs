@@ -655,7 +655,11 @@ impl CellCtx<'_> {
     ) -> Option<(u16, u16)> {
         let p = &self.theme.palette;
         let buf = &out.buffer;
-        let segments = wrap_segments(buf.as_str(), self.text_w);
+        // Wrapped once per text and width by the coordinator's scroll pass.
+        let segments = match out.cached_segments(self.text_w) {
+            Some(segments) => std::borrow::Cow::Borrowed(segments),
+            None => std::borrow::Cow::Owned(wrap_segments(buf.as_str(), self.text_w)),
+        };
         let cursor_at = cursor_visual(buf, &segments);
         let output_id = self.cell.outputs.first().map(|item| item.id)?;
         let mut cursor = None;

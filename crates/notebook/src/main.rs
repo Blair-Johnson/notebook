@@ -193,6 +193,8 @@ async fn run_loop(
     let dog = watchdog::Watchdog::spawn();
     dog.enter(watchdog::Phase::Draw);
     draw_frame(terminal, coordinator)?;
+    let mut last_draw = Instant::now();
+    let mut pending_draw = false;
 
     while !coordinator.should_quit {
         let mut redraw = false;
@@ -229,6 +231,20 @@ async fn run_loop(
                 )?;
                 redraw = !coordinator.should_quit;
             }
+            // Ticks before kernel events: they are rarely ready, and a flood
+            // of output must not starve them (autosave, notices).
+            _ = fast_tick.tick() => {
+                kind = "tick";
+                dog.enter(watchdog::Phase::Tick);
+                started = Instant::now();
+                redraw = coordinator.on_tick(Instant::now());
+            }
+            _ = autosave_tick.tick() => {
+                kind = "autosave";
+                dog.enter(watchdog::Phase::Autosave);
+                started = Instant::now();
+                coordinator.on_autosave_tick();
+            }
             kernel_event = nb_kernel::recv_event(coordinator.kernel.as_mut()), if kernel_open => {
                 match kernel_event {
                     Some(first) => {
@@ -248,28 +264,31 @@ async fn run_loop(
                     None => kernel_open = false,
                 }
             }
-            _ = fast_tick.tick() => {
-                kind = "tick";
-                dog.enter(watchdog::Phase::Tick);
+            _ = tokio::time::sleep_until((last_draw + FRAME_INTERVAL).into()), if pending_draw => {
+                kind = "frame";
                 started = Instant::now();
-                redraw = coordinator.on_tick(Instant::now());
-            }
-            _ = autosave_tick.tick() => {
-                kind = "autosave";
-                dog.enter(watchdog::Phase::Autosave);
-                started = Instant::now();
-                coordinator.on_autosave_tick();
+                redraw = true;
             }
         }
         let handled = started.elapsed();
         if redraw && !coordinator.should_quit {
-            dog.enter(watchdog::Phase::Draw);
-            draw_frame(terminal, coordinator)?;
+            // Input draws at once; output and ticks at most once a frame.
+            if kind == "input" || last_draw.elapsed() >= FRAME_INTERVAL {
+                dog.enter(watchdog::Phase::Draw);
+                draw_frame(terminal, coordinator)?;
+                last_draw = Instant::now();
+                pending_draw = false;
+            } else {
+                pending_draw = true;
+            }
         }
         trace.record(coordinator, kind, handled, started.elapsed() - handled);
     }
     Ok(())
 }
+
+/// Redraws caused by kernel output or ticks come at most this often.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Loop iterations slower than this are reported in the log overlay.
 const SLOW_ITERATION: Duration = Duration::from_millis(100);

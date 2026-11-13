@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 /// Zero-based `(row, char_col)` cursor coordinates within a single cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -40,6 +41,9 @@ pub struct TextBuffer {
     selection: Option<Selection>,
     undo_stack: Vec<BufferSnapshot>,
     redo_stack: Vec<BufferSnapshot>,
+    /// Byte offset of each line start, built on first use after an edit:
+    /// drawing looks lines up per screen row.
+    line_index: OnceLock<Vec<usize>>,
 }
 
 impl TextBuffer {
@@ -50,7 +54,16 @@ impl TextBuffer {
             selection: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            line_index: OnceLock::new(),
         }
+    }
+
+    fn line_index(&self) -> &[usize] {
+        self.line_index.get_or_init(|| {
+            std::iter::once(0)
+                .chain(self.text.match_indices('\n').map(|(offset, _)| offset + 1))
+                .collect()
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -66,7 +79,7 @@ impl TextBuffer {
     }
 
     pub fn line_count(&self) -> usize {
-        self.text.split('\n').count().max(1)
+        self.line_index().len()
     }
 
     /// Convert a row/character-column position into a Unicode-scalar offset.
@@ -114,7 +127,10 @@ impl TextBuffer {
     }
 
     pub fn line(&self, row: usize) -> Option<&str> {
-        self.text.split('\n').nth(row)
+        let index = self.line_index();
+        let start = *index.get(row)?;
+        let end = index.get(row + 1).map_or(self.text.len(), |next| next - 1);
+        Some(&self.text[start..end])
     }
 
     pub fn line_char_len(&self, row: usize) -> usize {
@@ -131,6 +147,7 @@ impl TextBuffer {
         let offset = self.char_offset_of(self.cursor);
         let byte_offset = self.byte_offset_of_char(offset);
         self.text.insert_str(byte_offset, s);
+        self.line_index = OnceLock::new();
         for ch in s.chars() {
             if ch == '\n' {
                 self.cursor.row += 1;
@@ -157,12 +174,14 @@ impl TextBuffer {
         let start_byte = self.byte_offset_of_char(start);
         let end_byte = self.byte_offset_of_char(cursor_offset);
         self.text.replace_range(start_byte..end_byte, "");
+        self.line_index = OnceLock::new();
         self.cursor = self.cursor_at_offset(start);
         self.selection = None;
     }
 
     pub fn replace_all(&mut self, text: impl Into<String>) {
         self.text = text.into();
+        self.line_index = OnceLock::new();
         self.cursor = CursorPos::default();
         self.selection = None;
     }
@@ -177,6 +196,7 @@ impl TextBuffer {
         let start = self.byte_offset_of_char(offset);
         let end = self.byte_offset_of_char(offset + 1);
         self.text.replace_range(start..end, "");
+        self.line_index = OnceLock::new();
         self.cursor = self.cursor_at_offset(offset);
         self.selection = None;
     }
@@ -195,6 +215,7 @@ impl TextBuffer {
         let start = self.byte_offset_of_char(offset);
         let end = self.byte_offset_of_char(offset + 1);
         self.text.replace_range(start..end, &ch.to_string());
+        self.line_index = OnceLock::new();
         self.cursor = self.cursor_at_offset(offset);
         self.selection = None;
     }
@@ -210,6 +231,7 @@ impl TextBuffer {
         let start_byte = self.byte_offset_of_char(start);
         let end_byte = self.byte_offset_of_char(end);
         self.text.replace_range(start_byte..end_byte, "");
+        self.line_index = OnceLock::new();
         self.cursor = self.cursor_at_offset(start);
         self.selection = None;
         removed
@@ -234,6 +256,7 @@ impl TextBuffer {
         let start_byte = self.byte_offset_of_char(start);
         let end_byte = self.byte_offset_of_char(end);
         self.text.replace_range(start_byte..end_byte, "");
+        self.line_index = OnceLock::new();
         self.cursor = self.cursor_at_offset(start);
         self.selection = None;
         removed
@@ -356,6 +379,7 @@ impl TextBuffer {
             cursor: self.cursor,
         });
         self.text = snapshot.text;
+        self.line_index = OnceLock::new();
         self.cursor = self.clamp_cursor(snapshot.cursor);
         self.selection = None;
         true
@@ -370,6 +394,7 @@ impl TextBuffer {
             cursor: self.cursor,
         });
         self.text = snapshot.text;
+        self.line_index = OnceLock::new();
         self.cursor = self.clamp_cursor(snapshot.cursor);
         self.selection = None;
         true

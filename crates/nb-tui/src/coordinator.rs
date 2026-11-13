@@ -485,8 +485,9 @@ impl Coordinator {
             .outputs
             .saturating_sub(1)
             .max(1);
-        let segments = vim::wrap_segments(out.buffer.as_str(), text_w);
-        let cursor_row = vim::segment_of(&segments, out.buffer.cursor()) as u32;
+        let cursor = out.buffer.cursor();
+        let segments = out.segments(text_w);
+        let cursor_row = vim::segment_of(segments, cursor) as u32;
         let max_scroll = (segments.len() as u32).saturating_sub(region);
         if cursor_row < out.scroll {
             out.scroll = cursor_row;

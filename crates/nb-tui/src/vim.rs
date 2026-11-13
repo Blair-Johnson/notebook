@@ -620,6 +620,9 @@ pub struct OutputText {
     pub scroll: u32,
     /// Output revision the text was built from.
     pub revision: u64,
+    /// Wrap segments of the text at `segments_width` (0: not built).
+    segments: Vec<(usize, usize, usize)>,
+    segments_width: u16,
 }
 
 impl OutputText {
@@ -629,6 +632,8 @@ impl OutputText {
             buffer: TextBuffer::new(outputs_text(cell)),
             scroll: 0,
             revision: outputs_revision(cell),
+            segments: Vec::new(),
+            segments_width: 0,
         }
     }
 
@@ -641,7 +646,24 @@ impl OutputText {
             self.buffer.set_cursor(cursor);
             clamp_normal(&mut self.buffer);
             self.revision = revision;
+            self.segments_width = 0;
         }
+    }
+
+    /// Wrap segments at `width`, wrapped again only when the text or the
+    /// width changed.
+    pub fn segments(&mut self, width: u16) -> &[(usize, usize, usize)] {
+        let width = width.max(1);
+        if self.segments_width != width {
+            self.segments = wrap_segments(self.buffer.as_str(), width);
+            self.segments_width = width;
+        }
+        &self.segments
+    }
+
+    /// The segments if already wrapped at `width` (drawing only reads).
+    pub fn cached_segments(&self, width: u16) -> Option<&[(usize, usize, usize)]> {
+        (self.segments_width == width.max(1)).then_some(self.segments.as_slice())
     }
 }
 
@@ -686,10 +708,15 @@ pub fn wrap_segments(text: &str, width: u16) -> Vec<(usize, usize, usize)> {
 
 /// Screen row (index into `segments`) holding `pos`.
 pub fn segment_of(segments: &[(usize, usize, usize)], pos: CursorPos) -> usize {
-    segments
-        .iter()
-        .rposition(|&(row, start, _)| row == pos.row && start <= pos.col)
-        .unwrap_or(0)
+    // Segments are sorted by (row, start): the last one starting at or
+    // before `pos`, if it is on the same row.
+    let index = segments
+        .partition_point(|&(row, start, _)| (row, start) <= (pos.row, pos.col))
+        .saturating_sub(1);
+    match segments.get(index) {
+        Some(&(row, start, _)) if row == pos.row && start <= pos.col => index,
+        _ => 0,
+    }
 }
 
 /// Ids `command` treats as text edits (ignored, not unknown, when read-only).
