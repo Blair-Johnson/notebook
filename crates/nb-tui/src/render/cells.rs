@@ -557,7 +557,7 @@ impl CellCtx<'_> {
                     .cell
                     .outputs
                     .iter()
-                    .map(|output| output.plain_text().lines().count().max(1))
+                    .map(|output| output.line_count().max(1))
                     .sum();
                 let right = vec![muted(format!(" ▸ {lines} lines "))];
                 let labels = self.all_labels(&sections, look);

@@ -327,6 +327,48 @@ impl OutputItem {
         };
         strip_ansi(text.trim_end_matches('\n'))
     }
+
+    /// `plain_text().lines().count()` without building the text: cheap
+    /// enough to call every frame on a large output.
+    pub fn line_count(&self) -> usize {
+        match &self.data {
+            OutputData::Stream { buffer, .. } => count_lines([buffer.as_str()].into_iter()),
+            OutputData::Rich { bundle, .. } => match bundle.get("text/plain") {
+                Some(Value::String(text)) => count_lines([text.as_str()].into_iter()),
+                Some(Value::Array(parts)) => count_lines(parts.iter().filter_map(Value::as_str)),
+                _ => usize::from(!bundle.is_empty()),
+            },
+            OutputData::Error {
+                ename,
+                evalue,
+                traceback,
+            } => {
+                if traceback.is_empty() {
+                    count_lines([ename.as_str(), ": ", evalue.as_str()].into_iter())
+                } else {
+                    let separated = traceback.iter().enumerate().flat_map(|(index, line)| {
+                        [if index == 0 { "" } else { "\n" }, line.as_str()]
+                    });
+                    count_lines(separated)
+                }
+            }
+        }
+    }
+}
+
+/// Lines in the concatenation of `pieces`, ignoring trailing newlines, as
+/// `str::lines` counts them.
+fn count_lines<'a>(pieces: impl DoubleEndedIterator<Item = &'a str> + Clone) -> usize {
+    let newlines: usize = pieces.clone().map(|piece| piece.matches('\n').count()).sum();
+    let mut trailing = 0;
+    for piece in pieces.rev() {
+        let content = piece.trim_end_matches('\n');
+        trailing += piece.len() - content.len();
+        if !content.is_empty() {
+            return newlines - trailing + 1;
+        }
+    }
+    0
 }
 
 /// Remove ANSI CSI/OSC escape sequences.

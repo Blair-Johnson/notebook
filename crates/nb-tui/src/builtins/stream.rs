@@ -1,15 +1,16 @@
 //! Built-in ANSI `stdout`/`stderr` stream output renderer with incremental row-slice wrapping.
 
 use ansi_to_tui::IntoText;
-use ratatui::text::{Line, Span};
-use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
 use nb_core::output::TRUNCATION_MARKER;
 use nb_core::{OutputData, OutputItem, StreamBuffer};
 use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 pub struct StreamRenderer;
 
@@ -181,8 +182,10 @@ impl StreamOutputView {
         }
         let old_byte = self.line_byte_starts[first_kept];
         let old_row = self.line_row_starts[first_kept];
-        let marker_rows =
-            wrapped_row_count(TRUNCATION_MARKER.trim_end_matches('\n'), self.wrapped_for_width);
+        let marker_rows = wrapped_row_count(
+            TRUNCATION_MARKER.trim_end_matches('\n'),
+            self.wrapped_for_width,
+        );
         self.line_byte_starts.drain(..first_kept);
         self.line_row_starts.drain(..first_kept);
         for start in &mut self.line_byte_starts {
@@ -305,16 +308,8 @@ impl OutputView for StreamOutputView {
                 .unwrap_or(source.len())
                 .min(source.len());
             let raw = source[byte_start..byte_end].trim_end_matches(['\r', '\n']);
-            let wrapped = wrap_ansi_line(raw, width.max(1));
-            let skip = absolute_start.saturating_sub(row_start) as usize;
-            let take_end = absolute_end.saturating_sub(row_start) as usize;
-            for line in wrapped
-                .into_iter()
-                .skip(skip)
-                .take(take_end.saturating_sub(skip))
-            {
-                out.push(line);
-            }
+            let local = absolute_start.saturating_sub(row_start)..absolute_end - row_start;
+            render_rows(raw, width, local, out);
             line_index += 1;
         }
     }
@@ -358,70 +353,144 @@ impl OutputView for StreamOutputView {
     }
 }
 
-fn wrapped_row_count(line: &str, width: u16) -> u32 {
-    let width = usize::from(width.max(1));
-    let mut used = 0usize;
-    let mut rows = 1u32;
-    for ch in line.chars() {
+/// Rows `line` wraps to; matches what [`render_rows`] draws.
+pub(crate) fn wrapped_row_count(line: &str, width: u16) -> u32 {
+    let mut wrap = RowWrap::new(width);
+    let mut hidden = 0usize;
+    for (n, (_, ch)) in visible_chars(line).enumerate() {
+        if n < MAX_LINE_CHARS {
+            wrap.place(ch);
+        } else {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        for ch in hidden_marker(hidden).chars() {
+            wrap.place(ch);
+        }
+    }
+    wrap.row + 1
+}
+
+/// Logical lines longer than this many visible characters are cut short
+/// with a marker: wrapping them whole every frame is slow, and a screenful
+/// of one line is unreadable anyway.
+const MAX_LINE_CHARS: usize = 100_000;
+
+fn hidden_marker(hidden: usize) -> String {
+    format!(" … [{hidden} more characters]")
+}
+
+/// One wrapping rule for measuring and drawing: a character that does not
+/// fit on the current row starts the next one.
+struct RowWrap {
+    width: usize,
+    used: usize,
+    row: u32,
+}
+
+impl RowWrap {
+    fn new(width: u16) -> Self {
+        Self {
+            width: usize::from(width.max(1)),
+            used: 0,
+            row: 0,
+        }
+    }
+
+    /// Place `ch` and return the row it lands on.
+    fn place(&mut self, ch: char) -> u32 {
         let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if char_width > 0 && used > 0 && used + char_width > width {
-            rows = rows.saturating_add(1);
-            used = 0;
+        if char_width > 0 && self.used > 0 && self.used + char_width > self.width {
+            self.row += 1;
+            self.used = 0;
         }
-        used = used.saturating_add(char_width);
+        self.used += char_width;
+        self.row
     }
-    rows.max(1)
 }
 
-/// Parse a single logical line and wrap it without losing ANSI-derived span styles.
-fn wrap_ansi_line(raw: &str, width: u16) -> Vec<Line<'static>> {
-    let parsed = raw.into_text().ok();
-    let lines = parsed.as_ref().map(|text| text.lines.as_slice());
-    let Some(lines) = lines else {
-        return vec![Line::from(raw.to_string())];
-    };
-    if lines.is_empty() {
-        return vec![Line::default()];
-    }
-    lines
-        .iter()
-        .flat_map(|line| wrap_styled_line(line, width))
-        .collect()
-}
-
-fn wrap_styled_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    let mut output: Vec<Line<'static>> = Vec::new();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    for source_span in &line.spans {
-        for ch in source_span.content.chars() {
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if char_width > 0 && used > 0 && used + char_width > width {
-                output.push(Line::from(std::mem::take(&mut spans)));
-                used = 0;
+/// Characters of `line` that take up columns, with their byte offsets;
+/// ANSI CSI and OSC escape sequences are skipped.
+fn visible_chars(line: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut chars = line.char_indices().peekable();
+    std::iter::from_fn(move || {
+        loop {
+            let (offset, ch) = chars.next()?;
+            if ch != '\u{1b}' {
+                return Some((offset, ch));
             }
-            let content = ch.to_string();
-            if let Some(last) = spans.last_mut() {
-                if last.style == source_span.style {
-                    last.content.to_mut().push(ch);
-                } else {
-                    spans.push(Span::styled(content, source_span.style));
+            match chars.next() {
+                Some((_, '[')) => {
+                    for (_, ch) in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
                 }
-            } else {
-                spans.push(Span::styled(content, source_span.style));
+                Some((_, ']')) => {
+                    while let Some((_, ch)) = chars.next() {
+                        if ch == '\u{7}'
+                            || (ch == '\u{1b}' && chars.next_if(|(_, ch)| *ch == '\\').is_some())
+                        {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
-            used = used.saturating_add(char_width);
-            if used >= width && char_width > 0 {
-                output.push(Line::from(std::mem::take(&mut spans)));
-                used = 0;
+        }
+    })
+}
+
+/// Draw rows `rows` of one logical line. Plain text skips ANSI parsing,
+/// and only the requested rows are built.
+pub(crate) fn render_rows(line: &str, width: u16, rows: Range<u32>, out: &mut Vec<Line<'static>>) {
+    let mut visible = visible_chars(line);
+    let (shown, hidden) = match visible.nth(MAX_LINE_CHARS) {
+        Some((cut, _)) => (&line[..cut], 1 + visible.count()),
+        None => (line, 0),
+    };
+    let mut spans: Vec<Span<'_>> = if shown.contains('\u{1b}') {
+        match shown.into_text() {
+            Ok(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
+            Err(_) => vec![Span::raw(shown)],
+        }
+    } else {
+        vec![Span::raw(shown)]
+    };
+    if hidden > 0 {
+        spans.push(Span::styled(
+            hidden_marker(hidden),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    let mut wrap = RowWrap::new(width);
+    let mut built: Vec<Vec<Span<'static>>> = Vec::new();
+    'spans: for span in &spans {
+        for ch in span.content.chars() {
+            let row = wrap.place(ch);
+            if row >= rows.end {
+                break 'spans;
+            }
+            if row < rows.start {
+                continue;
+            }
+            let index = (row - rows.start) as usize;
+            if built.len() <= index {
+                built.resize_with(index + 1, Vec::new);
+            }
+            let row_spans = &mut built[index];
+            match row_spans.last_mut() {
+                Some(last) if last.style == span.style => last.content.to_mut().push(ch),
+                _ => row_spans.push(Span::styled(ch.to_string(), span.style)),
             }
         }
     }
-    if !spans.is_empty() || output.is_empty() {
-        output.push(Line::from(spans));
+    if built.is_empty() && rows.start == 0 && rows.end > 0 {
+        built.push(Vec::new());
     }
-    output
+    out.extend(built.into_iter().map(Line::from));
 }
 
 #[cfg(test)]
@@ -437,6 +506,55 @@ mod tests {
             },
             false,
         )
+    }
+
+    fn text_of(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn measured_rows_match_drawn_rows() {
+        let long = "z".repeat(MAX_LINE_CHARS + 25);
+        let lines = [
+            "",
+            "plain text that wraps across a few rows",
+            "\u{1b}[31mred\u{1b}[0m and \u{1b}[1;32mbold green\u{1b}[0m words to wrap",
+            "wide 漢字漢字漢字漢字 chars",
+            "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+            long.as_str(),
+        ];
+        for line in lines {
+            for width in [1, 7, 10, 80] {
+                let rows = wrapped_row_count(line, width);
+                let mut full = Vec::new();
+                render_rows(line, width, 0..u32::MAX, &mut full);
+                assert_eq!(full.len() as u32, rows, "{line:.40?} at width {width}");
+                let window = rows / 3..(rows / 3 + 2).min(rows);
+                let mut part = Vec::new();
+                render_rows(line, width, window.clone(), &mut part);
+                assert_eq!(
+                    text_of(&part),
+                    text_of(&full[window.start as usize..window.end as usize]),
+                    "{line:.40?} at width {width}"
+                );
+            }
+        }
+        let mut last = Vec::new();
+        render_rows(
+            &long,
+            80,
+            wrapped_row_count(&long, 80) - 1..u32::MAX,
+            &mut last,
+        );
+        assert!(text_of(&last)[0].contains("[25 more characters]"));
     }
 
     /// Growing, rewriting and truncating keeps the index equal to a fresh one.

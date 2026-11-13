@@ -1,17 +1,18 @@
 //! Built-in Python/JAX traceback output view supporting frame folding and cell-line jumps.
 
 use ansi_to_tui::IntoText;
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-};
-use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
 use nb_core::{CellId, OutputData, OutputItem};
 use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+use std::cell::RefCell;
+use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 pub struct TracebackRenderer;
 
@@ -42,6 +43,16 @@ pub struct TracebackView {
     total_rows: u32,
     shown_rows: u32,
     scroll_offset: Option<u32>,
+    /// Built lines for one (output revision, width, folding): building parses
+    /// the ANSI of the whole traceback, too slow to repeat every frame.
+    built: RefCell<Option<BuiltLines>>,
+}
+
+struct BuiltLines {
+    rev: u64,
+    width: u16,
+    folded: bool,
+    lines: Vec<RenderedTraceLine>,
 }
 
 #[derive(Clone)]
@@ -98,6 +109,38 @@ impl TracebackView {
 
     fn max_scroll(&self) -> u32 {
         self.total_rows.saturating_sub(self.shown_rows)
+    }
+
+    /// Run `f` over the built lines, building them only when stale.
+    fn with_lines<R>(
+        &self,
+        item: &OutputItem,
+        width: u16,
+        f: impl FnOnce(&[RenderedTraceLine]) -> R,
+    ) -> R {
+        let mut built = self.built.borrow_mut();
+        let fresh = built.as_ref().is_some_and(|built| {
+            built.rev == item.rev
+                && built.width == width
+                && built.folded == self.fold_internal_frames
+        });
+        if !fresh {
+            *built = Some(BuiltLines {
+                rev: item.rev,
+                width,
+                folded: self.fold_internal_frames,
+                lines: self.build_lines(item, width),
+            });
+        }
+        f(&built.as_ref().expect("just built").lines)
+    }
+
+    /// Frames and cell lines do not depend on width: reuse the last build.
+    fn built_width(&self) -> u16 {
+        self.built
+            .borrow()
+            .as_ref()
+            .map_or(u16::MAX, |built| built.width)
     }
 
     fn build_lines(&self, item: &OutputItem, width: u16) -> Vec<RenderedTraceLine> {
@@ -201,8 +244,10 @@ impl OutputView for TracebackView {
         _theme: &Theme,
         cap_rows: Option<u16>,
     ) -> OutputMetrics {
-        let lines = self.build_lines(item, width.max(1));
-        self.total_rows = lines.len() as u32;
+        let (total_rows, max_frame) = self.with_lines(item, width.max(1), |lines| {
+            (lines.len() as u32, max_frame(lines))
+        });
+        self.total_rows = total_rows;
         self.shown_rows = cap_rows
             .map_or(self.total_rows, u32::from)
             .min(self.total_rows)
@@ -210,13 +255,7 @@ impl OutputView for TracebackView {
         if let Some(offset) = self.scroll_offset {
             self.scroll_offset = Some(offset.min(self.max_scroll()));
         }
-        self.selected_frame = self.selected_frame.min(
-            lines
-                .iter()
-                .filter_map(|line| line.frame)
-                .max()
-                .unwrap_or(0),
-        );
+        self.selected_frame = self.selected_frame.min(max_frame);
         OutputMetrics {
             total_rows: self.total_rows,
             shown_rows: self.shown_rows,
@@ -233,34 +272,28 @@ impl OutputView for TracebackView {
         _theme: &Theme,
         out: &mut Vec<Line<'static>>,
     ) {
-        let lines = self.build_lines(item, width.max(1));
         let local = rows.end <= self.shown_rows;
         let start = if local {
             self.visible_start().saturating_add(rows.start)
         } else {
             rows.start
         } as usize;
-        let end = (if local {
+        let end = if local {
             self.visible_start().saturating_add(rows.end)
         } else {
             rows.end
-        } as usize)
-            .min(lines.len());
-        for rendered in lines
-            .into_iter()
-            .skip(start)
-            .take(end.saturating_sub(start))
-        {
-            if focused && rendered.frame == Some(self.selected_frame) {
-                out.push(
-                    rendered
-                        .line
-                        .patch_style(Style::default().add_modifier(Modifier::REVERSED)),
-                );
-            } else {
-                out.push(rendered.line);
+        } as usize;
+        self.with_lines(item, width.max(1), |lines| {
+            let end = end.min(lines.len());
+            for rendered in lines.get(start..end).unwrap_or_default() {
+                let line = rendered.line.clone();
+                if focused && rendered.frame == Some(self.selected_frame) {
+                    out.push(line.patch_style(Style::default().add_modifier(Modifier::REVERSED)));
+                } else {
+                    out.push(line);
+                }
             }
-        }
+        });
     }
 
     fn handle_input(
@@ -280,12 +313,7 @@ impl OutputView for TracebackView {
             self.rev = self.rev.wrapping_add(1);
             return InputOutcome::Consumed;
         }
-        let max_frame = self
-            .build_lines(item, u16::MAX)
-            .iter()
-            .filter_map(|line| line.frame)
-            .max()
-            .unwrap_or(0);
+        let max_frame = self.with_lines(item, self.built_width(), max_frame);
         if Self::motion(&input, "motion.top").is_some() {
             self.selected_frame = 0;
             self.scroll_offset = Some(0);
@@ -310,14 +338,14 @@ impl OutputView for TracebackView {
         if Self::command_is(&input, "focus.enter")
             || matches!(input, ResolvedInput::Command { id, .. } if id.0.as_ref() == "ui.accept")
         {
-            let selected = self
-                .build_lines(item, u16::MAX)
-                .into_iter()
-                .find(|line| line.frame == Some(self.selected_frame));
-            if let Some(selected) = selected {
-                if let (Some(cell_id), Some(line)) =
-                    (self.cell_id.clone(), selected_cell_line(&selected))
-                {
+            let selected = self.with_lines(item, self.built_width(), |lines| {
+                lines
+                    .iter()
+                    .find(|line| line.frame == Some(self.selected_frame))
+                    .map(selected_cell_line)
+            });
+            if let Some(cell_line) = selected {
+                if let (Some(cell_id), Some(line)) = (self.cell_id.clone(), cell_line) {
                     host.jump_to_cell(cell_id, Some(line));
                     return InputOutcome::Consumed;
                 }
@@ -329,6 +357,14 @@ impl OutputView for TracebackView {
 
 fn selected_cell_line(line: &RenderedTraceLine) -> Option<usize> {
     line.cell_line
+}
+
+fn max_frame(lines: &[RenderedTraceLine]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| line.frame)
+        .max()
+        .unwrap_or(0)
 }
 
 fn parse_frame(line: &str) -> Option<(String, usize)> {

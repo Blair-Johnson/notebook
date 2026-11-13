@@ -1,15 +1,15 @@
 //! Built-in `text/plain` fallback renderer for `OutputData::Rich` MIME bundles.
 
-use ratatui::text::Line;
-use serde_json::Value;
-use std::borrow::Cow;
-use std::ops::Range;
-use unicode_width::UnicodeWidthChar;
+use super::stream::{render_rows, wrapped_row_count};
 use nb_core::{OutputData, OutputItem};
 use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
+use ratatui::text::Line;
+use serde_json::Value;
+use std::borrow::Cow;
+use std::ops::Range;
 
 pub struct PlainTextRenderer;
 
@@ -40,10 +40,13 @@ impl OutputRenderer for PlainTextRenderer {
 #[derive(Default)]
 pub struct PlainTextView {
     rev: u64,
-    width: u16,
     line_row_starts: Vec<u32>,
     line_byte_starts: Vec<usize>,
-    text_len: usize,
+    /// (output revision, width) the line index was built for.
+    indexed: Option<(u64, u16)>,
+    /// Text built from the bundle when it is not a single `text/plain`
+    /// string, kept for the output revision it was built from.
+    built: Option<(u64, String)>,
     total_rows: u32,
     shown_rows: u32,
     scroll_offset: Option<u32>,
@@ -77,51 +80,18 @@ impl PlainTextView {
         };
     }
 
-    fn source<'a>(item: &'a OutputItem) -> Cow<'a, str> {
+    /// The text shown: borrowed when `text/plain` is one string, else the
+    /// cached build (or a fresh one, if `measure` has not run for this revision).
+    fn source<'a>(&'a self, item: &'a OutputItem) -> Cow<'a, str> {
         let OutputData::Rich { bundle, .. } = &item.data else {
             return Cow::Borrowed("");
         };
-        if let Some(value) = bundle.get("text/plain") {
-            return value_to_text(value);
+        if let Some(Value::String(text)) = bundle.get("text/plain") {
+            return Cow::Borrowed(text);
         }
-        Cow::Owned(
-            bundle
-                .iter()
-                .map(|(key, value)| format!("[{key}] {}", value_to_text(value)))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    }
-
-    fn rebuild(&mut self, source: &str, width: u16) {
-        self.width = width.max(1);
-        self.line_row_starts.clear();
-        self.line_byte_starts.clear();
-        self.line_row_starts.push(0);
-        if source.is_empty() {
-            self.line_byte_starts.push(0);
-            self.line_row_starts.push(1);
-            return;
-        }
-        let mut row = 0u32;
-        let mut start = 0usize;
-        while start < source.len() {
-            let end = source[start..]
-                .find('\n')
-                .map_or(source.len(), |offset| start + offset);
-            let content_end = if end > start && source.as_bytes()[end - 1] == b'\r' {
-                end - 1
-            } else {
-                end
-            };
-            self.line_byte_starts.push(start);
-            row = row.saturating_add(wrapped_rows(&source[start..content_end], self.width));
-            self.line_row_starts.push(row);
-            start = if end < source.len() {
-                end + 1
-            } else {
-                source.len()
-            };
+        match &self.built {
+            Some((rev, text)) if *rev == item.rev => Cow::Borrowed(text),
+            _ => Cow::Owned(build_text(item)),
         }
     }
 
@@ -162,14 +132,20 @@ impl OutputView for PlainTextView {
         _theme: &Theme,
         cap_rows: Option<u16>,
     ) -> OutputMetrics {
-        let source = Self::source(item);
-        if self.width != width.max(1)
-            || self.text_len != source.len()
-            || self.line_row_starts.is_empty()
-        {
-            self.rebuild(source.as_ref(), width);
+        let width = width.max(1);
+        if self.indexed != Some((item.rev, width)) {
+            let direct = matches!(
+                &item.data,
+                OutputData::Rich { bundle, .. } if matches!(bundle.get("text/plain"), Some(Value::String(_)))
+            );
+            if !direct && self.built.as_ref().is_none_or(|(rev, _)| *rev != item.rev) {
+                self.built = Some((item.rev, build_text(item)));
+            }
+            let (row_starts, byte_starts) = index_lines(&self.source(item), width);
+            self.line_row_starts = row_starts;
+            self.line_byte_starts = byte_starts;
+            self.indexed = Some((item.rev, width));
         }
-        self.text_len = source.len();
         self.total_rows = self.line_row_starts.last().copied().unwrap_or(1).max(1);
         self.shown_rows = cap_rows
             .map_or(self.total_rows, u32::from)
@@ -194,7 +170,7 @@ impl OutputView for PlainTextView {
         _theme: &Theme,
         out: &mut Vec<Line<'static>>,
     ) {
-        let source = Self::source(item);
+        let source = self.source(item);
         if self.line_row_starts.len() < 2 {
             out.push(Line::default());
             return;
@@ -224,17 +200,11 @@ impl OutputView for PlainTextView {
                 .line_byte_starts
                 .get(line_index + 1)
                 .copied()
-                .unwrap_or(source.len());
+                .unwrap_or(source.len())
+                .min(source.len());
             let text = source[byte_start..byte_end].trim_end_matches(['\r', '\n']);
-            let wrapped = wrap_plain_line(text, width.max(1));
-            let skip = start.saturating_sub(line_start) as usize;
-            let take = end.saturating_sub(line_start) as usize;
-            out.extend(
-                wrapped
-                    .into_iter()
-                    .skip(skip)
-                    .take(take.saturating_sub(skip)),
-            );
+            let local = start.saturating_sub(line_start)..end - line_start;
+            render_rows(text, width, local, out);
             line_index += 1;
         }
     }
@@ -287,47 +257,66 @@ fn value_to_text(value: &Value) -> Cow<'_, str> {
                         .as_str()
                         .map_or_else(|| value.to_string(), str::to_owned)
                 })
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .collect::<String>(),
         ),
         Value::Null => Cow::Borrowed(""),
         other => Cow::Owned(other.to_string()),
     }
 }
 
-fn wrapped_rows(line: &str, width: u16) -> u32 {
-    let width = usize::from(width.max(1));
-    let mut used = 0usize;
-    let mut rows = 1u32;
-    for ch in line.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cw > 0 && used > 0 && used + cw > width {
-            rows = rows.saturating_add(1);
-            used = 0;
-        }
-        used = used.saturating_add(cw);
+/// The text of a bundle without a single `text/plain` string: a joined
+/// nbformat line array, or each MIME value labeled, large ones by size only.
+fn build_text(item: &OutputItem) -> String {
+    let OutputData::Rich { bundle, .. } = &item.data else {
+        return String::new();
+    };
+    if let Some(value) = bundle.get("text/plain") {
+        return value_to_text(value).into_owned();
     }
-    rows.max(1)
+    bundle
+        .iter()
+        .map(|(key, value)| match value {
+            Value::String(text) if text.len() > LARGE_VALUE_BYTES => {
+                format!("[{key}] <{} KB>", text.len().div_ceil(1024))
+            }
+            _ => format!("[{key}] {}", value_to_text(value)),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn wrap_plain_line(line: &str, width: u16) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut used = 0usize;
-    for ch in line.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cw > 0 && used > 0 && used + cw > width {
-            lines.push(Line::from(std::mem::take(&mut current)));
-            used = 0;
-        }
-        current.push(ch);
-        used = used.saturating_add(cw);
+/// MIME values longer than this (base64 images, big HTML) show as a size.
+const LARGE_VALUE_BYTES: usize = 4096;
+
+/// Per logical line of `source`: the first wrapped row (with a final total)
+/// and the byte offset where it starts.
+fn index_lines(source: &str, width: u16) -> (Vec<u32>, Vec<usize>) {
+    let mut row_starts = vec![0];
+    let mut byte_starts = Vec::new();
+    if source.is_empty() {
+        byte_starts.push(0);
+        row_starts.push(1);
+        return (row_starts, byte_starts);
     }
-    if current.is_empty() && lines.is_empty() {
-        lines.push(Line::default());
-    } else {
-        lines.push(Line::from(current));
+    let mut row = 0u32;
+    let mut start = 0usize;
+    while start < source.len() {
+        let end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |offset| start + offset);
+        let content_end = if end > start && source.as_bytes()[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        byte_starts.push(start);
+        row = row.saturating_add(wrapped_row_count(&source[start..content_end], width));
+        row_starts.push(row);
+        start = if end < source.len() {
+            end + 1
+        } else {
+            source.len()
+        };
     }
-    lines
+    (row_starts, byte_starts)
 }
