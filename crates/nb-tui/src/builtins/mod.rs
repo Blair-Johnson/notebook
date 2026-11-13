@@ -974,7 +974,7 @@ impl Plugin for BuiltinsPlugin {
             "Scroll margin",
             "Rows kept between the cursor and the top or bottom edge while moving",
             SettingKind::Int {
-                default: 3,
+                default: 2,
                 min: 0,
                 max: 100,
             },

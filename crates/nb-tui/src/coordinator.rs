@@ -86,6 +86,15 @@ pub struct Coordinator {
     /// Put the notebook cursor on this source position (cell, line, column)
     /// once the cell's notebook layout is measured (after leaving it).
     nb_pending: Option<(CellId, usize, usize)>,
+    /// What the top of the view showed last frame: (cell, row in the cell,
+    /// scroll row then). Cells changing height above it (markdown switching
+    /// between rendered and raw, outputs clearing, a resize) then do not
+    /// move what is on screen.
+    view_anchor: Option<(CellId, u32, u32)>,
+    /// The last cursor move was a cell jump: if its target is off screen,
+    /// put the target's top at the top of the view rather than scrolling
+    /// the minimum.
+    align_jump: bool,
     /// The entered output's read-only text, while `OutputFocus` is active.
     pub output_text: Option<vim::OutputText>,
     pub focus: FocusStack,
@@ -183,6 +192,8 @@ impl Coordinator {
             nb_row: CardRows::SOURCE_TOP,
             nb_row_cell: None,
             nb_pending: None,
+            view_anchor: None,
+            align_jump: false,
             output_text: None,
             focus: FocusStack::default(),
             grammar: VimGrammar::default(),
@@ -341,6 +352,20 @@ impl Coordinator {
         );
         let height = u32::from(viewport.height.max(1));
         self.vim.half_page = usize::from(viewport.height / 2).max(1);
+        // Keep what the user is reading in place when content above it
+        // changed height, unless they scrolled meanwhile or follow the bottom.
+        if let Some((cell_id, offset, saved)) = self.view_anchor.take() {
+            let following = self.stick_bottom && snap.core.follow_output;
+            if self.scroll_row == saved && !following {
+                if let Some(index) = self.document.position_of(&cell_id) {
+                    let heights = self.layout_cache.heights();
+                    if index < heights.len() {
+                        let offset = offset.min(heights.height(index).saturating_sub(1));
+                        self.scroll_row = heights.prefix_sum(index) + offset;
+                    }
+                }
+            }
+        }
         let output_region = self.output_region_rows(text_w);
         let followed = self.follow_focus;
         let notebook_level = matches!(self.focus.base(), FocusLayer::NotebookNormal);
@@ -377,6 +402,15 @@ impl Coordinator {
                             // The text starts below the block's header divider.
                             (outputs_top + 1 + row, outputs_top + row + 2)
                         }
+                        // A cell jump to an off-screen target: its top (the
+                        // border or divider above the cursor row) at the top.
+                        _ if nb_global.is_some_and(|row| {
+                            self.align_jump && (row < self.scroll_row || row >= self.scroll_row + height)
+                        }) =>
+                        {
+                            let row = nb_global.unwrap_or(top).saturating_sub(1);
+                            (row, row + 1)
+                        }
                         // The notebook cursor row, with a margin.
                         _ if nb_global.is_some() => {
                             let row = nb_global.unwrap_or(top);
@@ -384,7 +418,9 @@ impl Coordinator {
                         }
                         _ => (top, top + cell_rows.min(height)),
                     };
-                    if want_top < self.scroll_row {
+                    let aligning = self.align_jump
+                        && nb_global.is_some_and(|row| row < self.scroll_row || row >= self.scroll_row + height);
+                    if aligning || want_top < self.scroll_row {
                         self.scroll_row = want_top;
                     } else if want_bottom > self.scroll_row + height {
                         self.scroll_row = want_bottom - height;
@@ -410,6 +446,15 @@ impl Coordinator {
             self.stick_bottom = max_scroll > 0 && self.scroll_row >= max_scroll;
         }
         self.user_scrolled = false;
+        self.align_jump = false;
+        self.view_anchor = self
+            .layout_cache
+            .heights()
+            .find_row(self.scroll_row)
+            .and_then(|(index, offset)| {
+                let cell_id = self.document.order().get(index)?.clone();
+                Some((cell_id, offset, self.scroll_row))
+            });
     }
 
     /// For an entered output: keep its cursor inside the output region by
@@ -2123,6 +2168,7 @@ impl Coordinator {
 
     /// `]]`/`[[` jump between cells; `}`/`{` also stop at output blocks.
     fn nb_jump(&mut self, forward: bool, include_outputs: bool) {
+        self.align_jump = true;
         let Some((index, row)) = self.nb_cursor() else {
             return;
         };

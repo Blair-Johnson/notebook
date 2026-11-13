@@ -50,7 +50,7 @@ impl Default for CoreSettings {
             output_default_view: nb_core::OutputDisplay::Preview,
             notice_secs: 4,
             follow_output: true,
-            scrolloff: 3,
+            scrolloff: 2,
             fast_scroll_rows: 5,
             indent_width: 4,
             wheel_scroll_lines: 3,
@@ -380,7 +380,7 @@ fn build_snapshot(
             .unwrap_or_default(),
         notice_secs: setting_int(&values, "display.notice_secs", 4).max(1) as u64,
         follow_output: setting_bool(&values, "display.follow_output", true),
-        scrolloff: setting_int(&values, "display.scrolloff", 3).clamp(0, 100) as u16,
+        scrolloff: setting_int(&values, "display.scrolloff", 2).clamp(0, 100) as u16,
         fast_scroll_rows: setting_int(&values, "display.fast_scroll_rows", 5).clamp(1, 1000) as u16,
         indent_width: setting_int(&values, "editor.indent_width", 4).clamp(1, 16) as u16,
         wheel_scroll_lines: setting_int(&values, "display.wheel_scroll_lines", 3)

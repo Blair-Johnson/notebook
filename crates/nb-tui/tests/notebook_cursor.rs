@@ -191,3 +191,46 @@ fn the_wheel_scrolls_the_view_and_drags_the_cursor_along() {
     keys(&mut c, "j");
     assert!(c.scroll_row >= scroll);
 }
+
+fn ten_cells() -> Coordinator {
+    let cells: Vec<(String, String)> = (0..10)
+        .map(|n| (format!("a{n} = 1\nb{n} = 2"), String::new()))
+        .collect();
+    let refs: Vec<(&str, &str)> = cells.iter().map(|(s, o)| (s.as_str(), o.as_str())).collect();
+    coordinator(&refs)
+}
+
+#[test]
+fn jumping_to_an_off_screen_cell_puts_its_top_at_the_top() {
+    let mut c = ten_cells();
+    // Stepping cell by cell scrolls minimally (the next cell is on screen);
+    // one counted jump lands far below the view and aligns the target.
+    keys(&mut c, "6]]");
+    let index = c.document.position_of(&c.selected_cell).unwrap();
+    assert_eq!(index, 6);
+    let cell_top = c.layout_cache.heights().prefix_sum(index);
+    let total = c.layout_cache.heights().total_height();
+    let max_scroll = total - u32::from(c.last_geometry.viewport_rect.height);
+    assert_eq!(
+        c.scroll_row,
+        cell_top.min(max_scroll),
+        "the jumped-to cell starts at the top (unless the notebook ends first)"
+    );
+    keys(&mut c, "gg3]]");
+    let index = c.document.position_of(&c.selected_cell).unwrap();
+    assert_eq!(index, 3);
+    assert_eq!(c.scroll_row, 0, "a jump to a cell already on screen does not scroll");
+}
+
+#[test]
+fn entering_and_leaving_a_cell_mid_notebook_keeps_the_view() {
+    let mut c = ten_cells();
+    keys(&mut c, "G");
+    keys(&mut c, "kkkkkk");
+    let scroll = c.scroll_row;
+    assert!(scroll > 0);
+    keys(&mut c, "i");
+    keys(&mut c, "j");
+    press(&mut c, KeyCode::Esc);
+    assert_eq!(c.scroll_row, scroll);
+}
