@@ -434,11 +434,7 @@ impl CellCtx<'_> {
             } => {
                 let tab = |kind: StreamKind, name: &str, color: Color| {
                     if kind == active {
-                        let mut style = self.label_style(color, look);
-                        if stdout && stderr {
-                            style = style.add_modifier(Modifier::UNDERLINED);
-                        }
-                        Span::styled(format!(" {name} "), style)
+                        Span::styled(format!(" {name} "), self.label_style(color, look))
                     } else {
                         Span::styled(format!(" {name} "), Style::default().fg(p.muted).bg(p.bg))
                     }
