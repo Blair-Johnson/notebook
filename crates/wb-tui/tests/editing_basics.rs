@@ -152,3 +152,15 @@ fn clicking_from_the_notebook_enters_the_clicked_cell() {
     let first = c.document.order()[0].clone();
     assert_eq!(c.document.cell(&first).unwrap().buffer.cursor().col, 2);
 }
+
+#[test]
+fn global_commands_work_while_editing_a_cell() {
+    let mut c = coordinator(&["x = 1"]);
+    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut c, KeyCode::Char('/'), KeyModifiers::CONTROL);
+    assert!(matches!(c.focus.top(), FocusLayer::Modal(ModalKind::CommandPalette)));
+    press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(mode(&c), Some(CellMode::Normal));
+    keys(&mut c, ":");
+    assert!(matches!(c.focus.top(), FocusLayer::Modal(ModalKind::ExCommandBar)));
+}

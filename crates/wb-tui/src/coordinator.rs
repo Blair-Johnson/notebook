@@ -829,6 +829,18 @@ impl Coordinator {
     }
 
     fn dispatch_input(&mut self, input: ResolvedInput) -> Effect {
+        // Application-wide commands behave the same at every level.
+        if let ResolvedInput::Command { id, count, arg } = &input {
+            let id = id.0.as_ref();
+            let pdb_interrupt =
+                id == "kernel.interrupt" && matches!(self.focus.top(), FocusLayer::PdbInput);
+            if is_global_command(id)
+                && !pdb_interrupt
+                && !matches!(self.focus.top(), FocusLayer::Modal(_))
+            {
+                return self.dispatch_notebook_command(id, count.unwrap_or(1), *arg);
+            }
+        }
         match self.focus.top().clone() {
             FocusLayer::NotebookNormal => self.dispatch_notebook(input),
             FocusLayer::CellEdit { cell_id, mode, .. } => {
@@ -2995,6 +3007,14 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
+}
+
+/// Commands that mean the same thing whichever layer has focus.
+fn is_global_command(id: &str) -> bool {
+    id.starts_with("app.")
+        || id.starts_with("doc.")
+        || id.starts_with("ui.")
+        || matches!(id, "kernel.interrupt" | "kernel.restart")
 }
 
 /// Editing commands bound in `text.insert`, shared by every text entry.
