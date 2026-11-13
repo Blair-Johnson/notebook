@@ -25,6 +25,7 @@ use jupyter_protocol::messaging::{
     ShutdownRequest, Stdio, UnknownMessage,
 };
 use jupyter_protocol::{ConnectionInfo, Transport};
+use jupyter_zmq_client::RuntimeError;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr};
@@ -36,6 +37,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use nb_core::{CommId, ExecId, MimeBundle, StreamKind};
 
 pub struct LocalZmqKernel {
@@ -60,7 +62,14 @@ impl LocalZmqKernel {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let supervisor_connection_file = connection_file.clone();
         tokio::spawn(async move {
-            supervise(spec, supervisor_connection_file, cmd_rx, event_tx).await;
+            supervise(
+                spec,
+                supervisor_connection_file,
+                cmd_rx,
+                event_tx,
+                Liveness::default(),
+            )
+            .await;
         });
         Self {
             cmd_tx,
@@ -114,6 +123,43 @@ struct ShellRequest {
     request_id: Option<u64>,
 }
 
+/// Time bounds that keep a silent, wedged or vanished kernel from hanging the session.
+#[derive(Clone, Copy, Debug)]
+struct Liveness {
+    /// Deadline for a `complete_request`/`inspect_request` reply. Executes never
+    /// time out: cells may legitimately run for days.
+    query_deadline: Duration,
+    /// How long an execution that has its `execute_reply` waits for the iopub
+    /// `idle`, which a PUB socket may drop under load, before finishing anyway.
+    idle_grace: Duration,
+    /// Heartbeat cadence for attached kernels, which have no child process to watch.
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+    heartbeat_misses: u32,
+    /// How long a kernel may take to exit after `shutdown_request` before SIGKILL.
+    shutdown_grace: Duration,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self {
+            query_deadline: Duration::from_secs(10),
+            idle_grace: Duration::from_secs(2),
+            heartbeat_interval: Duration::from_secs(3),
+            heartbeat_timeout: Duration::from_secs(10),
+            heartbeat_misses: 3,
+            shutdown_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+/// How long a dead kernel's stderr reader may take to reach EOF.
+const STDERR_DRAIN: Duration = Duration::from_millis(500);
+/// How long a final `shutdown_request` may take to reach the kernel.
+const CONTROL_FLUSH: Duration = Duration::from_millis(500);
+/// Pause after an iopub transport error while the SUB socket reconnects.
+const IOPUB_RETRY: Duration = Duration::from_millis(100);
+
 enum SupervisorMessage {
     IoPub(JupyterMessage),
     Shell {
@@ -125,8 +171,14 @@ enum SupervisorMessage {
         failed: bool,
         stop_on_error: bool,
     },
-    ShellFailed {
-        lane: Lane,
+    /// A completion or inspection got no reply before its deadline.
+    QueryTimedOut {
+        kind: ShellKind,
+        request_id: Option<u64>,
+    },
+    /// A shell, stdin or control socket failed; the kernel can no longer be driven.
+    ChannelFailed {
+        channel: &'static str,
         reason: String,
     },
     Stdin(JupyterMessage),
@@ -136,7 +188,11 @@ enum SupervisorMessage {
     },
     ProcessExited {
         status: String,
-        expected: bool,
+    },
+    /// An `execute_reply` waited `idle_grace` without its iopub `idle`.
+    IdleGrace(ExecId),
+    HeartbeatLost {
+        misses: u32,
     },
 }
 
@@ -148,13 +204,88 @@ struct PreparedKernel {
     pid: Option<u32>,
 }
 
+/// Handles for a kernel process this supervisor launched.
+struct OwnedProcess {
+    terminate: Option<oneshot::Sender<Duration>>,
+    monitor: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+
+impl OwnedProcess {
+    /// Kill the process after `grace` (at once when zero) and wait until it is reaped.
+    async fn stop(&mut self, grace: Duration) {
+        if let Some(terminate) = self.terminate.take() {
+            let _ = terminate.send(grace);
+        }
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.await;
+        }
+    }
+
+    /// Give the stderr reader a moment to reach EOF so the ring holds the final lines.
+    async fn drain_stderr(&mut self) {
+        if let Some(mut reader) = self.stderr.take() {
+            let _ = tokio::time::timeout(STDERR_DRAIN, &mut reader).await;
+        }
+    }
+}
+
+/// Background tasks owned by one kernel session. They are aborted when it ends,
+/// because a DEALER socket whose peer vanished blocks in `recv` forever.
+#[derive(Default)]
+struct TaskSet(Vec<JoinHandle<()>>);
+
+impl TaskSet {
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.0.push(task);
+    }
+}
+
+impl Drop for TaskSet {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+struct Connected {
+    shell: jupyter_zmq_client::ClientShellConnection,
+    stdin: jupyter_zmq_client::ClientStdinConnection,
+    control: jupyter_zmq_client::ClientControlConnection,
+    inspect_shell: Option<jupyter_zmq_client::ClientShellConnection>,
+    subshell_id: Option<String>,
+    supports_debugger: bool,
+}
+
+/// Why a kernel failed to start.
+enum StartupFailure {
+    /// Connecting or the kernel_info handshake failed.
+    Connect(String),
+    /// The kernel process exited first.
+    Exited(String),
+    /// `Shutdown` arrived (or the handle was dropped) first.
+    Shutdown,
+}
+
+/// Why one kernel session ended.
+enum Outcome {
+    /// Shut down on request or because the handle was dropped.
+    Stop { kill: bool },
+    /// Relaunch as the next generation.
+    Restart,
+    /// The kernel died or failed to launch.
+    Dead,
+}
+
 async fn supervise(
     spec: KernelLaunchSpec,
     connection_file: Option<PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<KernelCmd>,
     event_tx: mpsc::UnboundedSender<KernelEvent>,
+    liveness: Liveness,
 ) {
-    let generation = 0_u64;
+    let mut generation = 0_u64;
     let Some(connection_file) = connection_file else {
         let _ = event_tx.send(KernelEvent::LaunchFailed {
             generation,
@@ -163,164 +294,495 @@ async fn supervise(
         return;
     };
 
-    let prepared = match prepare_kernel(&spec, &connection_file).await {
+    // Commands that arrived while a kernel was starting, replayed in order.
+    let mut pending = VecDeque::new();
+    loop {
+        let outcome = run_kernel(
+            &spec,
+            &connection_file,
+            generation,
+            &mut cmd_rx,
+            &mut pending,
+            &event_tx,
+            liveness,
+        )
+        .await;
+        match outcome {
+            Outcome::Stop { .. } => return,
+            Outcome::Restart => {}
+            // A dead kernel does not end the session: `Restart` relaunches it.
+            Outcome::Dead => {
+                if !wait_for_restart(&mut cmd_rx, &mut pending, &event_tx).await {
+                    return;
+                }
+            }
+        }
+        generation = generation.wrapping_add(1);
+    }
+}
+
+/// Launch or attach one kernel generation and drive it until it stops, dies or restarts.
+async fn run_kernel(
+    spec: &KernelLaunchSpec,
+    connection_file: &Path,
+    generation: u64,
+    cmd_rx: &mut mpsc::UnboundedReceiver<KernelCmd>,
+    pending: &mut VecDeque<KernelCmd>,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+    liveness: Liveness,
+) -> Outcome {
+    let prepared = match prepare_kernel(spec, connection_file).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if spec.existing_connection_file.is_none() {
+                let _ = tokio::fs::remove_file(connection_file).await;
+            }
             let _ = event_tx.send(KernelEvent::LaunchFailed {
                 generation,
                 reason: format!("{error:#}"),
             });
-            return;
+            return Outcome::Dead;
         }
     };
 
     let PreparedKernel {
         connection_info,
         resolved,
-        mut child,
+        child,
         owns_process,
         pid,
     } = prepared;
     let stderr_ring = Arc::new(Mutex::new(RingLog::new(DEFAULT_PROCESS_LOG_CAP)));
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
-    let mut kill_tx = None;
+    let mut process =
+        child.map(|child| spawn_owned_process(child, pid, &stderr_ring, &internal_tx));
+    let mut tasks = TaskSet::default();
+    // Supervisor messages that arrive while connecting, replayed by the session loop.
+    let mut early = VecDeque::new();
 
-    if let Some(mut process) = child.take() {
-        if let Some(stdout) = process.stdout.take() {
-            spawn_process_stream(
-                stdout,
-                StreamKind::Stdout,
-                internal_tx.clone(),
-                Arc::new(Mutex::new(RingLog::new(DEFAULT_PROCESS_LOG_CAP))),
-            );
+    // zeromq retries a refused connect for 30 s, so race startup against the
+    // kernel exiting and against the UI shutting down.
+    let startup = tokio::select! {
+        result = connect_kernel(&connection_info, &internal_tx, &mut tasks) => {
+            result.map_err(StartupFailure::Connect)
         }
-        if let Some(stderr) = process.stderr.take() {
-            spawn_process_stream(
-                stderr,
-                StreamKind::Stderr,
-                internal_tx.clone(),
-                stderr_ring.clone(),
-            );
+        status = startup_exit(&mut internal_rx, &mut early) => {
+            Err(StartupFailure::Exited(status))
         }
-        let (terminate_tx, terminate_rx) = oneshot::channel();
-        kill_tx = Some(terminate_tx);
-        spawn_process_monitor(process, terminate_rx, internal_tx.clone());
-    }
-
-    let session = uuid::Uuid::new_v4().to_string();
-    let iopub =
-        match jupyter_zmq_client::create_client_iopub_connection(&connection_info, "", &session)
-            .await
-        {
-            Ok(connection) => connection,
-            Err(error) => {
-                launch_failed(
-                    &event_tx,
-                    generation,
-                    format!("iopub connect: {error}"),
-                    owns_process,
-                    &connection_file,
-                    kill_tx,
-                )
-                .await;
-                return;
+        () = startup_shutdown(cmd_rx, pending) => Err(StartupFailure::Shutdown),
+    };
+    // `Err(Some(reason))` failed the launch; `Err(None)` was asked to shut down.
+    let startup = match startup {
+        Ok(connected) => Ok(connected),
+        Err(StartupFailure::Connect(error)) if process.is_some() => {
+            // A kernel that crashes on startup usually surfaces first as a socket
+            // error; its exit status and stderr say far more about why.
+            match tokio::time::timeout(STDERR_DRAIN, startup_exit(&mut internal_rx, &mut early))
+                .await
+            {
+                Ok(status) => Err(Some(format!(
+                    "kernel process exited during startup ({status})"
+                ))),
+                Err(_) => Err(Some(error)),
             }
-        };
-
-    let identity = match jupyter_zmq_client::peer_identity_for_session(&session) {
-        Ok(identity) => identity,
-        Err(error) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                format!("shell identity: {error}"),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
+        }
+        Err(StartupFailure::Connect(error)) => Err(Some(error)),
+        Err(StartupFailure::Exited(status)) => Err(Some(format!(
+            "kernel process exited during startup ({status})"
+        ))),
+        Err(StartupFailure::Shutdown) => Err(None),
+    };
+    let connected = match startup {
+        Ok(connected) => connected,
+        Err(Some(reason)) => {
+            drop(tasks);
+            let reason = match process.as_mut() {
+                Some(process) => {
+                    process.stop(Duration::ZERO).await;
+                    process.drain_stderr().await;
+                    with_stderr_hint(reason, &stderr_ring)
+                }
+                None => reason,
+            };
+            // The session loop that would forward the kernel's output never runs.
+            early.extend(std::iter::from_fn(|| internal_rx.try_recv().ok()));
+            for message in early {
+                if let SupervisorMessage::ProcessLog { stream, line } = message {
+                    let _ = event_tx.send(KernelEvent::ProcessLog { stream, line });
+                }
+            }
+            if owns_process {
+                let _ = tokio::fs::remove_file(connection_file).await;
+            }
+            let _ = event_tx.send(KernelEvent::LaunchFailed { generation, reason });
+            return Outcome::Dead;
+        }
+        Err(None) => {
+            drop(tasks);
+            if let Some(process) = process.as_mut() {
+                process.stop(Duration::ZERO).await;
+            }
+            if owns_process {
+                let _ = tokio::fs::remove_file(connection_file).await;
+            }
+            return Outcome::Stop { kill: true };
         }
     };
-    let mut shell = match jupyter_zmq_client::create_client_shell_connection_with_identity(
-        &connection_info,
+
+    let Connected {
+        shell,
+        stdin,
+        control,
+        inspect_shell,
+        subshell_id,
+        supports_debugger,
+    } = connected;
+    let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+    tasks.push(spawn_stdin_pump(stdin, stdin_rx, internal_tx.clone()));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let mut control_task = spawn_control_pump(control, control_rx, internal_tx.clone());
+
+    let (main_tx, main_rx) = mpsc::unbounded_channel();
+    tasks.push(spawn_shell_worker(
+        shell,
+        Lane::Main,
+        main_rx,
+        internal_tx.clone(),
+        liveness.query_deadline,
+    ));
+    let (inspect_tx, inspect_rx) = mpsc::unbounded_channel();
+    if let Some(connection) = inspect_shell {
+        tasks.push(spawn_shell_worker(
+            connection,
+            Lane::Inspect,
+            inspect_rx,
+            internal_tx.clone(),
+            liveness.query_deadline,
+        ));
+    }
+    if !owns_process {
+        // An attached kernel has no child process to watch, so the heartbeat is
+        // the only way to notice that it died or was restarted elsewhere.
+        tasks.push(spawn_heartbeat(
+            connection_info,
+            liveness,
+            internal_tx.clone(),
+        ));
+    }
+
+    let info = KernelSessionInfo {
+        generation,
+        kernel_name: resolved.kernel_name.clone(),
+        display_name: resolved.display_name.clone(),
+        spec_dir: resolved.spec_dir.clone(),
+        connection_file: connection_file.to_path_buf(),
+        pid,
+        supports_subshells: subshell_id.is_some(),
+        supports_debugger,
+    };
+
+    let mut router = ExecRouter::default();
+    let mut main_queue = VecDeque::new();
+    let mut inspect_queue = VecDeque::new();
+    let mut main_inflight = false;
+    let mut inspect_inflight = false;
+    let mut pending_input: Option<JupyterMessage> = None;
+
+    let outcome = 'session: {
+        if event_tx.send(KernelEvent::Ready { info }).is_err() {
+            break 'session Outcome::Stop { kill: true };
+        }
+
+        loop {
+            schedule_shell(&mut main_queue, &main_tx, &mut main_inflight);
+            if subshell_id.is_some() {
+                schedule_shell(&mut inspect_queue, &inspect_tx, &mut inspect_inflight);
+            }
+
+            tokio::select! {
+                command = next_buffered(pending, cmd_rx) => {
+                    let Some(command) = command else { break Outcome::Stop { kill: true } };
+                    match command {
+                        KernelCmd::Execute { target, lane, code, silent, store_history, stop_on_error } => {
+                            let mut message = execute_message(code, silent, store_history, stop_on_error);
+                            if lane == Lane::Inspect && let Some(id) = subshell_id.as_deref() {
+                                message = decorate_subshell_message(message, id);
+                            }
+                            let exec_id = ExecId(message.header.msg_id.clone());
+                            let execution_count = None;
+                            router.register(exec_id.clone(), target.clone());
+                            let _ = event_tx.send(KernelEvent::ExecutionStarted {
+                                exec_id: exec_id.clone(),
+                                target: target.clone(),
+                                execution_count,
+                            });
+                            let request = ShellRequest {
+                                message,
+                                kind: ShellKind::Execute,
+                                stop_on_error,
+                                request_id: None,
+                            };
+                            if lane == Lane::Inspect && subshell_id.is_some() {
+                                inspect_queue.push_back(request);
+                            } else {
+                                main_queue.push_back(request);
+                            }
+                        }
+                        KernelCmd::Complete { req_id, code, cursor_char_pos } => {
+                            enqueue_query(&mut main_queue, ShellRequest {
+                                message: complete_message(code, cursor_char_pos),
+                                kind: ShellKind::Complete,
+                                stop_on_error: false,
+                                request_id: Some(req_id),
+                            }, event_tx);
+                        }
+                        KernelCmd::Inspect { req_id, code, cursor_char_pos, detail_level } => {
+                            let mut message = inspect_message(code, cursor_char_pos, detail_level);
+                            let queue = if let Some(id) = subshell_id.as_deref() {
+                                message = decorate_subshell_message(message, id);
+                                &mut inspect_queue
+                            } else {
+                                &mut main_queue
+                            };
+                            enqueue_query(queue, ShellRequest {
+                                message,
+                                kind: ShellKind::Inspect,
+                                stop_on_error: false,
+                                request_id: Some(req_id),
+                            }, event_tx);
+                        }
+                        KernelCmd::ReplyInput { value } => {
+                            if let Some(parent) = pending_input.take() {
+                                let reply: JupyterMessage = InputReply {
+                                    value,
+                                    ..InputReply::default()
+                                }
+                                .as_child_of(&parent);
+                                let _ = stdin_tx.send(reply);
+                            }
+                        }
+                        KernelCmd::CommOpen { comm_id, target_name, data } => {
+                            main_queue.push_back(ShellRequest {
+                                message: JupyterCommOpen {
+                                    comm_id: jupyter_protocol::CommId(comm_id.0),
+                                    target_name,
+                                    data,
+                                    target_module: None,
+                                }.into(),
+                                kind: ShellKind::NoReply,
+                                stop_on_error: false,
+                                request_id: None,
+                            });
+                        }
+                        KernelCmd::CommMsg { comm_id, data } => {
+                            main_queue.push_back(ShellRequest {
+                                message: JupyterCommMsg {
+                                    comm_id: jupyter_protocol::CommId(comm_id.0),
+                                    data,
+                                }.into(),
+                                kind: ShellKind::NoReply,
+                                stop_on_error: false,
+                                request_id: None,
+                            });
+                        }
+                        KernelCmd::CommClose { comm_id, data } => {
+                            main_queue.push_back(ShellRequest {
+                                message: JupyterCommClose {
+                                    comm_id: jupyter_protocol::CommId(comm_id.0),
+                                    data,
+                                }.into(),
+                                kind: ShellKind::NoReply,
+                                stop_on_error: false,
+                                request_id: None,
+                            });
+                        }
+                        KernelCmd::Interrupt => {
+                            if resolved.interrupt_via_message || pid.is_none() {
+                                let _ = control_tx.send(InterruptRequest::default().into());
+                            } else if let Some(process_id) = pid {
+                                signal_process_group(process_id, libc::SIGINT);
+                            }
+                        }
+                        KernelCmd::Restart => {
+                            if owns_process {
+                                let _ = control_tx.send(ShutdownRequest { restart: true }.into());
+                            } else {
+                                // nb cannot relaunch a kernel it did not start, and shutting
+                                // it down would strand whoever owns it. Reconnect instead:
+                                // DEALER sockets never reconnect by themselves, so this
+                                // also recovers from the kernel being restarted elsewhere.
+                                let _ = event_tx.send(KernelEvent::ProcessLog {
+                                    stream: StreamKind::Stderr,
+                                    line: "nb did not launch this kernel; reconnecting \
+                                           instead of restarting it"
+                                        .to_owned(),
+                                });
+                            }
+                            break Outcome::Restart;
+                        }
+                        KernelCmd::Shutdown { kill_process } => {
+                            if owns_process || kill_process {
+                                let _ = control_tx.send(ShutdownRequest { restart: false }.into());
+                            }
+                            break Outcome::Stop { kill: kill_process };
+                        }
+                    }
+                }
+                message = next_buffered(&mut early, &mut internal_rx) => {
+                    let Some(message) = message else { break Outcome::Stop { kill: true } };
+                    match message {
+                        SupervisorMessage::IoPub(message) => {
+                            if handle_iopub(message, &mut router, event_tx) {
+                                send_died(
+                                    event_tx,
+                                    generation,
+                                    "kernel reported execution state 'dead'".to_owned(),
+                                    &stderr_ring,
+                                );
+                                break Outcome::Dead;
+                            }
+                        }
+                        SupervisorMessage::Shell { message, request_id } => {
+                            handle_shell_message(
+                                message,
+                                request_id,
+                                &mut router,
+                                event_tx,
+                                &internal_tx,
+                                liveness.idle_grace,
+                            );
+                        }
+                        SupervisorMessage::ShellFinished { lane, failed, stop_on_error } => {
+                            match lane {
+                                Lane::Main => {
+                                    main_inflight = false;
+                                    if failed && stop_on_error {
+                                        cancel_queued_executes(&mut main_queue, &mut router, event_tx);
+                                    }
+                                }
+                                Lane::Inspect => inspect_inflight = false,
+                            }
+                        }
+                        SupervisorMessage::QueryTimedOut { kind, request_id } => {
+                            send_empty_reply(kind, request_id, event_tx);
+                        }
+                        SupervisorMessage::ChannelFailed { channel, reason } => {
+                            send_died(
+                                event_tx,
+                                generation,
+                                format!("{channel} connection failed: {reason}"),
+                                &stderr_ring,
+                            );
+                            break Outcome::Dead;
+                        }
+                        SupervisorMessage::Stdin(message) => {
+                            if let JupyterMessageContent::InputRequest(request) = &message.content {
+                                let prompt = request.prompt.clone();
+                                let password = request.password;
+                                pending_input = Some(message);
+                                let _ = event_tx.send(KernelEvent::InputRequested { prompt, password });
+                            }
+                        }
+                        SupervisorMessage::ProcessLog { stream, line } => {
+                            let _ = event_tx.send(KernelEvent::ProcessLog { stream, line });
+                        }
+                        SupervisorMessage::ProcessExited { status } => {
+                            if let Some(process) = process.as_mut() {
+                                process.drain_stderr().await;
+                            }
+                            send_died(event_tx, generation, status, &stderr_ring);
+                            break Outcome::Dead;
+                        }
+                        SupervisorMessage::IdleGrace(exec_id) => {
+                            if let Some((target, ok, elapsed)) = router.mark_iopub_idle(&exec_id) {
+                                let _ = event_tx.send(KernelEvent::ExecutionFinished {
+                                    exec_id,
+                                    target,
+                                    ok,
+                                    elapsed,
+                                });
+                            }
+                        }
+                        SupervisorMessage::HeartbeatLost { misses } => {
+                            send_died(
+                                event_tx,
+                                generation,
+                                format!("kernel stopped answering heartbeats ({misses} missed)"),
+                                &stderr_ring,
+                            );
+                            break Outcome::Dead;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    answer_queued_queries(&mut main_queue, event_tx);
+    answer_queued_queries(&mut inspect_queue, event_tx);
+    // Closing the channel lets the control pump deliver a final shutdown_request
+    // before it exits.
+    drop(control_tx);
+    if tokio::time::timeout(CONTROL_FLUSH, &mut control_task)
+        .await
+        .is_err()
+    {
+        control_task.abort();
+    }
+    drop(tasks);
+    if let Some(process) = process.as_mut() {
+        let grace = match outcome {
+            Outcome::Stop { kill: false } | Outcome::Restart => liveness.shutdown_grace,
+            Outcome::Stop { kill: true } | Outcome::Dead => Duration::ZERO,
+        };
+        process.stop(grace).await;
+    }
+    if owns_process {
+        let _ = tokio::fs::remove_file(connection_file).await;
+    }
+    outcome
+}
+
+/// Connect every channel and complete the kernel_info handshake. The iopub pump
+/// starts first so status published during startup is not lost.
+async fn connect_kernel(
+    connection_info: &ConnectionInfo,
+    internal_tx: &mpsc::UnboundedSender<SupervisorMessage>,
+    tasks: &mut TaskSet,
+) -> Result<Connected, String> {
+    let session = uuid::Uuid::new_v4().to_string();
+    let iopub = jupyter_zmq_client::create_client_iopub_connection(connection_info, "", &session)
+        .await
+        .map_err(|error| format!("iopub connect: {error}"))?;
+    let identity = jupyter_zmq_client::peer_identity_for_session(&session)
+        .map_err(|error| format!("shell identity: {error}"))?;
+    let mut shell = jupyter_zmq_client::create_client_shell_connection_with_identity(
+        connection_info,
         &session,
         identity.clone(),
     )
     .await
-    {
-        Ok(connection) => connection,
-        Err(error) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                format!("shell connect: {error}"),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
-        }
-    };
-    let stdin = match jupyter_zmq_client::create_client_stdin_connection_with_identity(
-        &connection_info,
+    .map_err(|error| format!("shell connect: {error}"))?;
+    let stdin = jupyter_zmq_client::create_client_stdin_connection_with_identity(
+        connection_info,
         &session,
         identity,
     )
     .await
-    {
-        Ok(connection) => connection,
-        Err(error) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                format!("stdin connect: {error}"),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
-        }
-    };
-    let mut control = match jupyter_zmq_client::create_client_control_connection(
-        &connection_info,
-        &session,
-    )
-    .await
-    {
-        Ok(connection) => connection,
-        Err(error) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                format!("control connect: {error}"),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
-        }
-    };
+    .map_err(|error| format!("stdin connect: {error}"))?;
+    let mut control =
+        jupyter_zmq_client::create_client_control_connection(connection_info, &session)
+            .await
+            .map_err(|error| format!("control connect: {error}"))?;
 
-    spawn_iopub_pump(iopub, internal_tx.clone());
+    tasks.push(spawn_iopub_pump(iopub, internal_tx.clone()));
 
     let kernel_info_request: JupyterMessage = KernelInfoRequest::default().into();
     let kernel_info_id = kernel_info_request.header.msg_id.clone();
-    if let Err(error) = shell.send(kernel_info_request).await {
-        launch_failed(
-            &event_tx,
-            generation,
-            format!("kernel_info send: {error}"),
-            owns_process,
-            &connection_file,
-            kill_tx,
-        )
-        .await;
-        return;
-    }
+    shell
+        .send(kernel_info_request)
+        .await
+        .map_err(|error| format!("kernel_info send: {error}"))?;
     let (kernel_info, kernel_info_metadata) = match tokio::time::timeout(
         Duration::from_secs(30),
         read_kernel_info(&mut shell, &kernel_info_id),
@@ -328,30 +790,8 @@ async fn supervise(
     .await
     {
         Ok(Ok(reply)) => reply,
-        Ok(Err(error)) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                format!("kernel_info read: {error}"),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
-        }
-        Err(_) => {
-            launch_failed(
-                &event_tx,
-                generation,
-                "timed out waiting for kernel_info_reply".to_owned(),
-                owns_process,
-                &connection_file,
-                kill_tx,
-            )
-            .await;
-            return;
-        }
+        Ok(Err(error)) => return Err(format!("kernel_info read: {error}")),
+        Err(_) => return Err("timed out waiting for kernel_info_reply".to_owned()),
     };
 
     let features = supported_features(&kernel_info_metadata);
@@ -382,7 +822,7 @@ async fn supervise(
             jupyter_zmq_client::peer_identity_for_session(&inspect_session)
             && let Ok(connection) =
                 jupyter_zmq_client::create_client_shell_connection_with_identity(
-                    &connection_info,
+                    connection_info,
                     &inspect_session,
                     inspect_identity,
                 )
@@ -394,234 +834,108 @@ async fn supervise(
         }
     }
 
-    let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
-    spawn_stdin_pump(stdin, stdin_rx, internal_tx.clone());
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    spawn_control_pump(control, control_rx);
-
-    let (main_tx, main_rx) = mpsc::unbounded_channel();
-    spawn_shell_worker(shell, Lane::Main, main_rx, internal_tx.clone());
-    let (inspect_tx, inspect_rx) = mpsc::unbounded_channel();
-    if let Some(connection) = inspect_shell {
-        spawn_shell_worker(connection, Lane::Inspect, inspect_rx, internal_tx.clone());
-    }
-
-    let info = KernelSessionInfo {
-        generation,
-        kernel_name: resolved.kernel_name.clone(),
-        display_name: resolved.display_name.clone(),
-        spec_dir: resolved.spec_dir.clone(),
-        connection_file: connection_file.clone(),
-        pid,
-        supports_subshells: subshell_id.is_some(),
+    Ok(Connected {
+        shell,
+        stdin,
+        control,
+        inspect_shell,
+        subshell_id,
         supports_debugger,
-    };
-    if event_tx.send(KernelEvent::Ready { info }).is_err() {
-        cleanup(owns_process, &connection_file, kill_tx, true).await;
-        return;
+    })
+}
+
+/// Resolve when the kernel process exits during startup, buffering every other
+/// supervisor message for the session loop.
+async fn startup_exit(
+    internal_rx: &mut mpsc::UnboundedReceiver<SupervisorMessage>,
+    early: &mut VecDeque<SupervisorMessage>,
+) -> String {
+    while let Some(message) = internal_rx.recv().await {
+        match message {
+            SupervisorMessage::ProcessExited { status } => return status,
+            other => early.push_back(other),
+        }
     }
+    std::future::pending().await
+}
 
-    let mut router = ExecRouter::default();
-    let mut main_queue = VecDeque::new();
-    let mut inspect_queue = VecDeque::new();
-    let mut main_inflight = false;
-    let mut inspect_inflight = false;
-    let mut pending_input: Option<JupyterMessage> = None;
-    let mut current_generation = generation;
-    let mut shutdown_force = true;
-
+/// Resolve when `Shutdown` arrives (or the handle is dropped) during startup,
+/// buffering every other command for the session loop.
+async fn startup_shutdown(
+    cmd_rx: &mut mpsc::UnboundedReceiver<KernelCmd>,
+    pending: &mut VecDeque<KernelCmd>,
+) {
     loop {
-        schedule_shell(&mut main_queue, &main_tx, &mut main_inflight);
-        if subshell_id.is_some() {
-            schedule_shell(&mut inspect_queue, &inspect_tx, &mut inspect_inflight);
-        }
-
-        tokio::select! {
-            command = cmd_rx.recv() => {
-                let Some(command) = command else { break };
-                match command {
-                    KernelCmd::Execute { target, lane, code, silent, store_history, stop_on_error } => {
-                        let mut message = execute_message(code, silent, store_history, stop_on_error);
-                        if lane == Lane::Inspect && let Some(id) = subshell_id.as_deref() {
-                            message = decorate_subshell_message(message, id);
-                        }
-                        let exec_id = ExecId(message.header.msg_id.clone());
-                        let execution_count = None;
-                        router.register(exec_id.clone(), target.clone());
-                        let _ = event_tx.send(KernelEvent::ExecutionStarted {
-                            exec_id: exec_id.clone(),
-                            target: target.clone(),
-                            execution_count,
-                        });
-                        let request = ShellRequest {
-                            message,
-                            kind: ShellKind::Execute,
-                            stop_on_error,
-                            request_id: None,
-                        };
-                        if lane == Lane::Inspect && subshell_id.is_some() {
-                            inspect_queue.push_back(request);
-                        } else {
-                            main_queue.push_back(request);
-                        }
-                    }
-                    KernelCmd::Complete { req_id, code, cursor_char_pos } => {
-                        main_queue.push_back(ShellRequest {
-                            message: complete_message(code, cursor_char_pos),
-                            kind: ShellKind::Complete,
-                            stop_on_error: false,
-                            request_id: Some(req_id),
-                        });
-                    }
-                    KernelCmd::Inspect { req_id, code, cursor_char_pos, detail_level } => {
-                        let mut message = inspect_message(code, cursor_char_pos, detail_level);
-                        if subshell_id.is_some() {
-                            if let Some(id) = subshell_id.as_deref() {
-                                message = decorate_subshell_message(message, id);
-                            }
-                            inspect_queue.push_back(ShellRequest {
-                                message,
-                                kind: ShellKind::Inspect,
-                                stop_on_error: false,
-                                request_id: Some(req_id),
-                            });
-                        } else {
-                            main_queue.push_back(ShellRequest {
-                                message,
-                                kind: ShellKind::Inspect,
-                                stop_on_error: false,
-                                request_id: Some(req_id),
-                            });
-                        }
-                    }
-                    KernelCmd::ReplyInput { value } => {
-                        if let Some(parent) = pending_input.take() {
-                            let reply: JupyterMessage = InputReply {
-                                value,
-                                ..InputReply::default()
-                            }
-                            .as_child_of(&parent);
-                            let _ = stdin_tx.send(reply);
-                        }
-                    }
-                    KernelCmd::CommOpen { comm_id, target_name, data } => {
-                        main_queue.push_back(ShellRequest {
-                            message: JupyterCommOpen {
-                                comm_id: jupyter_protocol::CommId(comm_id.0),
-                                target_name,
-                                data,
-                                target_module: None,
-                            }.into(),
-                            kind: ShellKind::NoReply,
-                            stop_on_error: false,
-                            request_id: None,
-                        });
-                    }
-                    KernelCmd::CommMsg { comm_id, data } => {
-                        main_queue.push_back(ShellRequest {
-                            message: JupyterCommMsg {
-                                comm_id: jupyter_protocol::CommId(comm_id.0),
-                                data,
-                            }.into(),
-                            kind: ShellKind::NoReply,
-                            stop_on_error: false,
-                            request_id: None,
-                        });
-                    }
-                    KernelCmd::CommClose { comm_id, data } => {
-                        main_queue.push_back(ShellRequest {
-                            message: JupyterCommClose {
-                                comm_id: jupyter_protocol::CommId(comm_id.0),
-                                data,
-                            }.into(),
-                            kind: ShellKind::NoReply,
-                            stop_on_error: false,
-                            request_id: None,
-                        });
-                    }
-                    KernelCmd::Interrupt => {
-                        if resolved.interrupt_via_message || pid.is_none() {
-                            let _ = control_tx.send(InterruptRequest::default().into());
-                        } else if let Some(process_id) = pid {
-                            send_sigint(process_id);
-                        }
-                    }
-                    KernelCmd::Restart => {
-                        current_generation = current_generation.wrapping_add(1);
-                        router.clear();
-                        let _ = control_tx.send(ShutdownRequest { restart: true }.into());
-                    }
-                    KernelCmd::Shutdown { kill_process } => {
-                        shutdown_force = kill_process;
-                        if owns_process || kill_process {
-                            let _ = control_tx.send(ShutdownRequest { restart: false }.into());
-                        }
-                        break;
-                    }
-                }
-            }
-            message = internal_rx.recv() => {
-                let Some(message) = message else { break };
-                match message {
-                    SupervisorMessage::IoPub(message) => {
-                        handle_iopub(message, &mut router, &event_tx);
-                    }
-                    SupervisorMessage::Shell { message, request_id } => {
-                        handle_shell_message(message, request_id, &mut router, &event_tx);
-                    }
-                    SupervisorMessage::ShellFinished { lane, failed, stop_on_error } => {
-                        match lane {
-                            Lane::Main => {
-                                main_inflight = false;
-                                if failed && stop_on_error {
-                                    cancel_queued_executes(&mut main_queue, &mut router, &event_tx);
-                                }
-                            }
-                            Lane::Inspect => inspect_inflight = false,
-                        }
-                    }
-                    SupervisorMessage::ShellFailed { lane, reason } => {
-                        let _ = event_tx.send(KernelEvent::Died {
-                            generation: current_generation,
-                            exit_status: format!("{lane:?} shell connection failed: {reason}"),
-                            stderr_tail: ring_tail(&stderr_ring),
-                        });
-                        break;
-                    }
-                    SupervisorMessage::Stdin(message) => {
-                        if let JupyterMessageContent::InputRequest(request) = &message.content {
-                            let prompt = request.prompt.clone();
-                            let password = request.password;
-                            pending_input = Some(message);
-                            let _ = event_tx.send(KernelEvent::InputRequested { prompt, password });
-                        }
-                    }
-                    SupervisorMessage::ProcessLog { stream, line } => {
-                        let _ = event_tx.send(KernelEvent::ProcessLog { stream, line });
-                    }
-                    SupervisorMessage::ProcessExited { status, expected } => {
-                        if !expected {
-                            router.clear();
-                            let _ = event_tx.send(KernelEvent::Died {
-                                generation: current_generation,
-                                exit_status: status,
-                                stderr_tail: ring_tail(&stderr_ring),
-                            });
-                        }
-                        break;
-                    }
-                }
-            }
+        match cmd_rx.recv().await {
+            None | Some(KernelCmd::Shutdown { .. }) => return,
+            Some(command) => pending.push_back(command),
         }
     }
+}
 
-    cleanup(
-        owns_process,
-        &connection_file,
-        kill_tx.take(),
-        shutdown_force,
-    )
-    .await;
+/// Park a dead session until the UI asks for a restart (`true`) or shuts it down.
+async fn wait_for_restart(
+    cmd_rx: &mut mpsc::UnboundedReceiver<KernelCmd>,
+    pending: &mut VecDeque<KernelCmd>,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+) -> bool {
+    while let Some(command) = next_buffered(pending, cmd_rx).await {
+        match command {
+            KernelCmd::Restart => return true,
+            KernelCmd::Shutdown { .. } => return false,
+            KernelCmd::Execute { target, .. } => {
+                // Nothing can run; finish at once so the request does not hang.
+                let _ = event_tx.send(KernelEvent::ExecutionFinished {
+                    exec_id: ExecId(uuid::Uuid::new_v4().to_string()),
+                    target,
+                    ok: false,
+                    elapsed: Duration::ZERO,
+                });
+            }
+            KernelCmd::Complete { req_id, .. } => {
+                send_empty_reply(ShellKind::Complete, Some(req_id), event_tx);
+            }
+            KernelCmd::Inspect { req_id, .. } => {
+                send_empty_reply(ShellKind::Inspect, Some(req_id), event_tx);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Take the next buffered item before waiting on the channel.
+async fn next_buffered<T>(
+    buffered: &mut VecDeque<T>,
+    receiver: &mut mpsc::UnboundedReceiver<T>,
+) -> Option<T> {
+    match buffered.pop_front() {
+        Some(item) => Some(item),
+        None => receiver.recv().await,
+    }
+}
+
+fn send_died(
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+    generation: u64,
+    exit_status: String,
+    stderr_ring: &Arc<Mutex<RingLog>>,
+) {
+    let _ = event_tx.send(KernelEvent::Died {
+        generation,
+        exit_status,
+        stderr_tail: ring_tail(stderr_ring),
+    });
+}
+
+/// Append the kernel's last stderr line, usually the real error (for example
+/// `No module named ipykernel_launcher`), to a launch failure reason.
+fn with_stderr_hint(reason: String, stderr_ring: &Arc<Mutex<RingLog>>) -> String {
+    let tail = ring_tail(stderr_ring);
+    match tail.iter().rev().find(|line| !line.trim().is_empty()) {
+        Some(line) => format!("{reason}: {}", line.trim()),
+        None => reason,
+    }
 }
 
 async fn prepare_kernel(
@@ -634,22 +948,21 @@ async fn prepare_kernel(
             .with_context(|| format!("reading connection file {}", existing.display()))?;
         let connection_info: ConnectionInfo = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing connection file {}", existing.display()))?;
-        let resolved = resolve_kernelspec(&spec.requested_name, &spec.working_dir)
-            .await
-            .unwrap_or_else(|_| ResolvedKernelspec {
-                kernel_name: connection_info
-                    .kernel_name
-                    .clone()
-                    .unwrap_or_else(|| spec.requested_name.clone()),
-                display_name: connection_info
-                    .kernel_name
-                    .clone()
-                    .unwrap_or_else(|| spec.requested_name.clone()),
-                language: "python".to_owned(),
-                spec_dir: spec.working_dir.clone(),
-                argv: Vec::new(),
-                interrupt_via_message: false,
-            });
+        // The kernel is already running, so a kernelspec would only supply names;
+        // skip discovery, which may have to spawn `jupyter --paths`.
+        let kernel_name = connection_info
+            .kernel_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| spec.requested_name.clone());
+        let resolved = ResolvedKernelspec {
+            kernel_name: kernel_name.clone(),
+            display_name: kernel_name,
+            language: "python".to_owned(),
+            spec_dir: spec.working_dir.clone(),
+            argv: Vec::new(),
+            interrupt_via_message: false,
+        };
         return Ok(PreparedKernel {
             connection_info,
             resolved,
@@ -713,6 +1026,10 @@ async fn prepare_kernel(
         .stdin(ProcessStdio::null())
         .stdout(ProcessStdio::piped())
         .stderr(ProcessStdio::piped())
+        // Lead a process group so signals reach the kernel through wrapper
+        // launchers (`conda run`, `pixi run`, scripts), and so terminal signals
+        // aimed at nb do not reach the kernel.
+        .process_group(0)
         .kill_on_drop(true);
     let child = command.spawn().with_context(|| {
         format!(
@@ -730,54 +1047,64 @@ async fn prepare_kernel(
     })
 }
 
-async fn launch_failed(
-    event_tx: &mpsc::UnboundedSender<KernelEvent>,
-    generation: u64,
-    reason: String,
-    owns_process: bool,
-    connection_file: &Path,
-    kill_tx: Option<oneshot::Sender<bool>>,
-) {
-    cleanup(owns_process, connection_file, kill_tx, true).await;
-    let _ = event_tx.send(KernelEvent::LaunchFailed { generation, reason });
-}
-
-async fn cleanup(
-    owns_process: bool,
-    connection_file: &Path,
-    kill_tx: Option<oneshot::Sender<bool>>,
-    force_kill: bool,
-) {
-    if let Some(terminate) = kill_tx {
-        let _ = terminate.send(force_kill);
+fn spawn_owned_process(
+    mut child: Child,
+    pid: Option<u32>,
+    stderr_ring: &Arc<Mutex<RingLog>>,
+    internal_tx: &mpsc::UnboundedSender<SupervisorMessage>,
+) -> OwnedProcess {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_process_stream(
+            stdout,
+            StreamKind::Stdout,
+            internal_tx.clone(),
+            Arc::new(Mutex::new(RingLog::new(DEFAULT_PROCESS_LOG_CAP))),
+        );
     }
-    if owns_process {
-        let _ = tokio::fs::remove_file(connection_file).await;
+    let stderr = child.stderr.take().map(|stderr| {
+        spawn_process_stream(
+            stderr,
+            StreamKind::Stderr,
+            internal_tx.clone(),
+            stderr_ring.clone(),
+        )
+    });
+    let (terminate_tx, terminate_rx) = oneshot::channel();
+    let monitor = spawn_process_monitor(child, pid, terminate_rx, internal_tx.clone());
+    OwnedProcess {
+        terminate: Some(terminate_tx),
+        monitor: Some(monitor),
+        stderr,
     }
 }
 
 fn spawn_process_monitor(
     mut child: Child,
-    mut terminate_rx: oneshot::Receiver<bool>,
+    pid: Option<u32>,
+    terminate_rx: oneshot::Receiver<Duration>,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
             result = child.wait() => {
                 let status = format_exit_status(result);
-                let _ = internal_tx.send(SupervisorMessage::ProcessExited { status, expected: false });
+                let _ = internal_tx.send(SupervisorMessage::ProcessExited { status });
             }
-            requested = &mut terminate_rx => {
-                if requested.unwrap_or(true) {
+            grace = terminate_rx => {
+                // A dropped sender means the supervisor is gone: kill at once.
+                let grace = grace.unwrap_or(Duration::ZERO);
+                if tokio::time::timeout(grace, child.wait()).await.is_err() {
+                    // The group leader is not reaped yet, so its pid still names
+                    // this group; kill wrapper launchers' children too.
+                    if let Some(pid) = pid {
+                        signal_process_group(pid, libc::SIGKILL);
+                    }
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                } else {
-                    let status = format_exit_status(child.wait().await);
-                    let _ = internal_tx.send(SupervisorMessage::ProcessExited { status, expected: true });
                 }
             }
         }
-    });
+    })
 }
 
 fn format_exit_status(result: std::io::Result<ExitStatus>) -> String {
@@ -792,7 +1119,8 @@ fn spawn_process_stream<R>(
     stream: StreamKind,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
     ring: Arc<Mutex<RingLog>>,
-) where
+) -> JoinHandle<()>
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -808,60 +1136,162 @@ fn spawn_process_stream<R>(
                 break;
             }
         }
-    });
+    })
+}
+
+/// Whether `error` only affects one message (bad signature, framing or JSON), so
+/// the socket can keep reading. Anything else is a transport failure.
+fn is_message_error(error: &RuntimeError) -> bool {
+    !matches!(error, RuntimeError::ZmqError(_) | RuntimeError::IoError(_))
+}
+
+/// Report a dropped or failed message in the process log instead of losing it
+/// silently. Returns `false` once the supervisor is gone.
+fn log_channel_error(
+    internal_tx: &mpsc::UnboundedSender<SupervisorMessage>,
+    channel: &str,
+    error: &RuntimeError,
+) -> bool {
+    internal_tx
+        .send(SupervisorMessage::ProcessLog {
+            stream: StreamKind::Stderr,
+            line: format!("nb-kernel: {channel} message dropped: {error}"),
+        })
+        .is_ok()
 }
 
 fn spawn_iopub_pump(
     mut connection: jupyter_zmq_client::ClientIoPubConnection,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok(message) = connection.read().await {
+        loop {
+            let message = match connection.read().await {
+                Ok(message) => message,
+                Err(error) => {
+                    if !log_channel_error(&internal_tx, "iopub", &error) {
+                        break;
+                    }
+                    if !is_message_error(&error) {
+                        // SUB sockets reconnect by themselves; pause so a
+                        // persistent transport error cannot spin this loop.
+                        tokio::time::sleep(IOPUB_RETRY).await;
+                    }
+                    continue;
+                }
+            };
             if internal_tx.send(SupervisorMessage::IoPub(message)).is_err() {
                 break;
             }
         }
-    });
+    })
 }
 
 fn spawn_stdin_pump(
     mut connection: jupyter_zmq_client::ClientStdinConnection,
     mut outgoing: mpsc::UnboundedReceiver<JupyterMessage>,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::select! {
+            let result = tokio::select! {
                 message = outgoing.recv() => {
                     let Some(message) = message else { break };
-                    if connection.send(message).await.is_err() { break; }
+                    connection.send(message).await.map(|()| None)
                 }
-                message = connection.read() => {
-                    let Ok(message) = message else { break };
-                    if internal_tx.send(SupervisorMessage::Stdin(message)).is_err() { break; }
+                message = connection.read() => message.map(Some),
+            };
+            match result {
+                Ok(Some(message)) => {
+                    if internal_tx.send(SupervisorMessage::Stdin(message)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) if is_message_error(&error) => {
+                    if !log_channel_error(&internal_tx, "stdin", &error) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = internal_tx.send(SupervisorMessage::ChannelFailed {
+                        channel: "stdin",
+                        reason: error.to_string(),
+                    });
+                    break;
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_control_pump(
     mut connection: jupyter_zmq_client::ClientControlConnection,
     mut outgoing: mpsc::UnboundedReceiver<JupyterMessage>,
-) {
+    internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::select! {
+            let result = tokio::select! {
                 message = outgoing.recv() => {
                     let Some(message) = message else { break };
-                    if connection.send(message).await.is_err() { break; }
+                    connection.send(message).await
                 }
-                result = connection.read() => {
-                    if result.is_err() { break; }
+                // Control replies carry nothing the session needs.
+                message = connection.read() => message.map(|_| ()),
+            };
+            match result {
+                Ok(()) => {}
+                Err(error) if is_message_error(&error) => {
+                    if !log_channel_error(&internal_tx, "control", &error) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = internal_tx.send(SupervisorMessage::ChannelFailed {
+                        channel: "control",
+                        reason: error.to_string(),
+                    });
+                    break;
                 }
             }
         }
-    });
+    })
+}
+
+fn spawn_heartbeat(
+    connection_info: ConnectionInfo,
+    liveness: Liveness,
+    internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut misses = 0;
+        loop {
+            tokio::time::sleep(liveness.heartbeat_interval).await;
+            // A REQ socket is unusable after a lost reply, so each ping gets a fresh one.
+            let ping = async {
+                let mut heartbeat =
+                    jupyter_zmq_client::create_client_heartbeat_connection(&connection_info)
+                        .await?;
+                heartbeat.single_heartbeat().await
+            };
+            match tokio::time::timeout(liveness.heartbeat_timeout, ping).await {
+                Ok(Ok(())) => misses = 0,
+                Ok(Err(_)) | Err(_) => misses += 1,
+            }
+            if misses >= liveness.heartbeat_misses {
+                let _ = internal_tx.send(SupervisorMessage::HeartbeatLost { misses });
+                return;
+            }
+        }
+    })
+}
+
+fn lane_channel(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Main => "main shell",
+        Lane::Inspect => "inspect shell",
+    }
 }
 
 fn spawn_shell_worker(
@@ -869,7 +1299,9 @@ fn spawn_shell_worker(
     lane: Lane,
     mut requests: mpsc::UnboundedReceiver<ShellRequest>,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
-) {
+    query_deadline: Duration,
+) -> JoinHandle<()> {
+    let channel = lane_channel(lane);
     tokio::spawn(async move {
         while let Some(request) = requests.recv().await {
             let id = ExecId(request.message.header.msg_id.clone());
@@ -877,11 +1309,11 @@ fn spawn_shell_worker(
             let stop_on_error = request.stop_on_error;
             let request_id = request.request_id;
             if let Err(error) = connection.send(request.message).await {
-                let _ = internal_tx.send(SupervisorMessage::ShellFailed {
-                    lane,
+                let _ = internal_tx.send(SupervisorMessage::ChannelFailed {
+                    channel,
                     reason: error.to_string(),
                 });
-                break;
+                return;
             }
             if kind == ShellKind::NoReply {
                 let _ = internal_tx.send(SupervisorMessage::ShellFinished {
@@ -892,19 +1324,44 @@ fn spawn_shell_worker(
                 continue;
             }
 
+            // Only completions and inspections get a deadline: a kernel that never
+            // answers one (an unsupported request, a handler that raised) must not
+            // wedge the lane, but an execute may run for days.
+            let deadline =
+                (kind != ShellKind::Execute).then(|| tokio::time::Instant::now() + query_deadline);
             let mut failed = false;
             loop {
-                let message = match connection.read().await {
-                    Ok(message) => message,
-                    Err(error) => {
-                        let _ = internal_tx.send(SupervisorMessage::ShellFailed {
-                            lane,
+                let read = match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, connection.read()).await,
+                    None => Ok(connection.read().await),
+                };
+                let message = match read {
+                    Ok(Ok(message)) => message,
+                    Ok(Err(error)) if is_message_error(&error) => {
+                        if !log_channel_error(&internal_tx, channel, &error) {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = internal_tx.send(SupervisorMessage::ChannelFailed {
+                            channel,
                             reason: error.to_string(),
                         });
                         return;
                     }
+                    Err(_) => {
+                        let _ =
+                            internal_tx.send(SupervisorMessage::QueryTimedOut { kind, request_id });
+                        break;
+                    }
                 };
-                let terminal = shell_reply_is_terminal(&message, &id, kind);
+                // Requests are serialized per lane, so a reply to anything else is
+                // a late answer to a request that already timed out.
+                if !is_reply_to(&message, &id) {
+                    continue;
+                }
+                let terminal = shell_reply_is_terminal(&message, kind);
                 if let JupyterMessageContent::ExecuteReply(reply) = &message.content {
                     failed = reply.status != ReplyStatus::Ok;
                 }
@@ -927,16 +1384,17 @@ fn spawn_shell_worker(
                 stop_on_error,
             });
         }
-    });
+    })
 }
 
-fn shell_reply_is_terminal(message: &JupyterMessage, id: &ExecId, kind: ShellKind) -> bool {
-    let Some(parent) = message.parent_header.as_ref() else {
-        return false;
-    };
-    if parent.msg_id != id.0 {
-        return false;
-    }
+fn is_reply_to(message: &JupyterMessage, id: &ExecId) -> bool {
+    message
+        .parent_header
+        .as_ref()
+        .is_some_and(|parent| parent.msg_id == id.0)
+}
+
+fn shell_reply_is_terminal(message: &JupyterMessage, kind: ShellKind) -> bool {
     match kind {
         ShellKind::Execute => matches!(message.content, JupyterMessageContent::ExecuteReply(_)),
         ShellKind::Complete => matches!(message.content, JupyterMessageContent::CompleteReply(_)),
@@ -1074,11 +1532,58 @@ fn cancel_queued_executes(
     *queue = retained;
 }
 
+/// Queue a completion or inspection, keeping at most one of each kind waiting so
+/// keystrokes cannot pile requests up behind a running cell. The request it
+/// replaces is answered empty at once so the UI stops waiting for it.
+fn enqueue_query(
+    queue: &mut VecDeque<ShellRequest>,
+    request: ShellRequest,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+) {
+    if let Some(queued) = queue.iter_mut().find(|queued| queued.kind == request.kind) {
+        let replaced = std::mem::replace(queued, request);
+        send_empty_reply(replaced.kind, replaced.request_id, event_tx);
+    } else {
+        queue.push_back(request);
+    }
+}
+
+/// Answer every queued completion and inspection when a session ends.
+fn answer_queued_queries(
+    queue: &mut VecDeque<ShellRequest>,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+) {
+    for request in queue.drain(..) {
+        send_empty_reply(request.kind, request.request_id, event_tx);
+    }
+}
+
+fn send_empty_reply(
+    kind: ShellKind,
+    request_id: Option<u64>,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+) {
+    let Some(req_id) = request_id else {
+        return;
+    };
+    let event = match kind {
+        ShellKind::Complete => KernelEvent::CompleteReply {
+            req_id,
+            start_char: 0,
+            items: Vec::new(),
+        },
+        ShellKind::Inspect => KernelEvent::InspectReply { req_id, doc: None },
+        ShellKind::Execute | ShellKind::NoReply => return,
+    };
+    let _ = event_tx.send(event);
+}
+
+/// Route one iopub message. Returns `true` when the kernel announced its own death.
 fn handle_iopub(
     message: JupyterMessage,
     router: &mut ExecRouter,
     event_tx: &mpsc::UnboundedSender<KernelEvent>,
-) {
+) -> bool {
     let parent = parent_exec_id(&message);
     match message.content {
         JupyterMessageContent::StreamContent(stream) => {
@@ -1164,6 +1669,9 @@ fn handle_iopub(
             }
         }
         JupyterMessageContent::Status(status) => {
+            if status.execution_state == ExecutionState::Dead {
+                return true;
+            }
             let busy = matches!(status.execution_state, ExecutionState::Busy);
             let _ = event_tx.send(KernelEvent::BusyStateChanged { busy });
             if status.execution_state == ExecutionState::Idle
@@ -1200,6 +1708,7 @@ fn handle_iopub(
         }
         _ => {}
     }
+    false
 }
 
 fn handle_shell_message(
@@ -1207,19 +1716,32 @@ fn handle_shell_message(
     request_id: Option<u64>,
     router: &mut ExecRouter,
     event_tx: &mpsc::UnboundedSender<KernelEvent>,
+    internal_tx: &mpsc::UnboundedSender<SupervisorMessage>,
+    idle_grace: Duration,
 ) {
     let parent = parent_exec_id(&message);
     match message.content {
         JupyterMessageContent::ExecuteReply(reply) => {
-            if let Some(exec_id) = parent
-                && let Some((target, ok, elapsed)) =
-                    router.mark_shell_reply(&exec_id, reply.status == ReplyStatus::Ok)
+            let Some(exec_id) = parent else {
+                return;
+            };
+            if let Some((target, ok, elapsed)) =
+                router.mark_shell_reply(&exec_id, reply.status == ReplyStatus::Ok)
             {
                 let _ = event_tx.send(KernelEvent::ExecutionFinished {
                     exec_id,
                     target,
                     ok,
                     elapsed,
+                });
+            } else if router.active(&exec_id).is_some() {
+                // The iopub `idle` normally follows within milliseconds. PUB drops
+                // messages past its high-water mark, so finish without it after a
+                // grace period rather than leave the cell running forever.
+                let internal_tx = internal_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(idle_grace).await;
+                    let _ = internal_tx.send(SupervisorMessage::IdleGrace(exec_id));
                 });
             }
         }
@@ -1357,14 +1879,26 @@ fn decorate_subshell_message(mut message: JupyterMessage, subshell_id: &str) -> 
 }
 
 #[allow(unsafe_code)]
-fn send_sigint(pid: u32) {
-    // Signal mode is the Jupyter default for ipykernel. This is intentionally
-    // the only unsafe operation in nb-kernel; all other lifecycle paths use
-    // Tokio process handles or protocol messages.
+fn signal_process_group(pid: u32, signal: libc::c_int) {
+    // Owned kernels lead their own process group (see `prepare_kernel`), so the
+    // signal also reaches a kernel started through a wrapper launcher. This is
+    // intentionally the only unsafe operation in nb-kernel; all other lifecycle
+    // paths use Tokio process handles or protocol messages.
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 1 {
+        return;
+    }
     unsafe {
-        let _ = libc::kill(pid as i32, libc::SIGINT);
+        if libc::killpg(pid, signal) != 0 {
+            let _ = libc::kill(pid, signal);
+        }
     }
 }
+
+#[cfg(test)]
+mod liveness_tests;
 
 #[cfg(test)]
 mod tests {

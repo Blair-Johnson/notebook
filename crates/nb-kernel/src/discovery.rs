@@ -3,6 +3,11 @@
 use crate::client::KernelError;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Bound on `jupyter --paths --json`, which can hang behind a slow shim
+/// (pyenv/asdf rehash, conda activation) and would otherwise stall startup.
+const JUPYTER_PATHS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct KernelLaunchSpec {
@@ -47,6 +52,8 @@ async fn resolve_kernelspec_with_roots(
         Some(working_dir.join("venv")),
     ];
 
+    // Asked lazily and once: it spawns a Python process.
+    let mut jupyter_dirs = None;
     for name in &candidates {
         for env_root in local_roots.iter().flatten() {
             let data_dir = env_root.join("share/jupyter");
@@ -56,8 +63,15 @@ async fn resolve_kernelspec_with_roots(
             }
         }
 
-        if let Ok(spec) = jupyter_zmq_client::find_kernelspec_with_jupyter_paths(name).await {
-            return Ok(convert_spec(spec, None));
+        let data_dirs = match &jupyter_dirs {
+            Some(dirs) => dirs,
+            None => jupyter_dirs.insert(jupyter_data_dirs().await),
+        };
+        for data_dir in data_dirs {
+            let specs = jupyter_zmq_client::read_kernelspec_jsons(data_dir).await;
+            if let Some(spec) = specs.into_iter().find(|spec| &spec.kernel_name == name) {
+                return Ok(convert_spec(spec, None));
+            }
         }
     }
 
@@ -65,6 +79,17 @@ async fn resolve_kernelspec_with_roots(
         "no Jupyter kernel found (tried {candidates:?}); install ipykernel in this \
          environment, e.g. `pixi add ipykernel`"
     )))
+}
+
+/// Standard Jupyter data directories plus those `jupyter --paths` reports, or
+/// just the standard ones when `jupyter` is missing or does not answer in time.
+async fn jupyter_data_dirs() -> Vec<PathBuf> {
+    tokio::time::timeout(
+        JUPYTER_PATHS_TIMEOUT,
+        jupyter_zmq_client::data_dirs_with_jupyter_paths(),
+    )
+    .await
+    .unwrap_or_else(|_| jupyter_zmq_client::data_dirs())
 }
 
 fn candidate_names(requested_name: &str) -> Vec<String> {
