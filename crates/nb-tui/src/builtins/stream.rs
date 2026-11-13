@@ -4,7 +4,8 @@ use ansi_to_tui::IntoText;
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
-use nb_core::{OutputData, OutputItem};
+use nb_core::output::TRUNCATION_MARKER;
+use nb_core::{OutputData, OutputItem, StreamBuffer};
 use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
@@ -38,6 +39,8 @@ pub struct StreamOutputView {
     line_row_starts: Vec<u32>,
     line_byte_starts: Vec<usize>,
     measured_bytes: usize,
+    measured_revision: u64,
+    measured_truncated: usize,
     total_rows: u32,
     shown_rows: u32,
     scroll_offset: Option<u32>, // None = follow tail
@@ -67,9 +70,13 @@ impl StreamOutputView {
     }
 
     fn text(item: &OutputItem) -> &str {
+        Self::buffer(item).map_or("", StreamBuffer::as_str)
+    }
+
+    fn buffer(item: &OutputItem) -> Option<&StreamBuffer> {
         match &item.data {
-            OutputData::Stream { buffer, .. } => buffer.as_str(),
-            _ => "",
+            OutputData::Stream { buffer, .. } => Some(buffer),
+            _ => None,
         }
     }
 
@@ -119,16 +126,24 @@ impl StreamOutputView {
         }
     }
 
-    fn ensure_index(&mut self, text: &str, width: u16) {
+    fn ensure_index(&mut self, buffer: Option<&StreamBuffer>, width: u16) {
+        let text = buffer.map_or("", StreamBuffer::as_str);
         let width = width.max(1);
-        if self.line_row_starts.is_empty() || self.wrapped_for_width != width {
+        let (revision, truncated) = buffer.map_or((0, 0), |b| (b.revision(), b.truncated_lines()));
+        let rebuilt = if self.line_row_starts.is_empty() || self.wrapped_for_width != width {
+            true
+        } else if truncated != self.measured_truncated {
+            // The buffer dropped leading lines: shift the index, or start over.
+            !self.drop_leading_lines(text, truncated)
+        } else {
+            // Shrinking without truncation means different text altogether.
+            text.len() < self.measured_bytes
+        };
+        if rebuilt {
             self.rebuild_index(text, width);
-        } else if text.len() < self.measured_bytes {
-            // StreamBuffer caps can discard the prefix. Rebuild rather than retaining stale offsets.
-            self.rebuild_index(text, width);
-        } else if text.len() > self.measured_bytes {
-            let old_lines = self.line_byte_starts.len();
-            let recompute_line = old_lines.saturating_sub(1);
+        } else if revision != self.measured_revision || text.len() != self.measured_bytes {
+            // Only the last line can change in place; re-index from its start.
+            let recompute_line = self.line_byte_starts.len().saturating_sub(1);
             let byte_start = self
                 .line_byte_starts
                 .get(recompute_line)
@@ -143,11 +158,42 @@ impl StreamOutputView {
             self.line_row_starts.truncate(recompute_line + 1);
             self.append_index_from(text, byte_start, row_start);
         }
+        self.measured_revision = revision;
+        self.measured_truncated = truncated;
         self.measured_bytes = text.len();
         self.total_rows = self.line_row_starts.last().copied().unwrap_or(0).max(1);
         if self.scroll_offset.is_some() {
             self.scroll_offset = Some(self.visible_start().min(self.max_scroll()));
         }
+    }
+
+    /// Rebase the index after the buffer replaced its oldest lines with the
+    /// truncation marker. Lines indexed before are unchanged apart from the
+    /// last one, which the caller re-indexes. Returns false when the index
+    /// cannot be shifted (it never saw the new first line).
+    fn drop_leading_lines(&mut self, text: &str, truncated: usize) -> bool {
+        let Some(dropped) = truncated.checked_sub(self.measured_truncated) else {
+            return false;
+        };
+        let first_kept = usize::from(self.measured_truncated > 0) + dropped;
+        if first_kept >= self.line_byte_starts.len() || !text.starts_with(TRUNCATION_MARKER) {
+            return false;
+        }
+        let old_byte = self.line_byte_starts[first_kept];
+        let old_row = self.line_row_starts[first_kept];
+        let marker_rows =
+            wrapped_row_count(TRUNCATION_MARKER.trim_end_matches('\n'), self.wrapped_for_width);
+        self.line_byte_starts.drain(..first_kept);
+        self.line_row_starts.drain(..first_kept);
+        for start in &mut self.line_byte_starts {
+            *start = *start - old_byte + TRUNCATION_MARKER.len();
+        }
+        for start in &mut self.line_row_starts {
+            *start = *start - old_row + marker_rows;
+        }
+        self.line_byte_starts.insert(0, 0);
+        self.line_row_starts.insert(0, 0);
+        true
     }
 
     fn max_scroll(&self) -> u32 {
@@ -200,7 +246,7 @@ impl OutputView for StreamOutputView {
         _theme: &Theme,
         cap_rows: Option<u16>,
     ) -> OutputMetrics {
-        self.ensure_index(Self::text(item), width);
+        self.ensure_index(Self::buffer(item), width);
         self.shown_rows = cap_rows
             .map_or(self.total_rows, u32::from)
             .min(self.total_rows)
@@ -376,4 +422,49 @@ fn wrap_styled_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
         output.push(Line::from(spans));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nb_core::StreamKind;
+
+    fn item(buffer: &StreamBuffer) -> OutputItem {
+        OutputItem::new(
+            OutputData::Stream {
+                stream: StreamKind::Stdout,
+                buffer: buffer.clone(),
+            },
+            false,
+        )
+    }
+
+    /// Growing, rewriting and truncating keeps the index equal to a fresh one.
+    #[test]
+    fn incremental_index_matches_rebuild() {
+        let theme = Theme::default();
+        let chunks = [
+            "short\n",
+            "a much longer line that wraps at width ten\n",
+            "progress 1",
+            "\rprogress 2",
+            "\rprogress 3\n",
+            "é漢é漢é漢é漢é漢é漢\n",
+            "tail",
+            " more tail\nnext\n",
+            "x\ny\nz\n",
+        ];
+        let mut buffer = StreamBuffer::with_cap(4);
+        let mut view = StreamOutputView::default();
+        for (step, chunk) in chunks.iter().cycle().take(60).enumerate() {
+            buffer.push_chunk(chunk);
+            let item = item(&buffer);
+            let metrics = view.measure(&item, 10, &theme, None);
+            let mut fresh = StreamOutputView::default();
+            let expected = fresh.measure(&item, 10, &theme, None);
+            assert_eq!(metrics, expected, "step {step}");
+            assert_eq!(view.line_byte_starts, fresh.line_byte_starts, "step {step}");
+            assert_eq!(view.line_row_starts, fresh.line_row_starts, "step {step}");
+        }
+    }
 }

@@ -3,7 +3,9 @@
 use crate::cell::Cell;
 use crate::id::{CellId, OutputId};
 use crate::ops::{DocOp, UndoHistory};
-use crate::output::{MimeBundle, OutputData, OutputItem, StreamBuffer, StreamKind};
+use crate::output::{
+    DEFAULT_MAX_STREAM_LINES, MimeBundle, OutputData, OutputItem, StreamBuffer, StreamKind,
+};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -33,6 +35,11 @@ pub struct Document {
     pub history: UndoHistory,
     pub dirty_source: bool,
     pub dirty_outputs: bool,
+    /// Line cap for stream outputs started from now on.
+    pub stream_line_cap: usize,
+    /// The empty cell added outside history when an operation removed the
+    /// last cell; undo and redo drop it again while it is untouched.
+    placeholder: Option<CellId>,
 }
 
 impl Document {
@@ -50,6 +57,8 @@ impl Document {
             history: UndoHistory::default(),
             dirty_source: false,
             dirty_outputs: false,
+            stream_line_cap: DEFAULT_MAX_STREAM_LINES,
+            placeholder: None,
         }
     }
 
@@ -72,6 +81,8 @@ impl Document {
             history: UndoHistory::default(),
             dirty_source: false,
             dirty_outputs: false,
+            stream_line_cap: DEFAULT_MAX_STREAM_LINES,
+            placeholder: None,
         };
         document.rebuild_display_index();
         document
@@ -107,6 +118,7 @@ impl Document {
     pub fn apply(&mut self, op: DocOp) {
         self.apply_forward(&op);
         self.history.push(op);
+        self.keep_one_cell(false);
     }
 
     pub fn undo(&mut self) -> bool {
@@ -115,6 +127,7 @@ impl Document {
         };
         self.apply_reverse(&op);
         self.history.push_redo(op);
+        self.keep_one_cell(true);
         true
     }
 
@@ -124,15 +137,40 @@ impl Document {
         };
         self.apply_forward(&op);
         self.history.push(op);
+        self.keep_one_cell(true);
         true
     }
 
+    /// A notebook always has a cell. Removing the last one adds an empty
+    /// placeholder outside history; when undo or redo brings other cells
+    /// back, an untouched placeholder goes away again.
+    fn keep_one_cell(&mut self, replaying: bool) {
+        if let Some(id) = self.placeholder.clone() {
+            match self.cells.get(&id) {
+                None => self.placeholder = None,
+                Some(cell) if replaying && self.order.len() > 1 => {
+                    if cell.buffer.as_str().is_empty() && cell.outputs.is_empty() {
+                        self.remove_ids(&[id]);
+                    }
+                    self.placeholder = None;
+                }
+                Some(_) => {}
+            }
+        }
+        if self.order.is_empty() {
+            let cell = Cell::new_code();
+            self.placeholder = Some(cell.id.clone());
+            self.insert_cells(0, &[cell]);
+        }
+    }
+
     pub fn append_stream(&mut self, cell_id: &CellId, stream: StreamKind, chunk: &str, late: bool) {
+        let cap = self.stream_line_cap;
         let Some(cell) = self.cells.get_mut(cell_id) else {
             self.append_session_log(OutputItem::new(
                 OutputData::Stream {
                     stream,
-                    buffer: stream_buffer_with_chunk(chunk),
+                    buffer: stream_buffer_with_chunk(chunk, cap),
                 },
                 late,
             ));
@@ -155,7 +193,7 @@ impl Document {
         let item = OutputItem::new(
             OutputData::Stream {
                 stream,
-                buffer: stream_buffer_with_chunk(chunk),
+                buffer: stream_buffer_with_chunk(chunk, cap),
             },
             late,
         );
@@ -489,8 +527,8 @@ impl Document {
     }
 }
 
-fn stream_buffer_with_chunk(chunk: &str) -> StreamBuffer {
-    let mut buffer = StreamBuffer::default();
+fn stream_buffer_with_chunk(chunk: &str, max_lines: usize) -> StreamBuffer {
+    let mut buffer = StreamBuffer::with_cap(max_lines);
     buffer.push_chunk(chunk);
     buffer
 }

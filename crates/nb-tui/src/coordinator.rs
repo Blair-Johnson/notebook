@@ -859,7 +859,7 @@ impl Coordinator {
             } => {
                 let affected = self.document.update_display(&display_id, bundle, metadata);
                 for cell_id in affected {
-                    self.update_views_for_cell(&cell_id);
+                    self.update_views_for_cell(&cell_id, false);
                 }
             }
             KernelEvent::ClearOutput { target, wait } => {
@@ -1099,6 +1099,7 @@ impl Coordinator {
         self.grammar.insert_escape_chord = Duration::from_millis(snap.core.insert_escape_chord_ms);
         self.term_effects.set_mouse_capture(snap.core.mouse_capture);
         self.vim.indent_width = usize::from(snap.core.indent_width).max(1);
+        self.document.stream_line_cap = snap.core.max_stream_lines;
     }
 
     fn dispatch_grammar_step(&mut self, step: GrammarStep) -> Option<Effect> {
@@ -2886,67 +2887,44 @@ impl Coordinator {
                 ),
             ),
         }
-        self.update_views_for_cell(&cell_id);
+        self.update_views_for_cell(&cell_id, true);
     }
 
     /// Mount a view for every output (call after changing outputs directly).
     pub fn remount_output_views(&mut self) {
         self.output_views.clear();
-        let outputs = self
-            .document
-            .cells_in_order()
-            .flat_map(|cell| {
-                cell.outputs
-                    .iter()
-                    .cloned()
-                    .map(move |item| (cell.id.clone(), item))
-            })
-            .collect::<Vec<_>>();
-        for (cell_id, item) in outputs {
-            self.mount_output(&cell_id, &item);
-        }
-    }
-
-    fn update_views_for_cell(&mut self, cell_id: &CellId) {
-        let outputs = self
-            .document
-            .cell(cell_id)
-            .map(|cell| cell.outputs.clone())
-            .unwrap_or_default();
-        for item in &outputs {
-            if self.output_views.contains_key(&item.id) {
-                let ctx = MountCtx {
-                    cell_id: cell_id.clone(),
-                    output_id: item.id,
-                };
-                if let Some(view) = self.output_views.get_mut(&item.id) {
-                    view.on_output_updated(item, &ctx);
+        for cell in self.document.cells_in_order() {
+            for item in &cell.outputs {
+                if let Some(view) = mount_view(&self.registry, &cell.id, item) {
+                    self.output_views.insert(item.id, view);
                 }
-            } else {
-                self.mount_output(cell_id, item);
             }
         }
     }
 
-    fn mount_output(&mut self, cell_id: &CellId, item: &OutputItem) {
-        let Some((_, renderer)) = self
-            .registry
-            .output_renderers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, renderer)| {
-                renderer.can_render(item).map(|priority| (priority, index))
-            })
-            .max_by_key(|(priority, index)| (*priority, *index))
-        else {
+    /// Tell views their outputs changed, mounting views for new outputs.
+    /// Appends only ever change the cell's last output; display updates
+    /// can change any of them.
+    fn update_views_for_cell(&mut self, cell_id: &CellId, last_only: bool) {
+        let Some(cell) = self.document.cell(cell_id) else {
             return;
         };
-        let ctx = MountCtx {
-            cell_id: cell_id.clone(),
-            output_id: item.id,
+        let skip = if last_only {
+            cell.outputs.len().saturating_sub(1)
+        } else {
+            0
         };
-        let view = self.registry.output_renderers[renderer].mount(item, &ctx);
-        self.output_views.insert(item.id, view);
+        for item in cell.outputs.iter().skip(skip) {
+            if let Some(view) = self.output_views.get_mut(&item.id) {
+                let ctx = MountCtx {
+                    cell_id: cell_id.clone(),
+                    output_id: item.id,
+                };
+                view.on_output_updated(item, &ctx);
+            } else if let Some(view) = mount_view(&self.registry, cell_id, item) {
+                self.output_views.insert(item.id, view);
+            }
+        }
     }
 
     fn forward_comm(&mut self, comm_id: &CommId, data: &Map<String, Value>) {
@@ -3522,7 +3500,9 @@ impl Coordinator {
             .and_then(|source| parse_ipynb(&source).map_err(|error| error.to_string()))
         {
             Ok(document) => {
+                let cap = self.document.stream_line_cap;
                 self.document = document;
+                self.document.stream_line_cap = cap;
                 self.selected_cell = self
                     .document
                     .order()
@@ -3595,6 +3575,24 @@ impl OutputHost for CoordinatorOutputHost<'_> {
     }
 }
 
+/// Mount a view from the highest-priority renderer that accepts `item`.
+fn mount_view(
+    registry: &ExtensionRegistry,
+    cell_id: &CellId,
+    item: &OutputItem,
+) -> Option<Box<dyn OutputView>> {
+    let (_, renderer) = registry
+        .output_renderers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, renderer)| renderer.can_render(item).map(|priority| (priority, index)))
+        .max_by_key(|(priority, index)| (*priority, *index))?;
+    let ctx = MountCtx {
+        cell_id: cell_id.clone(),
+        output_id: item.id,
+    };
+    Some(registry.output_renderers[renderer].mount(item, &ctx))
+}
 fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
     let data = match payload {
         WireOutput::Stream { stream, text } => {

@@ -132,7 +132,12 @@ async fn main() -> Result<()> {
     std::mem::forget(terminal);
 
     match result {
-        Ok(result) => result,
+        Ok(Err(error)) => {
+            // Usually the terminal closed mid-draw or mid-read.
+            coordinator.emergency_autosave();
+            Err(error)
+        }
+        Ok(ok) => ok,
         Err(payload) => {
             coordinator.emergency_autosave();
             std::panic::resume_unwind(payload)
@@ -206,7 +211,11 @@ async fn run_loop(
                 coordinator.on_signal("SIGINT");
             }
             maybe_event = input.events.recv() => {
-                let Some(event_result) = maybe_event else { break };
+                let Some(event_result) = maybe_event else {
+                    // The input thread stopped (the terminal went away): like SIGHUP.
+                    coordinator.on_signal("input closed");
+                    break;
+                };
                 let event = event_result?;
                 kind = "input";
                 dog.enter(watchdog::Phase::Input);

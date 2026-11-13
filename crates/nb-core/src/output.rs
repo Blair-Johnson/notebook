@@ -8,7 +8,8 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub const DEFAULT_MAX_STREAM_LINES: usize = 10_000;
-const TRUNCATION_MARKER: &str = "[... output truncated ...]\n";
+pub const DEFAULT_MAX_STREAM_BYTES: usize = 8 << 20;
+pub const TRUNCATION_MARKER: &str = "[... output truncated ...]\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum StreamKind {
@@ -17,12 +18,50 @@ pub enum StreamKind {
 }
 
 /// Coalesced terminal stream text supporting `\r` progress-bar overwrites and line caps.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// `text` holds the logical lines joined by `\n`, prefixed by
+/// [`TRUNCATION_MARKER`] once lines have been dropped, and suffixed by `\r`
+/// while a carriage return waits to overwrite the last line. Appending only
+/// touches the chunk and the last line, so streaming cost is linear in the
+/// output, not quadratic.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamBuffer {
     text: String,
     max_lines: usize,
     truncated_lines: usize,
+    #[serde(default = "default_max_bytes")]
+    max_bytes: usize,
+    #[serde(skip)]
+    revision: u64,
+    #[serde(skip)]
+    tail: Option<Tail>,
 }
+
+/// Where appends land; derived from `text` on first use.
+#[derive(Clone, Copy, Debug)]
+struct Tail {
+    /// Logical lines after the truncation marker.
+    lines: usize,
+    /// Byte offset of the last line.
+    last_start: usize,
+    /// Byte offset of the next write; inside the last line after a `\r`.
+    cursor: usize,
+}
+
+fn default_max_bytes() -> usize {
+    DEFAULT_MAX_STREAM_BYTES
+}
+
+impl PartialEq for StreamBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.max_lines == other.max_lines
+            && self.max_bytes == other.max_bytes
+            && self.truncated_lines == other.truncated_lines
+    }
+}
+
+impl Eq for StreamBuffer {}
 
 impl Default for StreamBuffer {
     fn default() -> Self {
@@ -32,10 +71,19 @@ impl Default for StreamBuffer {
 
 impl StreamBuffer {
     pub fn with_cap(max_lines: usize) -> Self {
+        Self::with_caps(max_lines, DEFAULT_MAX_STREAM_BYTES)
+    }
+
+    /// Keep at most `max_lines` lines and roughly `max_bytes` bytes; the
+    /// oldest whole lines go first, and the last line is never dropped.
+    pub fn with_caps(max_lines: usize, max_bytes: usize) -> Self {
         Self {
             text: String::new(),
             max_lines: max_lines.max(1),
             truncated_lines: 0,
+            max_bytes: max_bytes.max(1),
+            revision: 0,
+            tail: None,
         }
     }
 
@@ -47,88 +95,156 @@ impl StreamBuffer {
         self.truncated_lines
     }
 
+    /// Changes on every append. Views compare it to know their index is stale,
+    /// even when a `\r` rewrite left the length unchanged.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Append a streamed chunk using terminal `\r` overwrite semantics and line capping.
     pub fn push_chunk(&mut self, chunk: &str) {
-        let existing = self
-            .text
-            .strip_prefix(TRUNCATION_MARKER)
-            .unwrap_or(&self.text);
-        let mut lines: Vec<Vec<char>> = vec![Vec::new()];
-        let mut cursor = 0usize;
-        for ch in existing.chars() {
-            match ch {
-                '\n' => {
-                    lines.push(Vec::new());
-                    cursor = 0;
+        if chunk.is_empty() {
+            return;
+        }
+        let mut tail = self.take_tail();
+        let pending = self.write(&mut tail, chunk);
+        self.enforce_caps(&mut tail);
+        if pending {
+            self.text.push('\r');
+        }
+        self.tail = Some(tail);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn body_start(&self) -> usize {
+        if self.text.starts_with(TRUNCATION_MARKER) {
+            TRUNCATION_MARKER.len()
+        } else {
+            0
+        }
+    }
+
+    /// The append state, with any pending `\r` removed from `text`.
+    fn take_tail(&mut self) -> Tail {
+        let pending = self.text.ends_with('\r');
+        if pending {
+            self.text.pop();
+        }
+        if let Some(tail) = self.tail.take() {
+            return tail;
+        }
+        let body_start = self.body_start();
+        if self.text[body_start..].contains('\r') {
+            // Text that never went through `push_chunk` (deserialized): replay it.
+            let raw = self.text.split_off(body_start);
+            let mut tail = self.empty_tail();
+            self.write(&mut tail, &raw);
+            if pending {
+                tail.cursor = tail.last_start;
+            }
+            return tail;
+        }
+        let body = &self.text[body_start..];
+        let last_start = body.rfind('\n').map_or(body_start, |i| body_start + i + 1);
+        Tail {
+            lines: body.bytes().filter(|b| *b == b'\n').count() + 1,
+            last_start,
+            cursor: if pending { last_start } else { self.text.len() },
+        }
+    }
+
+    fn empty_tail(&self) -> Tail {
+        Tail {
+            lines: 1,
+            last_start: self.text.len(),
+            cursor: self.text.len(),
+        }
+    }
+
+    /// Apply `chunk` at the cursor; returns whether it ended on a pending `\r`.
+    fn write(&mut self, tail: &mut Tail, chunk: &str) -> bool {
+        let mut pending = false;
+        for piece in chunk.split_inclusive(['\r', '\n']) {
+            let (run, delimiter) = match piece.as_bytes().last() {
+                Some(b'\r') => (&piece[..piece.len() - 1], Some('\r')),
+                Some(b'\n') => (&piece[..piece.len() - 1], Some('\n')),
+                _ => (piece, None),
+            };
+            if !run.is_empty() {
+                self.write_run(tail, run);
+                pending = false;
+            }
+            match delimiter {
+                Some('\n') => {
+                    self.text.push('\n');
+                    tail.lines += 1;
+                    tail.last_start = self.text.len();
+                    tail.cursor = self.text.len();
+                    pending = false;
                 }
-                '\r' => {
-                    cursor = 0;
+                Some(_) => {
+                    tail.cursor = tail.last_start;
+                    pending = true;
                 }
-                ch => {
-                    let line = lines.last_mut().expect("stream always has one line");
-                    if cursor < line.len() {
-                        line[cursor] = ch;
-                    } else {
-                        line.push(ch);
-                    }
-                    cursor += 1;
-                }
+                None => {}
             }
         }
+        pending
+    }
 
-        let normalized = chunk.replace("\r\n", "\n");
-        let mut pending_overwrite = existing.ends_with('\r');
-        for ch in normalized.chars() {
-            match ch {
-                '\n' => {
-                    lines.push(Vec::new());
-                    cursor = 0;
-                    pending_overwrite = false;
-                }
-                '\r' => {
-                    cursor = 0;
-                    pending_overwrite = true;
-                }
-                ch => {
-                    let line = lines.last_mut().expect("stream always has one line");
-                    if cursor < line.len() {
-                        line[cursor] = ch;
-                    } else {
-                        line.push(ch);
-                    }
-                    cursor += 1;
-                    pending_overwrite = false;
-                }
-            }
+    /// Write text without line breaks at the cursor, overwriting characters
+    /// of the last line one for one and appending past its end.
+    fn write_run(&mut self, tail: &mut Tail, run: &str) {
+        if tail.cursor == self.text.len() {
+            self.text.push_str(run);
+        } else {
+            let overwritten = run.chars().count();
+            let end = self.text[tail.cursor..]
+                .char_indices()
+                .nth(overwritten)
+                .map_or(self.text.len(), |(offset, _)| tail.cursor + offset);
+            self.text.replace_range(tail.cursor..end, run);
         }
+        tail.cursor += run.len();
+    }
 
-        let mut logical = lines
-            .iter()
-            .map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if pending_overwrite {
-            logical.push('\r');
+    /// Drop the oldest whole lines beyond the line and byte caps, in one
+    /// splice that also (re)writes the truncation marker.
+    fn enforce_caps(&mut self, tail: &mut Tail) {
+        let body_start = self.body_start();
+        let mut cut = body_start;
+        let mut dropped = 0;
+        if tail.lines > self.max_lines {
+            dropped = tail.lines - self.max_lines;
+            cut = self.text[body_start..]
+                .match_indices('\n')
+                .nth(dropped - 1)
+                .map_or(tail.last_start, |(offset, _)| body_start + offset + 1);
         }
-
-        let pending = logical.ends_with('\r');
-        if pending {
-            logical.pop();
+        let kept = self.text.len() - cut;
+        if kept > self.max_bytes && cut < tail.last_start {
+            let target = cut + (kept - self.max_bytes);
+            let next = if target > tail.last_start {
+                tail.last_start
+            } else {
+                // Bytes, not str: `target` may fall inside a multi-byte char.
+                self.text.as_bytes()[target - 1..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(tail.last_start, |offset| target + offset)
+            };
+            dropped += self.text[cut..next].bytes().filter(|b| *b == b'\n').count();
+            cut = next;
         }
-        let mut logical_lines: Vec<&str> = logical.split('\n').collect();
-        if logical_lines.len() > self.max_lines {
-            let dropped = logical_lines.len() - self.max_lines;
-            self.truncated_lines = self.truncated_lines.saturating_add(dropped);
-            logical_lines.drain(..dropped);
+        if dropped == 0 {
+            return;
         }
-        let mut result = logical_lines.join("\n");
-        if self.truncated_lines > 0 {
-            result.insert_str(0, TRUNCATION_MARKER);
-        }
-        if pending {
-            result.push('\r');
-        }
-        self.text = result;
+        self.text.replace_range(..cut, TRUNCATION_MARKER);
+        let rebase = |offset: usize| offset - cut + TRUNCATION_MARKER.len();
+        tail.last_start = rebase(tail.last_start);
+        tail.cursor = rebase(tail.cursor);
+        tail.lines -= dropped;
+        self.truncated_lines = self.truncated_lines.saturating_add(dropped);
     }
 }
 
