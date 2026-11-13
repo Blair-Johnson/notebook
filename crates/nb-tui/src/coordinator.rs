@@ -994,7 +994,12 @@ impl Coordinator {
             })?;
         let raw_key = match path {
             Some(p) => {
-                let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                // The real path, so `demo.py`, `./demo.py` and a path through a
+                // symlink (macOS `/tmp`) share one sidecar. New files can't be
+                // resolved yet; their absolute path is close enough.
+                let abs = std::fs::canonicalize(p)
+                    .or_else(|_| std::path::absolute(p))
+                    .unwrap_or_else(|_| p.to_path_buf());
                 abs.to_string_lossy().replace('%', "%%").replace('/', "%")
             }
             None => "scratchpad".to_string(),

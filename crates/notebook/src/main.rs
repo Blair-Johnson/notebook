@@ -81,11 +81,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let working_dir = notebook_path
-        .as_deref()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let working_dir = kernel_working_dir(notebook_path.as_deref());
 
     let doc = match notebook_path.as_deref() {
         Some(path) if path.exists() => nb_core::codec::open_path(path)?,
@@ -139,6 +135,33 @@ async fn main() -> Result<()> {
             coordinator.emergency_autosave();
             std::panic::resume_unwind(payload)
         }
+    }
+}
+
+/// The kernel runs next to the notebook: its folder, or the current
+/// directory for a bare file name (`nb demo.py`, whose parent is "").
+fn kernel_working_dir(notebook: Option<&std::path::Path>) -> PathBuf {
+    notebook
+        .and_then(|path| path.parent())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel_working_dir;
+    use std::path::Path;
+
+    #[test]
+    fn a_bare_file_name_runs_the_kernel_in_the_current_directory() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(kernel_working_dir(Some(Path::new("demo.py"))), here);
+        assert_eq!(kernel_working_dir(None), here);
+        assert_eq!(
+            kernel_working_dir(Some(Path::new("/data/run/exp.ipynb"))),
+            Path::new("/data/run")
+        );
     }
 }
 
