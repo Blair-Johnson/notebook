@@ -4,9 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Stable identity of a notebook cell (serialized as an nbformat 4.5 cell `id`).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
@@ -35,8 +32,9 @@ impl fmt::Display for CellId {
 pub struct OutputId(pub u64);
 
 impl OutputId {
+    /// Generate an output identity without mutable process-global state.
     pub fn next() -> Self {
-        Self(NEXT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed))
+        Self(uuid::Uuid::new_v4().as_u128() as u64)
     }
 }
 
