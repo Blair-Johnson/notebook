@@ -4,7 +4,7 @@ pub mod cache;
 pub mod fenwick;
 pub mod sections;
 
-pub use cache::{CachedCellLayout, CellLayoutKey, LayoutCache};
+pub use cache::{CachedCellLayout, CellLayoutKey, LayoutCache, OutputRows};
 pub use fenwick::FenwickTree;
 pub use sections::{OutputSection, SectionKind, has_stream_tabs, output_sections};
 

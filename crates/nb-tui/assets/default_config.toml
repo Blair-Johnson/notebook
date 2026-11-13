@@ -8,6 +8,8 @@ max_output_rows = 18
 output_default_view = "preview"
 notice_secs = 4
 follow_output = true
+scrolloff = 3
+fast_scroll_rows = 5
 wheel_scroll_lines = 3
 
 [editor]

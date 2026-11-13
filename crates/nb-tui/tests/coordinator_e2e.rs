@@ -65,7 +65,8 @@ fn counted_navigation_cell_edit_and_run_are_headless() {
     let now = Instant::now();
 
     coordinator.on_key(key(KeyCode::Char('3')), now);
-    coordinator.on_key(key(KeyCode::Char('j')), now);
+    coordinator.on_key(key(KeyCode::Char(']')), now);
+    coordinator.on_key(key(KeyCode::Char(']')), now);
     assert_eq!(coordinator.selected_cell, coordinator.document.order()[3]);
 
     coordinator.on_key(key(KeyCode::Char('i')), now);

@@ -78,6 +78,14 @@ pub struct Coordinator {
     pub selected_cell: CellId,
     /// Whether the selection is on the cell's source or its outputs.
     pub selected_part: CellPart,
+    /// Notebook-level cursor: a row of the selected cell's card. Valid only
+    /// while `nb_row_cell` is the selected cell; otherwise it is reset to
+    /// the first row of the selected part.
+    nb_row: u32,
+    nb_row_cell: Option<CellId>,
+    /// Put the notebook cursor on this source position (cell, line, column)
+    /// once the cell's notebook layout is measured (after leaving it).
+    nb_pending: Option<(CellId, usize, usize)>,
     /// The entered output's read-only text, while `OutputFocus` is active.
     pub output_text: Option<vim::OutputText>,
     pub focus: FocusStack,
@@ -172,6 +180,9 @@ impl Coordinator {
             document,
             selected_cell,
             selected_part: CellPart::Source,
+            nb_row: CardRows::SOURCE_TOP,
+            nb_row_cell: None,
+            nb_pending: None,
             output_text: None,
             focus: FocusStack::default(),
             grammar: VimGrammar::default(),
@@ -248,7 +259,11 @@ impl Coordinator {
         let snap = self.settings.snapshot().clone();
         self.reconcile_outputs();
         self.keep_focus_visible(frame.area(), &snap);
+        let notebook_row = matches!(self.focus.base(), FocusLayer::NotebookNormal)
+            .then(|| self.nb_cursor().map(|(_, row)| row))
+            .flatten();
         let view = AppView {
+            notebook_row,
             path: self.path.as_deref(),
             document: &self.document,
             selected_cell: &self.selected_cell,
@@ -328,6 +343,14 @@ impl Coordinator {
         self.vim.half_page = usize::from(viewport.height / 2).max(1);
         let output_region = self.output_region_rows(text_w);
         let followed = self.follow_focus;
+        let notebook_level = matches!(self.focus.base(), FocusLayer::NotebookNormal);
+        let scrolloff = u32::from(snap.core.scrolloff).min(height.saturating_sub(1) / 2);
+        let nb_global = if notebook_level {
+            self.nb_cursor()
+                .map(|(index, row)| self.layout_cache.heights().prefix_sum(index) + row)
+        } else {
+            None
+        };
         if self.follow_focus {
             self.follow_focus = false;
             if let Some(index) = self.document.position_of(&self.selected_cell) {
@@ -354,10 +377,11 @@ impl Coordinator {
                             // The text starts below the block's header divider.
                             (outputs_top + 1 + row, outputs_top + row + 2)
                         }
-                        _ if self.selected_part == CellPart::Output => (
-                            outputs_top,
-                            (top + cell_rows).min(outputs_top + height),
-                        ),
+                        // The notebook cursor row, with a margin.
+                        _ if nb_global.is_some() => {
+                            let row = nb_global.unwrap_or(top);
+                            (row.saturating_sub(scrolloff), row + 1 + scrolloff)
+                        }
                         _ => (top, top + cell_rows.min(height)),
                     };
                     if want_top < self.scroll_row {
@@ -374,6 +398,11 @@ impl Coordinator {
             self.scroll_row = max_scroll;
         }
         self.scroll_row = self.scroll_row.min(max_scroll);
+        // The view moved without the cursor (wheel, output growing,
+        // following): bring the cursor along so it stays on screen.
+        if notebook_level && !followed {
+            self.drag_cursor_into_view(height, scrolloff, max_scroll);
+        }
         // Intention comes from the user's own scrolling or navigation this
         // frame: ending at the very bottom of a scrollable notebook means
         // "follow". Content changing under the view leaves it as it was.
@@ -501,7 +530,9 @@ impl Coordinator {
     }
 
     /// Everything a key can move that the view should follow.
-    fn focus_signature(&self) -> (CellId, CellPart, usize, Option<CursorPos>, Option<CursorPos>) {
+    fn focus_signature(
+        &self,
+    ) -> (CellId, CellPart, u32, usize, Option<CursorPos>, Option<CursorPos>) {
         let edit_cursor = match self.focus.base() {
             FocusLayer::CellEdit { cell_id, .. } => {
                 self.document.cell(cell_id).map(|cell| cell.buffer.cursor())
@@ -511,6 +542,7 @@ impl Coordinator {
         (
             self.selected_cell.clone(),
             self.selected_part,
+            self.nb_row,
             self.focus.layers().len(),
             edit_cursor,
             self.output_text.as_ref().map(|out| out.buffer.cursor()),
@@ -1504,8 +1536,15 @@ impl Coordinator {
                 Effect::None
             }
             "cell.enter_normal" => {
+                let row = self.nb_cursor().map(|(_, row)| row);
                 if self.selected_part == CellPart::Output {
-                    self.enter_output(self.selected_cell.clone());
+                    let id = self.selected_cell.clone();
+                    let target = row.and_then(|row| self.output_pos_for_row(&id, row));
+                    self.enter_output(id);
+                    if let (Some((line, col)), Some(out)) = (target, self.output_text.as_mut()) {
+                        out.buffer.set_cursor(CursorPos { row: line, col });
+                        vim::clamp_normal(&mut out.buffer);
+                    }
                 } else if self
                     .document
                     .cell(&self.selected_cell)
@@ -1514,7 +1553,13 @@ impl Coordinator {
                     // Nothing to navigate in an empty cell: start typing.
                     self.begin_cell_edit(CellMode::Insert);
                 } else {
+                    let id = self.selected_cell.clone();
+                    let target = row.and_then(|row| self.source_pos_for_row(&id, row));
                     self.begin_cell_edit(CellMode::Normal);
+                    if let (Some((line, col)), Some(cell)) = (target, self.document.cell_mut(&id)) {
+                        cell.buffer.set_cursor(CursorPos { row: line, col });
+                        vim::clamp_normal(&mut cell.buffer);
+                    }
                 }
                 Effect::None
             }
@@ -1573,11 +1618,7 @@ impl Coordinator {
             }
             "cell.run_and_advance" => {
                 self.run_selected();
-                // Advance to the next cell, past this cell's outputs.
-                let next = self.selected_index() + 1;
-                if let Some(id) = self.document.order().get(next).cloned() {
-                    self.select_cell(id);
-                }
+                self.move_selected("motion.cell_next", 1);
                 Effect::None
             }
             "cell.run_all" => {
@@ -1828,6 +1869,7 @@ impl Coordinator {
                     }
                     self.set_cell_mode(CellMode::Normal);
                 } else {
+                    self.remember_source_cursor(cell_id);
                     self.commit_cell(cell_id);
                     self.focus.pop();
                 }
@@ -1959,83 +2001,366 @@ impl Coordinator {
         outcome
     }
 
-    /// Selectable notebook items in order: each cell's source, then its
-    /// outputs when it has any.
-    fn notebook_items(&self) -> Vec<(CellId, CellPart)> {
-        let mut items = Vec::with_capacity(self.document.order().len() * 2);
-        for cell in self.document.cells_in_order() {
-            items.push((cell.id.clone(), CellPart::Source));
-            if !cell.outputs.is_empty() && !cell.collapsed {
-                items.push((cell.id.clone(), CellPart::Output));
-            }
+    /// Where the notebook cursor can rest in the cell at `index`, and the
+    /// first row of its output block. Measures the cell if needed.
+    fn nb_layout(&mut self, index: usize) -> Option<(Vec<u32>, Option<u32>)> {
+        let snap = self.settings.snapshot().clone();
+        self.layout_cache.default_output_view = snap.core.output_default_view;
+        let cached = self.layout_cache.ensure_measured(
+            &self.document,
+            index,
+            &mut self.output_views,
+            snap.core.max_output_rows,
+            &snap.theme,
+        )?;
+        let mut stops = cached.stops.clone();
+        if stops.is_empty() {
+            stops.push(CardRows::SOURCE_TOP);
         }
-        items
+        Some((stops, cached.outputs_top))
     }
 
-    /// Screen rows an item occupies (header + source, or the output block).
-    fn item_rows(&self, id: &CellId, part: CellPart) -> usize {
-        let Some(index) = self.document.position_of(id) else {
-            return 1;
-        };
-        let heights = self.layout_cache.heights();
-        let total = if index < heights.len() {
-            heights.height(index) as usize
+    fn part_of(row: u32, outputs_top: Option<u32>) -> CellPart {
+        if outputs_top.is_some_and(|top| row >= top) {
+            CellPart::Output
         } else {
-            1
+            CellPart::Source
+        }
+    }
+
+    /// The notebook cursor as (cell index, card row), kept on a valid stop
+    /// of the selected cell and part.
+    fn nb_cursor(&mut self) -> Option<(usize, u32)> {
+        let index = self.document.position_of(&self.selected_cell)?;
+        let (stops, outputs_top) = self.nb_layout(index)?;
+        if let Some((cell_id, line, col)) = self.nb_pending.take() {
+            if cell_id == self.selected_cell {
+                if let Some(row) = self.row_for_source_pos(&cell_id, line, col) {
+                    self.nb_row = row;
+                    self.nb_row_cell = Some(cell_id);
+                    self.selected_part = CellPart::Source;
+                }
+            }
+        }
+        let valid = self.nb_row_cell.as_ref() == Some(&self.selected_cell)
+            && stops.contains(&self.nb_row)
+            && Self::part_of(self.nb_row, outputs_top) == self.selected_part;
+        if !valid {
+            self.nb_row = match (self.selected_part, outputs_top) {
+                (CellPart::Output, Some(top)) => {
+                    stops.iter().copied().find(|&row| row >= top).unwrap_or(stops[0])
+                }
+                _ => stops[0],
+            };
+            self.nb_row_cell = Some(self.selected_cell.clone());
+        }
+        self.selected_part = Self::part_of(self.nb_row, outputs_top);
+        Some((index, self.nb_row))
+    }
+
+    fn nb_set(&mut self, index: usize, row: u32) {
+        let Some(cell_id) = self.document.order().get(index).cloned() else {
+            return;
         };
-        let source = self
-            .layout_cache
-            .cached(id)
-            .map_or(1, |cached| cached.wrapped_source.len() as u32);
-        let rows = CardRows::from_total(total as u32, source);
-        let source_rows = rows.outputs_top() as usize;
-        match part {
-            CellPart::Source => source_rows.min(total),
-            CellPart::Output => total.saturating_sub(source_rows).max(1),
+        let outputs_top = self.nb_layout(index).and_then(|(_, top)| top);
+        self.selected_cell = cell_id.clone();
+        self.selected_part = Self::part_of(row, outputs_top);
+        self.nb_row = row;
+        self.nb_row_cell = Some(cell_id);
+        self.follow_focus = true;
+    }
+
+    /// Move the notebook cursor `delta` rows (stops), crossing cells.
+    fn nb_step_rows(&mut self, delta: i64) {
+        let Some((mut index, mut row)) = self.nb_cursor() else {
+            return;
+        };
+        let forward = delta > 0;
+        let len = self.document.order().len();
+        for _ in 0..delta.unsigned_abs() {
+            let Some((stops, _)) = self.nb_layout(index) else {
+                break;
+            };
+            let next = if forward {
+                stops.iter().copied().find(|&stop| stop > row)
+            } else {
+                stops.iter().rev().copied().find(|&stop| stop < row)
+            };
+            if let Some(stop) = next {
+                row = stop;
+                continue;
+            }
+            let neighbor = if forward {
+                (index + 1 < len).then_some(index + 1)
+            } else {
+                index.checked_sub(1)
+            };
+            let Some(neighbor) = neighbor else {
+                break;
+            };
+            let Some((stops, _)) = self.nb_layout(neighbor) else {
+                break;
+            };
+            index = neighbor;
+            row = if forward { stops[0] } else { stops[stops.len() - 1] };
+        }
+        self.nb_set(index, row);
+    }
+
+    /// Rows where a cell's parts start: its source, then its outputs.
+    fn part_starts(&mut self, index: usize) -> Vec<u32> {
+        let Some((stops, outputs_top)) = self.nb_layout(index) else {
+            return Vec::new();
+        };
+        let mut starts = vec![stops[0]];
+        if let Some(first_output) = outputs_top
+            .and_then(|top| stops.iter().copied().find(|&row| row >= top))
+        {
+            starts.push(first_output);
+        }
+        starts
+    }
+
+    /// `]]`/`[[` jump between cells; `}`/`{` also stop at output blocks.
+    fn nb_jump(&mut self, forward: bool, include_outputs: bool) {
+        let Some((index, row)) = self.nb_cursor() else {
+            return;
+        };
+        let len = self.document.order().len();
+        let starts = |this: &mut Self, index: usize| {
+            let mut starts = this.part_starts(index);
+            if !include_outputs {
+                starts.truncate(1);
+            }
+            starts
+        };
+        let here = starts(self, index);
+        if forward {
+            if let Some(&next) = here.iter().find(|&&start| start > row) {
+                return self.nb_set(index, next);
+            }
+            if index + 1 < len {
+                let next = starts(self, index + 1);
+                self.nb_set(index + 1, next[0]);
+            }
+        } else {
+            if let Some(&prev) = here.iter().rev().find(|&&start| start < row) {
+                return self.nb_set(index, prev);
+            }
+            if let Some(prev_index) = index.checked_sub(1) {
+                let prev = starts(self, prev_index);
+                self.nb_set(prev_index, prev[prev.len() - 1]);
+            }
         }
     }
 
     fn move_selected(&mut self, motion: &str, count: u32) {
-        let items = self.notebook_items();
-        if items.is_empty() {
-            return;
+        let count = i64::from(count.max(1));
+        let core = self.settings.snapshot().core.clone();
+        let half = i64::from(self.last_geometry.viewport_rect.height / 2).max(1);
+        let fast = i64::from(core.fast_scroll_rows.max(1));
+        match motion {
+            "motion.down" => self.nb_step_rows(count),
+            "motion.up" => self.nb_step_rows(-count),
+            "motion.fast_down" => self.nb_step_rows(count * fast),
+            "motion.fast_up" => self.nb_step_rows(-count * fast),
+            "motion.half_page_down" => self.nb_step_rows(count * half),
+            "motion.half_page_up" => self.nb_step_rows(-count * half),
+            "motion.top" => {
+                if let Some((stops, _)) = self.nb_layout(0) {
+                    self.nb_set(0, stops[0]);
+                }
+            }
+            "motion.bottom" => {
+                let last = self.document.order().len().saturating_sub(1);
+                if let Some((stops, _)) = self.nb_layout(last) {
+                    self.nb_set(last, stops[stops.len() - 1]);
+                }
+            }
+            "motion.cell_next" | "motion.cell_prev" | "motion.item_next" | "motion.item_prev" => {
+                let forward = motion.ends_with("_next");
+                let include_outputs = motion.starts_with("motion.item");
+                for _ in 0..count {
+                    self.nb_jump(forward, include_outputs);
+                }
+            }
+            _ => {}
         }
-        let last = items.len() - 1;
-        let current = items
-            .iter()
-            .position(|(id, part)| id == &self.selected_cell && *part == self.selected_part)
-            .or_else(|| items.iter().position(|(id, _)| id == &self.selected_cell))
-            .unwrap_or(0);
-        let count = count.max(1) as usize;
-        let half = usize::from(self.last_geometry.viewport_rect.height / 2).max(1) * count;
-        let next = match motion {
-            "motion.down" => (current + count).min(last),
-            "motion.up" => current.saturating_sub(count),
-            "motion.top" => 0,
-            "motion.bottom" => last,
-            "motion.half_page_down" => {
-                let mut index = current;
-                let mut rows = 0;
-                while index < last && rows < half {
-                    rows += self.item_rows(&items[index].0, items[index].1);
-                    index += 1;
-                }
-                index
-            }
-            "motion.half_page_up" => {
-                let mut index = current;
-                let mut rows = 0;
-                while index > 0 && rows < half {
-                    index -= 1;
-                    rows += self.item_rows(&items[index].0, items[index].1);
-                }
-                index
-            }
-            _ => current,
+    }
+
+    /// After the view moved on its own, put the cursor back on screen
+    /// (inside the scroll margin), on the nearest row it can rest on.
+    fn drag_cursor_into_view(&mut self, height: u32, scrolloff: u32, max_scroll: u32) {
+        let Some((index, row)) = self.nb_cursor() else {
+            return;
         };
-        let (id, part) = items[next].clone();
-        self.select_cell(id);
-        self.selected_part = part;
+        let global = self.layout_cache.heights().prefix_sum(index) + row;
+        let low = if self.scroll_row == 0 { 0 } else { self.scroll_row + scrolloff };
+        let high = if self.scroll_row >= max_scroll {
+            u32::MAX
+        } else {
+            (self.scroll_row + height).saturating_sub(1 + scrolloff)
+        };
+        if global < low {
+            self.nb_seek(low, true);
+        } else if global > high {
+            self.nb_seek(high, false);
+        }
+        self.follow_focus = false;
+    }
+
+    /// Put the cursor on the first stop at or after global row `target`
+    /// (`forward`), or the last stop at or before it.
+    fn nb_seek(&mut self, target: u32, forward: bool) {
+        let Some((mut index, local)) = self.layout_cache.heights().find_row(target) else {
+            return;
+        };
+        let len = self.document.order().len();
+        let mut first = true;
+        loop {
+            let Some((stops, _)) = self.nb_layout(index) else {
+                return;
+            };
+            let found = if forward {
+                stops.iter().copied().find(|&stop| !first || stop >= local)
+            } else {
+                stops.iter().rev().copied().find(|&stop| !first || stop <= local)
+            };
+            if let Some(row) = found {
+                self.nb_set(index, row);
+                return;
+            }
+            first = false;
+            let neighbor = if forward {
+                (index + 1 < len).then_some(index + 1)
+            } else {
+                index.checked_sub(1)
+            };
+            let Some(neighbor) = neighbor else {
+                return;
+            };
+            index = neighbor;
+        }
+    }
+
+    fn text_width_now(&self) -> u16 {
+        match self.layout_cache.last_width() {
+            0 => 80,
+            width => width,
+        }
+    }
+
+    /// Source line and column shown on card row `row` of `cell_id`.
+    fn source_pos_for_row(&self, cell_id: &CellId, row: u32) -> Option<(usize, usize)> {
+        let cell = self.document.cell(cell_id)?;
+        let cached = self.layout_cache.cached(cell_id)?;
+        let wrapped = row.checked_sub(CardRows::SOURCE_TOP)? as usize;
+        if cell.kind == CellKind::Markdown {
+            let line = *cached.source_line_map.get(wrapped)?;
+            return Some((line, 0));
+        }
+        let segments = vim::wrap_segments(cell.buffer.as_str(), self.text_width_now());
+        let &(line, start, _) = segments.get(wrapped)?;
+        let col = if start == 0 {
+            cell.buffer.first_nonblank_col(line)
+        } else {
+            start
+        };
+        Some((line, col))
+    }
+
+    /// Card row of `cell_id` that shows source position (`line`, `col`).
+    fn row_for_source_pos(&self, cell_id: &CellId, line: usize, col: usize) -> Option<u32> {
+        let cell = self.document.cell(cell_id)?;
+        let cached = self.layout_cache.cached(cell_id)?;
+        if cell.collapsed {
+            return Some(CardRows::SOURCE_TOP);
+        }
+        let wrapped = if cell.kind == CellKind::Markdown {
+            let map = &cached.source_line_map;
+            map.iter()
+                .position(|&mapped| mapped >= line)
+                .unwrap_or(map.len().saturating_sub(1))
+        } else {
+            let segments = vim::wrap_segments(cell.buffer.as_str(), self.text_width_now());
+            vim::segment_of(&segments, CursorPos { row: line, col })
+        };
+        let last = cached.wrapped_source.len().saturating_sub(1);
+        Some(CardRows::SOURCE_TOP + wrapped.min(last) as u32)
+    }
+
+    /// Leaving a cell: the notebook cursor goes to the row of its cursor.
+    fn remember_source_cursor(&mut self, cell_id: &CellId) {
+        if let Some(cell) = self.document.cell(cell_id) {
+            let cursor = cell.buffer.cursor();
+            self.nb_pending = Some((cell_id.clone(), cursor.row, cursor.col));
+            self.selected_cell = cell_id.clone();
+            self.selected_part = CellPart::Source;
+        }
+    }
+
+    /// Each shown output with the first line of its text in the read-only
+    /// output text (outputs joined in section order).
+    fn output_text_starts(&self, cell_id: &CellId) -> Vec<(nb_core::OutputId, usize)> {
+        let Some(cell) = self.document.cell(cell_id) else {
+            return Vec::new();
+        };
+        let mut line = 0;
+        let mut starts = Vec::new();
+        for section in crate::layout::output_sections(cell) {
+            for item in section.items {
+                starts.push((item.id, line));
+                line += item.plain_text().split('\n').count();
+            }
+        }
+        starts
+    }
+
+    /// Text position (line, column) of the output text shown at card row `row`.
+    fn output_pos_for_row(&self, cell_id: &CellId, row: u32) -> Option<(usize, usize)> {
+        let cached = self.layout_cache.cached(cell_id)?;
+        let (rows, offset) = cached.output_at(row)?;
+        let cell = self.document.cell(cell_id)?;
+        let item = cell.outputs.iter().find(|item| item.id == rows.output_id)?;
+        let start = self
+            .output_text_starts(cell_id)
+            .into_iter()
+            .find(|(id, _)| *id == rows.output_id)?
+            .1;
+        let segments = vim::wrap_segments(&item.plain_text(), self.text_width_now());
+        // Clipped outputs show their last rows.
+        let base = rows.total.saturating_sub(rows.shown) as usize;
+        let &(line, col, _) = segments
+            .get(base + offset as usize)
+            .or_else(|| segments.last())?;
+        Some((start + line, col))
+    }
+
+    /// Card row of `cell_id` showing output text line `line` (or the nearest
+    /// shown row of the same output).
+    fn row_for_output_line(&self, cell_id: &CellId, line: usize) -> Option<u32> {
+        let cached = self.layout_cache.cached(cell_id)?;
+        let cell = self.document.cell(cell_id)?;
+        let starts = self.output_text_starts(cell_id);
+        let (output_id, start) = starts
+            .iter()
+            .rev()
+            .find(|(_, start)| *start <= line)
+            .copied()?;
+        let rows = cached
+            .output_rows
+            .iter()
+            .find(|rows| rows.output_id == output_id)
+            .copied()?;
+        let item = cell.outputs.iter().find(|item| item.id == output_id)?;
+        let segments = vim::wrap_segments(&item.plain_text(), self.text_width_now());
+        let wrapped = segments
+            .iter()
+            .position(|&(row, _, _)| row >= line - start)
+            .unwrap_or(segments.len().saturating_sub(1)) as u32;
+        let base = rows.total.saturating_sub(rows.shown);
+        let offset = wrapped.saturating_sub(base).min(rows.shown.saturating_sub(1));
+        Some(rows.first_row + offset)
     }
 
     /// Insert-mode cursor keys: the cursor may sit after the last character.
@@ -2179,12 +2504,21 @@ impl Coordinator {
                     if let Some(cell) = self.document.cell_mut(&cell_id) {
                         cell.buffer.clear_selection();
                     }
+                    self.remember_source_cursor(&cell_id);
                     self.commit_cell(&cell_id);
                     self.focus.pop();
                 }
-                FocusLayer::OutputFocus { .. } => {
+                FocusLayer::OutputFocus { cell_id, .. } => {
                     self.focus.pop();
-                    self.output_text = None;
+                    if let Some(out) = self.output_text.take() {
+                        let line = out.buffer.cursor().row;
+                        if let Some(row) = self.row_for_output_line(&cell_id, line) {
+                            self.selected_cell = cell_id.clone();
+                            self.selected_part = CellPart::Output;
+                            self.nb_row = row;
+                            self.nb_row_cell = Some(cell_id);
+                        }
+                    }
                 }
                 _ => break,
             }

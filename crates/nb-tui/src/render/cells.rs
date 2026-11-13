@@ -196,6 +196,14 @@ impl CellCtx<'_> {
             cursor = position.or(cursor);
         }
 
+        if let (Some(row), true) = (self.view.notebook_row, look.source_selected || look.outputs_selected) {
+            if let Some(y) = self.screen_y(row) {
+                frame
+                    .buffer_mut()
+                    .set_style(self.inner_rect(y), Style::default().bg(self.theme.palette.cursor_line));
+            }
+        }
+
         if let Some(y) = self.screen_y(rows.total() - 1) {
             let color = if rows.outputs > 0 {
                 look.output_border

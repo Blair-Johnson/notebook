@@ -43,6 +43,8 @@ pub enum KernelPhase {
 
 /// Read-only projection of session state passed into `render_app`.
 pub struct AppView<'a> {
+    /// The notebook cursor's row in the selected cell, at notebook level.
+    pub notebook_row: Option<u32>,
     pub path: Option<&'a Path>,
     pub document: &'a Document,
     pub selected_cell: &'a CellId,

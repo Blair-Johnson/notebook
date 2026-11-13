@@ -30,6 +30,14 @@
 "app.command_bar" = [":"]
 
 [keys."notebook.normal"]
+# j/k move one row through sources and outputs; J/K move several. ]] and [[
+# jump between cells; } and { also stop at each cell's outputs.
+"motion.fast_down" = ["J"]
+"motion.fast_up" = ["K"]
+"motion.cell_next" = ["] ]"]
+"motion.cell_prev" = ["[ ["]
+"motion.item_next" = ["}"]
+"motion.item_prev" = ["{"]
 "app.quit" = ["q"]
 "doc.save" = ["w"]
 "doc.save_force" = ["W"]

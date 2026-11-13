@@ -39,6 +39,37 @@ pub struct CachedCellLayout {
     /// Some output is taller than the preview rows, so preview and full
     /// differ.
     pub clips: bool,
+    /// Card rows the notebook cursor can rest on, ascending: source lines,
+    /// output lines, a hidden output's summary row, a folded cell's row.
+    /// Borders and section dividers are skipped.
+    pub stops: Vec<u32>,
+    /// First row of the output block, if the cell shows any outputs.
+    pub outputs_top: Option<u32>,
+    /// Where each shown output's rows are, in drawing order.
+    pub output_rows: Vec<OutputRows>,
+}
+
+/// One output's rows within its card.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRows {
+    pub output_id: OutputId,
+    pub first_row: u32,
+    pub shown: u32,
+    pub total: u32,
+}
+
+impl CachedCellLayout {
+    /// The output (and row within it) drawn at card row `row`.
+    pub fn output_at(&self, row: u32) -> Option<(OutputRows, u32)> {
+        self.output_rows
+            .iter()
+            .find(|rows| row >= rows.first_row && row < rows.first_row + rows.shown)
+            .map(|rows| (*rows, row - rows.first_row))
+    }
+
+    pub fn first_stop(&self) -> u32 {
+        self.stops.first().copied().unwrap_or(CardRows::SOURCE_TOP)
+    }
 }
 
 pub struct LayoutCache {
@@ -200,9 +231,16 @@ impl LayoutCache {
 
         let (wrapped_source, source_line_map) = self.render_source(cell, width, theme, raw_source);
         let mut clips = false;
+        let mut stops: Vec<u32> = Vec::new();
+        let mut outputs_top = None;
+        let mut output_rows = Vec::new();
         let rows = if cell.collapsed {
+            stops.push(CardRows::SOURCE_TOP);
             CardRows { source: 1, outputs: 0 }
         } else {
+            let source_rows = wrapped_source.len() as u32;
+            stops.extend(CardRows::SOURCE_TOP..CardRows::SOURCE_TOP + source_rows);
+            let block_top = CardRows::SOURCE_TOP + source_rows;
             let sections = output_sections(cell);
             // Preview and full only differ when some output is taller than
             // the preview rows.
@@ -222,22 +260,34 @@ impl LayoutCache {
             let cap = output_cap(display, max_output_rows);
             let outputs = match (cell.outputs.len(), display) {
                 (0, _) => 0,
-                (_, OutputDisplay::Hidden) => 1,
+                (_, OutputDisplay::Hidden) => {
+                    outputs_top = Some(block_top);
+                    stops.push(block_top);
+                    1
+                }
                 // One divider per section, then its outputs' rows.
-                _ => sections
-                    .iter()
-                    .map(|section| {
-                        1 + section
-                            .items
-                            .iter()
-                            .map(|output| {
-                                output_views.get_mut(&output.id).map_or(1, |view| {
-                                    view.measure(output, width, theme, cap).shown_rows.max(1)
-                                })
-                            })
-                            .sum::<u32>()
-                    })
-                    .sum(),
+                _ => {
+                    let mut row = block_top;
+                    for section in &sections {
+                        row += 1;
+                        for output in &section.items {
+                            let (shown, total) = output_views.get_mut(&output.id).map_or((1, 1), |view| {
+                                let metrics = view.measure(output, width, theme, cap);
+                                (metrics.shown_rows.max(1), metrics.total_rows)
+                            });
+                            output_rows.push(OutputRows {
+                                output_id: output.id,
+                                first_row: row,
+                                shown,
+                                total,
+                            });
+                            stops.extend(row..row + shown);
+                            row += shown;
+                        }
+                    }
+                    outputs_top = (row > block_top).then_some(block_top);
+                    row - block_top
+                }
             };
             CardRows {
                 source: wrapped_source.len() as u32,
@@ -261,6 +311,9 @@ impl LayoutCache {
                 approx_bytes,
                 source_line_map,
                 clips,
+                stops,
+                outputs_top,
+                output_rows,
             },
         );
         Some(total_rows.max(1))
@@ -351,6 +404,24 @@ impl LayoutCache {
         };
         self.line_highlights.insert(cache_key, line.clone());
         line
+    }
+
+    /// Measure the cell at `index` now (at the last viewport width), for
+    /// navigation that reaches past what has been drawn.
+    pub fn ensure_measured(
+        &mut self,
+        doc: &Document,
+        index: usize,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        max_output_rows: u16,
+        theme: &Theme,
+    ) -> Option<&CachedCellLayout> {
+        self.ensure_tree(doc, max_output_rows);
+        let cell_id = doc.order().get(index)?.clone();
+        let width = if self.last_width == 0 { 80 } else { self.last_width };
+        let height = self.measure_cell(doc, &cell_id, output_views, width, max_output_rows, theme, None)?;
+        self.heights.set(index, height);
+        self.cells.get(&cell_id)
     }
 
     /// Synchronize visible cells immediately for `width` and enqueue off-screen cells

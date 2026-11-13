@@ -486,6 +486,12 @@ impl Plugin for BuiltinsPlugin {
             action(reg, id, ActionKind::Command, "Outputs", order, title, false);
         }
         for (order, id, title) in [
+            (55, "motion.fast_down", "Scroll down fast"),
+            (56, "motion.fast_up", "Scroll up fast"),
+            (57, "motion.cell_next", "Next cell"),
+            (58, "motion.cell_prev", "Previous cell"),
+            (59, "motion.item_next", "Next cell or output"),
+            (54, "motion.item_prev", "Previous cell or output"),
             (60, "motion.current_line", "Current line"),
             (61, "motion.bigword_next", "Next WORD"),
             (62, "motion.bigword_back", "Previous WORD"),
@@ -960,6 +966,30 @@ impl Plugin for BuiltinsPlugin {
             "Follow output",
             "When scrolled to the bottom, keep following the bottom as output grows",
             SettingKind::Bool { default: true },
+        );
+        setting(
+            reg,
+            "display.scrolloff",
+            "display",
+            "Scroll margin",
+            "Rows kept between the cursor and the top or bottom edge while moving",
+            SettingKind::Int {
+                default: 3,
+                min: 0,
+                max: 100,
+            },
+        );
+        setting(
+            reg,
+            "display.fast_scroll_rows",
+            "display",
+            "Fast scroll rows",
+            "Rows moved by J and K in the notebook",
+            SettingKind::Int {
+                default: 5,
+                min: 1,
+                max: 1_000,
+            },
         );
         setting(
             reg,

@@ -113,6 +113,7 @@ fn hint_actions(
             ("cell.enter_normal", "edit"),
             ("cell.run", "run"),
             ("cell.run_and_advance", "run+next"),
+            ("motion.cell_next", "next cell"),
             ("cell.insert_below", "new cell"),
             ("cell.toggle_kind", "md/code"),
             ("op.delete", "delete"),

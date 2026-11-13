@@ -231,7 +231,7 @@ fn printed_and_returned_values_get_their_own_sections_with_out_last() {
 #[test]
 fn tab_switches_between_stdout_and_stderr() {
     let mut c = mixed();
-    keys(&mut c, "j");
+    keys(&mut c, "}");
     c.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), Instant::now());
     let text = screen(&mut c);
     assert!(text.contains("a warning"), "{text}");

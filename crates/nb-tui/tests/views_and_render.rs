@@ -298,6 +298,7 @@ fn renderer_populates_frame_geometry_on_test_backend_without_mutating_document()
     let registry = nb_sdk::ExtensionRegistry::default();
     let logs = std::collections::VecDeque::new();
     let view = AppView {
+        notebook_row: None,
         path: None,
         document: &document,
         selected_cell: &selected,

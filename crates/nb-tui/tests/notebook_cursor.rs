@@ -1,0 +1,193 @@
+//! Notebook-level row cursor: j/k move one row through sources and outputs,
+//! J/K move several, ]]/[[ jump cells, }/{ also stop at outputs, and the
+//! view only scrolls when the cursor reaches its edges.
+
+use std::time::Instant;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use nb_core::{Cell, Document, FormatBacking, OutputData, OutputItem, StreamBuffer, StreamKind};
+use nb_kernel::FakeKernel;
+use nb_sdk::ExtensionRegistry;
+use nb_tui::focus::CellPart;
+use nb_tui::{BuiltinsPlugin, CellMode, Coordinator, FocusLayer};
+use ratatui::{Terminal, backend::TestBackend};
+
+fn stream(text: &str) -> OutputItem {
+    let mut buffer = StreamBuffer::default();
+    buffer.push_chunk(text);
+    OutputItem::new(
+        OutputData::Stream {
+            stream: StreamKind::Stdout,
+            buffer,
+        },
+        false,
+    )
+}
+
+/// Cells `(source, stdout)`, drawn in an 80x20 terminal.
+fn coordinator(cells: &[(&str, &str)]) -> Coordinator {
+    let cells = cells
+        .iter()
+        .map(|(source, out)| {
+            let mut cell = Cell::new_code();
+            cell.buffer.replace_all((*source).to_string());
+            if !out.is_empty() {
+                cell.outputs.push(stream(out));
+            }
+            cell
+        })
+        .collect();
+    let mut registry = ExtensionRegistry::default();
+    registry.install(BuiltinsPlugin);
+    let (kernel, _handle) = FakeKernel::pair();
+    let mut c = Coordinator::headless(
+        Document::from_cells(cells, FormatBacking::PercentPy { header: None }),
+        registry,
+        Box::new(kernel),
+    );
+    draw(&mut c);
+    c
+}
+
+fn draw(c: &mut Coordinator) {
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+    terminal.draw(|frame| c.draw(frame)).expect("draw");
+}
+
+fn keys(c: &mut Coordinator, text: &str) {
+    for ch in text.chars() {
+        c.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), Instant::now());
+        draw(c);
+    }
+}
+
+fn press(c: &mut Coordinator, code: KeyCode) {
+    c.on_key(KeyEvent::new(code, KeyModifiers::NONE), Instant::now());
+    draw(c);
+}
+
+fn lines(n: usize, word: &str) -> String {
+    (0..n).map(|i| format!("{word} {i}\n")).collect()
+}
+
+fn at(c: &Coordinator, index: usize, part: CellPart) -> bool {
+    c.selected_cell == c.document.order()[index] && c.selected_part == part
+}
+
+#[test]
+fn j_walks_rows_through_a_long_output_and_into_the_next_cell() {
+    let long = lines(10, "out");
+    let mut c = coordinator(&[("a = 1\nb = 2", &long), ("c = 3", "")]);
+    c.settings.set_value(
+        &nb_sdk::SettingId("display.output_default_view".into()),
+        nb_sdk::SettingValue::Text("full".into()),
+        &c.registry,
+    );
+    draw(&mut c);
+    keys(&mut c, "j");
+    assert!(at(&c, 0, CellPart::Source), "second source line");
+    keys(&mut c, "j");
+    assert!(at(&c, 0, CellPart::Output), "first output line");
+    keys(&mut c, "9j");
+    assert!(at(&c, 0, CellPart::Output), "still in the output");
+    keys(&mut c, "j");
+    assert!(at(&c, 1, CellPart::Source), "next cell after the last output line");
+    keys(&mut c, "K");
+    assert!(at(&c, 0, CellPart::Output), "K moves five rows back");
+}
+
+#[test]
+fn brackets_jump_cells_and_braces_also_stop_at_outputs() {
+    let mut c = coordinator(&[("x", "1\n"), ("y", "2\n"), ("z", "")]);
+    keys(&mut c, "]]");
+    assert!(at(&c, 1, CellPart::Source));
+    keys(&mut c, "]]");
+    assert!(at(&c, 2, CellPart::Source));
+    keys(&mut c, "[[");
+    assert!(at(&c, 1, CellPart::Source));
+    keys(&mut c, "gg}");
+    assert!(at(&c, 0, CellPart::Output));
+    keys(&mut c, "}");
+    assert!(at(&c, 1, CellPart::Source));
+    keys(&mut c, "{");
+    assert!(at(&c, 0, CellPart::Output));
+    keys(&mut c, "2]]");
+    assert!(at(&c, 2, CellPart::Source), "counts repeat the jump");
+}
+
+#[test]
+fn i_opens_the_cell_at_the_cursor_line_and_esc_returns_to_it() {
+    let mut c = coordinator(&[("first\n    second\nthird", "")]);
+    keys(&mut c, "j");
+    keys(&mut c, "i");
+    let id = c.document.order()[0].clone();
+    let cursor = c.document.cell(&id).unwrap().buffer.cursor();
+    assert_eq!((cursor.row, cursor.col), (1, 4), "line 2, first non-blank");
+    assert!(matches!(
+        c.focus.top(),
+        FocusLayer::CellEdit {
+            mode: CellMode::Normal,
+            ..
+        }
+    ));
+    keys(&mut c, "j");
+    press(&mut c, KeyCode::Esc);
+    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    keys(&mut c, "i");
+    let cursor = c.document.cell(&id).unwrap().buffer.cursor();
+    assert_eq!(cursor.row, 2, "the notebook cursor came back on line 3");
+}
+
+#[test]
+fn i_on_an_output_row_reads_from_that_line() {
+    let mut c = coordinator(&[("run()", &lines(3, "row"))]);
+    keys(&mut c, "jjj");
+    keys(&mut c, "i");
+    let out = c.output_text.as_ref().expect("reading the output");
+    assert_eq!(out.buffer.cursor().row, 2);
+    keys(&mut c, "k");
+    press(&mut c, KeyCode::Esc);
+    keys(&mut c, "i");
+    let out = c.output_text.as_ref().expect("reading again");
+    assert_eq!(out.buffer.cursor().row, 1, "Esc kept the reading position");
+}
+
+#[test]
+fn the_view_does_not_move_while_the_cursor_is_inside_it() {
+    let cells: Vec<(String, String)> = (0..8).map(|n| (format!("v{n} = {n}"), String::new())).collect();
+    let refs: Vec<(&str, &str)> = cells.iter().map(|(s, o)| (s.as_str(), o.as_str())).collect();
+    let mut c = coordinator(&refs);
+    keys(&mut c, "]]");
+    assert_eq!(c.scroll_row, 0, "the next cell is on screen: no scroll");
+    keys(&mut c, "i");
+    press(&mut c, KeyCode::Esc);
+    assert_eq!(c.scroll_row, 0, "entering and leaving a cell does not scroll");
+    // Moving past the bottom edge scrolls just enough.
+    keys(&mut c, "G");
+    let bottom = c.scroll_row;
+    assert!(bottom > 0);
+    keys(&mut c, "k");
+    assert_eq!(c.scroll_row, bottom, "one row up from the bottom stays put");
+}
+
+#[test]
+fn the_wheel_scrolls_the_view_and_drags_the_cursor_along() {
+    let cells: Vec<(String, String)> = (0..10).map(|n| (format!("v{n} = {n}"), String::new())).collect();
+    let refs: Vec<(&str, &str)> = cells.iter().map(|(s, o)| (s.as_str(), o.as_str())).collect();
+    let mut c = coordinator(&refs);
+    for _ in 0..4 {
+        c.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        draw(&mut c);
+    }
+    assert!(c.scroll_row > 0);
+    assert_ne!(c.selected_cell, c.document.order()[0], "the cursor left the top cell");
+    // The next key moves from where the cursor is, without a jump back.
+    let scroll = c.scroll_row;
+    keys(&mut c, "j");
+    assert!(c.scroll_row >= scroll);
+}
