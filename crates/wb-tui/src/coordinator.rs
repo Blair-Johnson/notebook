@@ -92,8 +92,12 @@ pub struct Coordinator {
     pub kernel_phase: KernelPhase,
     spinner_tick: usize,
     /// Scroll to keep the selection (or edit cursor) visible on the next
-    /// draw. Set by keyboard actions; cleared by mouse-wheel scrolling.
+    /// draw. Set when a key moves the selection or cursor; cleared by
+    /// mouse-wheel scrolling.
     follow_focus: bool,
+    /// The view was at the bottom after the last draw: keep following the
+    /// bottom as content grows, until the user scrolls or moves away.
+    stick_bottom: bool,
     pub notice: Option<String>,
     /// The notice last seen by `on_tick` and when it appeared; notices
     /// clear themselves after `display.notice_secs`.
@@ -171,6 +175,7 @@ impl Coordinator {
             kernel_phase: KernelPhase::Starting,
             spinner_tick: 0,
             follow_focus: true,
+            stick_bottom: false,
             notice: None,
             notice_seen: None,
             registry,
@@ -312,6 +317,7 @@ impl Coordinator {
         let height = u32::from(viewport.height.max(1));
         self.vim.half_page = usize::from(viewport.height / 2).max(1);
         let output_region = self.output_region_rows(text_w);
+        let followed = self.follow_focus;
         if self.follow_focus {
             self.follow_focus = false;
             if let Some(index) = self.document.position_of(&self.selected_cell) {
@@ -353,7 +359,15 @@ impl Coordinator {
             }
         }
         let total = self.layout_cache.heights().total_height();
-        self.scroll_row = self.scroll_row.min(total.saturating_sub(height));
+        let max_scroll = total.saturating_sub(height);
+        if !followed && self.stick_bottom && snap.core.follow_output {
+            self.scroll_row = max_scroll;
+        }
+        self.scroll_row = self.scroll_row.min(max_scroll);
+        // At the bottom means "follow the bottom". When everything fits on
+        // screen that is only meant if the last cell is the one in view.
+        let last_selected = self.document.order().last() == Some(&self.selected_cell);
+        self.stick_bottom = self.scroll_row >= max_scroll && (max_scroll > 0 || last_selected);
     }
 
     /// For an entered output: keep its cursor inside the output region by
@@ -462,10 +476,32 @@ impl Coordinator {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Effect {
-        self.follow_focus = true;
+        // Scroll to the selection only when the key moved it; a key that
+        // doesn't (run, interrupt, ...) leaves the view where it is.
+        let before = self.focus_signature();
         let effect = self.on_key_inner(key, now);
+        if self.focus_signature() != before {
+            self.follow_focus = true;
+        }
         self.reconcile_popups();
         effect
+    }
+
+    /// Everything a key can move that the view should follow.
+    fn focus_signature(&self) -> (CellId, CellPart, usize, Option<CursorPos>, Option<CursorPos>) {
+        let edit_cursor = match self.focus.base() {
+            FocusLayer::CellEdit { cell_id, .. } => {
+                self.document.cell(cell_id).map(|cell| cell.buffer.cursor())
+            }
+            _ => None,
+        };
+        (
+            self.selected_cell.clone(),
+            self.selected_part,
+            self.focus.layers().len(),
+            edit_cursor,
+            self.output_text.as_ref().map(|out| out.buffer.cursor()),
+        )
     }
 
     fn on_key_inner(&mut self, key: KeyEvent, now: Instant) -> Effect {
@@ -537,11 +573,15 @@ impl Coordinator {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.follow_focus = false;
+                // An explicit scroll; at the bottom, the next draw re-arms it.
+                self.stick_bottom = false;
                 self.scroll_row = self.scroll_row.saturating_sub(wheel_lines);
                 return;
             }
             MouseEventKind::ScrollDown => {
                 self.follow_focus = false;
+                // An explicit scroll; at the bottom, the next draw re-arms it.
+                self.stick_bottom = false;
                 self.scroll_row = self.scroll_row.saturating_add(wheel_lines);
                 return;
             }

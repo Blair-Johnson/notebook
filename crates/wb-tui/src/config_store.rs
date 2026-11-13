@@ -25,6 +25,7 @@ pub struct CoreSettings {
     /// View for outputs whose cell has no view of its own.
     pub output_default_view: wb_core::OutputDisplay,
     pub notice_secs: u64,
+    pub follow_output: bool,
     pub indent_width: u16,
     pub wheel_scroll_lines: u16,
     pub insert_escape_chord_ms: u64,
@@ -46,6 +47,7 @@ impl Default for CoreSettings {
             max_output_rows: 18,
             output_default_view: wb_core::OutputDisplay::Preview,
             notice_secs: 4,
+            follow_output: true,
             indent_width: 4,
             wheel_scroll_lines: 3,
             insert_escape_chord_ms: 500,
@@ -346,6 +348,7 @@ fn build_snapshot(
             .and_then(|name| wb_core::OutputDisplay::from_name(&name))
             .unwrap_or_default(),
         notice_secs: setting_int(&values, "display.notice_secs", 4).max(1) as u64,
+        follow_output: setting_bool(&values, "display.follow_output", true),
         indent_width: setting_int(&values, "editor.indent_width", 4).clamp(1, 16) as u16,
         wheel_scroll_lines: setting_int(&values, "display.wheel_scroll_lines", 3)
             .clamp(0, u16::MAX as i64) as u16,

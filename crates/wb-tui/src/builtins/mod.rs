@@ -955,6 +955,14 @@ impl Plugin for BuiltinsPlugin {
         );
         setting(
             reg,
+            "display.follow_output",
+            "display",
+            "Follow output",
+            "When scrolled to the bottom, keep following the bottom as output grows",
+            SettingKind::Bool { default: true },
+        );
+        setting(
+            reg,
             "editor.indent_width",
             "editor",
             "Indent width",
