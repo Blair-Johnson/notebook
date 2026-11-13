@@ -44,6 +44,8 @@ impl ExecRouter {
     }
 
     pub fn register(&mut self, exec_id: ExecId, target: TargetId) {
+        self.completed_targets.remove(&exec_id);
+        self.completed_order.retain(|id| id != &exec_id);
         self.active.insert(
             exec_id,
             ActiveExec {
@@ -78,12 +80,69 @@ impl ExecRouter {
         (TargetId::SessionLog, true)
     }
 
-    pub fn mark_shell_reply(&mut self, _id: &ExecId, _ok: bool) -> Option<(TargetId, bool, Duration)> {
-        todo!("wb-kernel::router: record shell reply; retire to completed LRU once idle also seen")
+    pub fn mark_shell_reply(
+        &mut self,
+        id: &ExecId,
+        ok: bool,
+    ) -> Option<(TargetId, bool, Duration)> {
+        if let Some(active) = self.active.get_mut(id) {
+            active.got_shell_reply = true;
+            active.ok &= ok;
+        }
+        self.finish_if_ready(id)
     }
 
-    pub fn mark_iopub_idle(&mut self, _id: &ExecId) -> Option<(TargetId, bool, Duration)> {
-        todo!("wb-kernel::router: record iopub idle; retire to completed LRU once reply also seen")
+    pub fn mark_iopub_idle(&mut self, id: &ExecId) -> Option<(TargetId, bool, Duration)> {
+        if let Some(active) = self.active.get_mut(id) {
+            active.got_iopub_idle = true;
+        }
+        self.finish_if_ready(id)
+    }
+
+    /// Retire an execution as a client-side cancellation. This is used for main-lane
+    /// requests skipped by `stop_on_error` before they reach the kernel.
+    pub fn cancel(&mut self, id: &ExecId, ok: bool) -> Option<(TargetId, bool, Duration)> {
+        let active = self.active.remove(id)?;
+        let elapsed = active.started_at.elapsed();
+        let target = active.target;
+        self.retire(id.clone(), target.clone());
+        Some((target, active.ok && ok, elapsed))
+    }
+
+    /// Drop all active and completed state when a kernel is restarted or dies.
+    pub fn clear(&mut self) {
+        self.active.clear();
+        self.completed_order.clear();
+        self.completed_targets.clear();
+    }
+
+    fn finish_if_ready(&mut self, id: &ExecId) -> Option<(TargetId, bool, Duration)> {
+        let ready = self
+            .active
+            .get(id)
+            .is_some_and(|active| active.got_shell_reply && active.got_iopub_idle);
+        if !ready {
+            return None;
+        }
+
+        let active = self.active.remove(id)?;
+        let elapsed = active.started_at.elapsed();
+        let target = active.target;
+        self.retire(id.clone(), target.clone());
+        Some((target, active.ok, elapsed))
+    }
+
+    fn retire(&mut self, id: ExecId, target: TargetId) {
+        self.completed_targets.remove(&id);
+        self.completed_order.retain(|old| old != &id);
+        self.completed_order.push_back(id.clone());
+        self.completed_targets.insert(id, target);
+
+        while self.completed_order.len() > self.completed_cap {
+            if let Some(evicted) = self.completed_order.pop_front() {
+                self.completed_targets.remove(&evicted);
+            }
+        }
     }
 }
 
@@ -112,5 +171,126 @@ impl RingLog {
     pub fn tail(&self, max_lines: usize) -> Vec<String> {
         let skip = self.lines.len().saturating_sub(max_lines);
         self.lines.iter().skip(skip).cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wb_core::{CellId, ExecId};
+
+    fn exec(n: usize) -> ExecId {
+        ExecId(format!("exec-{n}"))
+    }
+
+    fn target(n: usize) -> TargetId {
+        TargetId::Cell(CellId(format!("cell-{n}")))
+    }
+
+    #[test]
+    fn execution_finishes_in_either_signal_order() {
+        let mut router = ExecRouter::default();
+        let first = exec(1);
+        router.register(first.clone(), target(1));
+        assert!(router.mark_shell_reply(&first, true).is_none());
+        let (resolved, ok, _) = router
+            .mark_iopub_idle(&first)
+            .expect("both end signals finish execution");
+        assert_eq!(resolved, target(1));
+        assert!(ok);
+        assert!(router.active(&first).is_none());
+
+        let second = exec(2);
+        router.register(second.clone(), target(2));
+        assert!(router.mark_iopub_idle(&second).is_none());
+        let (_, ok, _) = router
+            .mark_shell_reply(&second, false)
+            .expect("idle before shell reply also finishes");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn completed_parents_are_bounded_fifo() {
+        let mut router = ExecRouter::with_capacity(4_096);
+        for n in 0..=4_096 {
+            let id = exec(n);
+            router.register(id.clone(), target(n));
+            assert!(router.mark_shell_reply(&id, true).is_none());
+            assert!(router.mark_iopub_idle(&id).is_some());
+        }
+
+        assert_eq!(router.completed_capacity(), (4_096, 4_096));
+        assert_eq!(
+            router.resolve_output_target(Some(&exec(0))),
+            (TargetId::SessionLog, true)
+        );
+        assert_eq!(
+            router.resolve_output_target(Some(&exec(1))),
+            (target(1), true)
+        );
+    }
+
+    #[test]
+    fn late_output_and_session_log_fallback_are_explicit() {
+        let mut router = ExecRouter::default();
+        let id = exec(9);
+        router.register(id.clone(), target(9));
+        assert_eq!(router.resolve_output_target(Some(&id)), (target(9), false));
+        let _ = router.mark_shell_reply(&id, true);
+        let _ = router.mark_iopub_idle(&id);
+        assert_eq!(router.resolve_output_target(Some(&id)), (target(9), true));
+        assert_eq!(
+            router.resolve_output_target(Some(&exec(999))),
+            (TargetId::SessionLog, true)
+        );
+        assert_eq!(
+            router.resolve_output_target(None),
+            (TargetId::SessionLog, true)
+        );
+    }
+
+    #[test]
+    fn clear_removes_active_and_completed_state() {
+        let mut router = ExecRouter::default();
+        let id = exec(1);
+        router.register(id.clone(), target(1));
+        let _ = router.mark_shell_reply(&id, true);
+        let _ = router.mark_iopub_idle(&id);
+        router.clear();
+        assert_eq!(router.completed_capacity().0, 0);
+        assert_eq!(
+            router.resolve_output_target(Some(&id)),
+            (TargetId::SessionLog, true)
+        );
+    }
+
+    #[test]
+    fn ring_log_keeps_only_the_newest_lines() {
+        let mut log = RingLog::new(2);
+        log.push_line("one".into());
+        log.push_line("two".into());
+        log.push_line("three".into());
+        assert_eq!(log.tail(10), ["two", "three"]);
+        assert_eq!(log.tail(1), ["three"]);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.capacity(), 2);
+        log.clear();
+        assert!(log.is_empty());
     }
 }
