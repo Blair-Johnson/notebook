@@ -133,16 +133,25 @@ pub struct CommandPaletteState {
     pub selected: usize,
 }
 
+/// What choosing a palette entry does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteKind {
+    /// Run the action.
+    Command,
+    /// Open the settings screen on this setting.
+    Setting,
+}
+
 #[derive(Clone, Debug)]
 pub struct PaletteEntry<'a> {
-    pub action: &'a ActionSpec,
-    pub spec: &'a ActionSpec,
+    pub kind: PaletteKind,
     pub id: &'a str,
     pub title: &'a str,
-    pub category: &'a str,
+    pub category: String,
     pub keys: String,
     pub bound_keys: String,
     pub score: usize,
+    order: u32,
 }
 
 impl CommandPaletteState {
@@ -174,26 +183,55 @@ impl CommandPaletteState {
                     .unwrap_or_default();
                 let score = score_action(action, &keys, &self.query)?;
                 Some(PaletteEntry {
-                    action,
-                    spec: action,
+                    kind: PaletteKind::Command,
                     id: action.id.as_str(),
                     title: action.title.as_ref(),
-                    category: action.category.as_ref(),
+                    category: action.category.to_string(),
                     keys: keys.clone(),
                     bound_keys: keys,
                     score,
+                    order: u32::from(action.order),
                 })
             })
             .collect::<Vec<_>>();
+        // Settings are searchable here too; choosing one opens it in the
+        // settings screen. Listed after commands when nothing is typed.
+        entries.extend(reg.settings.iter().enumerate().filter_map(|(index, spec)| {
+            let fields = [
+                spec.title.as_ref(),
+                spec.section.as_ref(),
+                spec.id.0.as_ref(),
+                spec.description.as_ref(),
+                "setting",
+            ];
+            let score = if self.query.trim().is_empty() {
+                0
+            } else {
+                fields
+                    .into_iter()
+                    .filter_map(|field| score_field(field, &self.query))
+                    .max()?
+            };
+            Some(PaletteEntry {
+                kind: PaletteKind::Setting,
+                id: spec.id.0.as_ref(),
+                title: spec.title.as_ref(),
+                category: format!("Setting · {}", spec.section),
+                keys: String::new(),
+                bound_keys: String::new(),
+                score,
+                order: 100_000 + index as u32,
+            })
+        }));
 
         entries.sort_by(|left, right| {
             right
                 .score
                 .cmp(&left.score)
-                .then(left.action.order.cmp(&right.action.order))
-                .then(left.action.category.cmp(&right.action.category))
-                .then(left.action.title.cmp(&right.action.title))
-                .then(left.action.id.cmp(&right.action.id))
+                .then(left.order.cmp(&right.order))
+                .then(left.category.cmp(&right.category))
+                .then(left.title.cmp(&right.title))
+                .then(left.id.cmp(&right.id))
         });
         entries
     }
@@ -283,6 +321,16 @@ impl SettingsModalState {
         ]
     }
 
+    /// Show `spec` in the screen: its tab, filtered down to it.
+    pub fn focus_setting(&mut self, spec: &SettingSpec) {
+        self.active_tab = (0..Self::tabs().len())
+            .find(|tab| setting_in_tab(spec, *tab))
+            .unwrap_or(0);
+        self.filter = spec.title.to_string();
+        self.selected_row = 0;
+        self.capturing_keybind = false;
+    }
+
     pub fn next_tab(&mut self) {
         self.active_tab = (self.active_tab + 1) % Self::tabs().len();
         self.selected_row = 0;
@@ -337,7 +385,7 @@ impl SettingsModalState {
 
     /// Handle the emergency, non-configurable settings keys.  This path is
     /// deliberately independent of the user keymap so a broken keybind cannot
-    /// make `/config` impossible to navigate or repair.
+    /// make the settings screen impossible to navigate or repair.
     pub fn handle_raw_key(
         &mut self,
         key: KeyEvent,

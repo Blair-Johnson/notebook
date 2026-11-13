@@ -74,7 +74,7 @@ pub struct ConfigSnapshot {
 }
 
 /// Manages `$XDG_CONFIG_HOME/workbench/config.toml` via `toml_edit::DocumentMut`
-/// so interactive `/config` edits preserve user comments and key formatting.
+/// so edits from the settings screen preserve user comments and key formatting.
 pub struct SettingsStore {
     path: Option<PathBuf>,
     doc: DocumentMut,

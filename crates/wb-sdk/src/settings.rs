@@ -1,4 +1,4 @@
-//! Declarative setting specifications shared by `config.toml` and `/config` UI.
+//! Declarative setting specifications shared by `config.toml` and the settings screen.
 
 use std::borrow::Cow;
 

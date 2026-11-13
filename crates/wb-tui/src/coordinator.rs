@@ -1077,8 +1077,16 @@ impl Coordinator {
                     return Effect::None;
                 };
                 let action = entry.id.to_string();
+                let kind = entry.kind;
                 self.overlays.palette = None;
                 self.focus.pop();
+                if kind == crate::overlays::PaletteKind::Setting {
+                    if let Some(spec) = self.registry.settings.iter().find(|s| s.id.0 == action) {
+                        self.overlays.settings.focus_setting(spec);
+                    }
+                    self.focus.push(FocusLayer::Modal(ModalKind::Settings));
+                    return Effect::None;
+                }
                 return self.dispatch_input(ResolvedInput::Command {
                     id: wb_sdk::CommandId(std::borrow::Cow::Owned(action)),
                     count: None,

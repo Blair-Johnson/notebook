@@ -279,3 +279,39 @@ fn pdb_history_preserves_draft_and_deduplicates_submissions() {
     let (_, history) = password.take_submission();
     assert_eq!(history, ["old"]);
 }
+
+#[test]
+fn palette_finds_settings_and_opens_them_in_the_settings_screen() {
+    use wb_tui::overlays::PaletteKind;
+    let registry = registry();
+    let keymap = wb_tui::Keymap::compile(&registry, "");
+    let mut palette = wb_tui::overlays::CommandPaletteState::new();
+    palette.query = "indent width".into();
+    let context = wb_sdk::KeyContextId::new_static("global");
+    let matches = palette.query_matches(&registry, &keymap, &context);
+    let first = matches.first().expect("a match");
+    assert_eq!((first.kind, first.id), (PaletteKind::Setting, "editor.indent_width"));
+
+    let (kernel, _handle) = wb_kernel::FakeKernel::pair();
+    let mut c = wb_tui::Coordinator::headless(
+        wb_core::Document::new_empty(wb_core::FormatBacking::PercentPy { header: None }),
+        registry,
+        Box::new(kernel),
+    );
+    let now = std::time::Instant::now();
+    c.on_key(key_mod(KeyCode::Char('/'), KeyModifiers::CONTROL), now);
+    for ch in "indent width".chars() {
+        c.on_key(key(KeyCode::Char(ch)), now);
+    }
+    c.on_key(key(KeyCode::Enter), now);
+    assert!(matches!(
+        c.focus.top(),
+        wb_tui::FocusLayer::Modal(wb_tui::ModalKind::Settings)
+    ));
+    assert_eq!(c.overlays.settings.active_tab, 1, "editor tab");
+    assert_eq!(c.overlays.settings.filter, "Indent width");
+}
+
+fn key_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}

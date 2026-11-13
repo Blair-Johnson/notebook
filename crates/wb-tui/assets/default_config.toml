@@ -1,5 +1,5 @@
 # Default Workbench configuration (`$XDG_CONFIG_HOME/workbench/config.toml`).
-# Comments and formatting in your user config file are preserved when saving from `/config`.
+# Comments and formatting in your user config file are preserved when the settings screen saves.
 
 [display]
 theme = "midnight"

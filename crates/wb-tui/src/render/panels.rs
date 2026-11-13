@@ -252,7 +252,7 @@ fn draw_palette(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, them
         width,
         (list_rows + 4).min(screen.height.saturating_sub(3)),
     );
-    let inner = panel(frame, area, "Commands", theme);
+    let inner = panel(frame, area, "Commands & settings", theme);
     let query = Line::from(vec![
         Span::styled("› ", key_style(theme)),
         Span::styled(palette.query.clone(), Style::default().fg(p.fg)),
@@ -269,7 +269,7 @@ fn draw_palette(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, them
     let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
     if entries.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("  no matching commands", Style::default().fg(p.muted))),
+            Paragraph::new(Span::styled("  nothing matches", Style::default().fg(p.muted))),
             list,
         );
         return;
