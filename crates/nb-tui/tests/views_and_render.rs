@@ -23,7 +23,7 @@ use nb_tui::config_store::CoreSettings;
 use nb_tui::focus::FocusStack;
 use nb_tui::layout::{LayoutCache, MIN_HISTORY_ROWS, TailFollow, ViewportLayout};
 use nb_tui::overlays::OverlayStates;
-use nb_tui::platform::{ClipboardSink, TmuxPaneTitle};
+use nb_tui::platform::ClipboardSink;
 use nb_tui::render::{AppView, HitTarget, KernelPhase, render_app};
 
 fn line_text(line: &Line<'_>) -> String {
@@ -366,9 +366,7 @@ fn renderer_populates_frame_geometry_on_test_backend_without_mutating_document()
 }
 
 #[test]
-fn platform_helpers_are_safe_when_tmux_is_not_active() {
-    let mut title = TmuxPaneTitle::detect();
-    title.update("nb\nstatus");
+fn clipboard_is_safe_when_tmux_is_not_active() {
     let mut clipboard = nb_tui::platform::SystemClipboard::default();
     let result = clipboard.copy(&"x".repeat(101 * 1024));
     if let Err(error) = result {

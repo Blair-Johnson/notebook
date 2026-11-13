@@ -10,13 +10,12 @@ use crossterm::execute;
 use std::io::Write;
 use crossterm::terminal::{Clear, ClearType};
 use std::io::stdout;
-use nb_tui::platform::{CursorShape, TerminalEffects, TmuxPaneTitle};
+use nb_tui::platform::{CursorShape, TerminalEffects};
 
 /// Real terminal effects used by the coordinator in the interactive binary.
 pub struct CrosstermTerminalEffects {
     last_cursor_shape: Option<CursorShape>,
     last_mouse_capture: Option<bool>,
-    pane_title: TmuxPaneTitle,
 }
 
 impl CrosstermTerminalEffects {
@@ -24,7 +23,6 @@ impl CrosstermTerminalEffects {
         Self {
             last_cursor_shape: None,
             last_mouse_capture: None,
-            pane_title: TmuxPaneTitle::detect(),
         }
     }
 }
@@ -60,10 +58,6 @@ impl TerminalEffects for CrosstermTerminalEffects {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
         self.last_mouse_capture = Some(enabled);
-    }
-
-    fn set_pane_title(&mut self, title: &str) {
-        self.pane_title.update(title);
     }
 }
 
