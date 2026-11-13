@@ -281,3 +281,11 @@ fn settings_default_snapshot_is_lenient_and_has_builtin_theme() {
     assert_eq!(store.snapshot().core.max_output_rows, 18);
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn modified_space_formats_as_a_word() {
+    use wb_tui::keymap::format_key;
+    assert_eq!(format_key(Key::Ctrl(' ')), "ctrl+space");
+    assert_eq!(format_key(Key::Alt(' ')), "alt+space");
+    assert_eq!(parse_key("ctrl+space"), Some(Key::Ctrl(' ')));
+}
