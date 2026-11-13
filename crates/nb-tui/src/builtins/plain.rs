@@ -265,7 +265,8 @@ fn value_to_text(value: &Value) -> Cow<'_, str> {
 }
 
 /// The text of a bundle without a single `text/plain` string: a joined
-/// nbformat line array, or each MIME value labeled, large ones by size only.
+/// nbformat line array, or each MIME value labeled. Binary payloads (base64
+/// images, audio, PDFs) show as a size; every text type is shown in full.
 fn build_text(item: &OutputItem) -> String {
     let OutputData::Rich { bundle, .. } = &item.data else {
         return String::new();
@@ -276,7 +277,7 @@ fn build_text(item: &OutputItem) -> String {
     bundle
         .iter()
         .map(|(key, value)| match value {
-            Value::String(text) if text.len() > LARGE_VALUE_BYTES => {
+            Value::String(text) if is_binary_mime(key) => {
                 format!("[{key}] <{} KB>", text.len().div_ceil(1024))
             }
             _ => format!("[{key}] {}", value_to_text(value)),
@@ -285,8 +286,14 @@ fn build_text(item: &OutputItem) -> String {
         .join("\n")
 }
 
-/// MIME values longer than this (base64 images, big HTML) show as a size.
-const LARGE_VALUE_BYTES: usize = 4096;
+/// MIME types whose payload is base64 data, not readable text.
+fn is_binary_mime(mime: &str) -> bool {
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    (mime.starts_with("image/") && mime != "image/svg+xml")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || matches!(mime, "application/pdf" | "application/octet-stream")
+}
 
 /// Per logical line of `source`: the first wrapped row (with a final total)
 /// and the byte offset where it starts.

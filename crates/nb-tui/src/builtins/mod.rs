@@ -1102,10 +1102,10 @@ impl Plugin for BuiltinsPlugin {
             "kernel.max_stream_lines",
             "kernel",
             "Maximum stream lines",
-            "Retain at most this many stream lines",
+            "Drop the oldest stream lines beyond this many (0 keeps all)",
             SettingKind::Int {
-                default: 10_000,
-                min: 1,
+                default: 0,
+                min: 0,
                 max: 1_000_000,
             },
         );

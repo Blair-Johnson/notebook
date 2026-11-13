@@ -164,7 +164,7 @@ fn byte_cap_never_drops_the_last_line() {
 fn many_small_chunks_take_linear_time() {
     let line = format!("{}\n", "y".repeat(79));
     let start = Instant::now();
-    let mut buffer = StreamBuffer::default();
+    let mut buffer = StreamBuffer::with_cap(10_000);
     for _ in 0..20_000 {
         buffer.push_chunk(&line);
     }
@@ -175,4 +175,17 @@ fn many_small_chunks_take_linear_time() {
         start.elapsed()
     );
     assert_eq!(buffer.truncated_lines(), 10_001);
+}
+
+#[test]
+fn by_default_nothing_is_dropped() {
+    let mut buffer = StreamBuffer::default();
+    for i in 0..30_000 {
+        buffer.push_chunk(&format!("line {i}\n"));
+    }
+    let long = "z".repeat(12 << 20);
+    buffer.push_chunk(&long);
+    assert_eq!(buffer.truncated_lines(), 0);
+    assert!(buffer.as_str().starts_with("line 0\n"));
+    assert!(buffer.as_str().ends_with(&long));
 }

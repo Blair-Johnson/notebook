@@ -7,7 +7,6 @@ use nb_sdk::{
     InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
@@ -356,29 +355,10 @@ impl OutputView for StreamOutputView {
 /// Rows `line` wraps to; matches what [`render_rows`] draws.
 pub(crate) fn wrapped_row_count(line: &str, width: u16) -> u32 {
     let mut wrap = RowWrap::new(width);
-    let mut hidden = 0usize;
-    for (n, (_, ch)) in visible_chars(line).enumerate() {
-        if n < MAX_LINE_CHARS {
-            wrap.place(ch);
-        } else {
-            hidden += 1;
-        }
-    }
-    if hidden > 0 {
-        for ch in hidden_marker(hidden).chars() {
-            wrap.place(ch);
-        }
+    for (_, ch) in visible_chars(line) {
+        wrap.place(ch);
     }
     wrap.row + 1
-}
-
-/// Logical lines longer than this many visible characters are cut short
-/// with a marker: wrapping them whole every frame is slow, and a screenful
-/// of one line is unreadable anyway.
-const MAX_LINE_CHARS: usize = 100_000;
-
-fn hidden_marker(hidden: usize) -> String {
-    format!(" … [{hidden} more characters]")
 }
 
 /// One wrapping rule for measuring and drawing: a character that does not
@@ -446,25 +426,14 @@ fn visible_chars(line: &str) -> impl Iterator<Item = (usize, char)> + '_ {
 /// Draw rows `rows` of one logical line. Plain text skips ANSI parsing,
 /// and only the requested rows are built.
 pub(crate) fn render_rows(line: &str, width: u16, rows: Range<u32>, out: &mut Vec<Line<'static>>) {
-    let mut visible = visible_chars(line);
-    let (shown, hidden) = match visible.nth(MAX_LINE_CHARS) {
-        Some((cut, _)) => (&line[..cut], 1 + visible.count()),
-        None => (line, 0),
-    };
-    let mut spans: Vec<Span<'_>> = if shown.contains('\u{1b}') {
-        match shown.into_text() {
+    let spans: Vec<Span<'_>> = if line.contains('\u{1b}') {
+        match line.into_text() {
             Ok(text) => text.lines.into_iter().flat_map(|line| line.spans).collect(),
-            Err(_) => vec![Span::raw(shown)],
+            Err(_) => vec![Span::raw(line)],
         }
     } else {
-        vec![Span::raw(shown)]
+        vec![Span::raw(line)]
     };
-    if hidden > 0 {
-        spans.push(Span::styled(
-            hidden_marker(hidden),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
     let mut wrap = RowWrap::new(width);
     let mut built: Vec<Vec<Span<'static>>> = Vec::new();
     'spans: for span in &spans {
@@ -522,7 +491,7 @@ mod tests {
 
     #[test]
     fn measured_rows_match_drawn_rows() {
-        let long = "z".repeat(MAX_LINE_CHARS + 25);
+        let long = "z".repeat(150_000);
         let lines = [
             "",
             "plain text that wraps across a few rows",
@@ -547,6 +516,7 @@ mod tests {
                 );
             }
         }
+        // Nothing is cut: the last row holds the line's last characters.
         let mut last = Vec::new();
         render_rows(
             &long,
@@ -554,7 +524,7 @@ mod tests {
             wrapped_row_count(&long, 80) - 1..u32::MAX,
             &mut last,
         );
-        assert!(text_of(&last)[0].contains("[25 more characters]"));
+        assert_eq!(text_of(&last), ["z".repeat(150_000 % 80)]);
     }
 
     /// Growing, rewriting and truncating keeps the index equal to a fresh one.

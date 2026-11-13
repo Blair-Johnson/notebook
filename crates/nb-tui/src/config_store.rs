@@ -63,7 +63,7 @@ impl Default for CoreSettings {
             use_jedi: false,
             complete_on_dot: true,
             signature_help: true,
-            max_stream_lines: 10_000,
+            max_stream_lines: 0,
             autosave_secs: 30,
         }
     }
@@ -398,7 +398,7 @@ fn build_snapshot(
         use_jedi: setting_bool(&values, "kernel.use_jedi", false),
         complete_on_dot: setting_bool(&values, "kernel.complete_on_dot", true),
         signature_help: setting_bool(&values, "kernel.signature_help", true),
-        max_stream_lines: setting_int(&values, "kernel.max_stream_lines", 10_000).max(0) as usize,
+        max_stream_lines: setting_int(&values, "kernel.max_stream_lines", 0).max(0) as usize,
         autosave_secs: setting_int(&values, "kernel.autosave_secs", 30).max(0) as u64,
     };
     ConfigSnapshot {

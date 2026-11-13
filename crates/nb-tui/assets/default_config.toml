@@ -25,5 +25,6 @@ default_kernel = "python3"
 use_jedi = false
 complete_on_dot = true
 signature_help = true
-max_stream_lines = 10000
+# 0 keeps every line of output.
+max_stream_lines = 0
 autosave_secs = 30

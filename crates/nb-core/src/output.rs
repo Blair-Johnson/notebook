@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const DEFAULT_MAX_STREAM_LINES: usize = 10_000;
-pub const DEFAULT_MAX_STREAM_BYTES: usize = 8 << 20;
+/// 0: keep every line. Output is never dropped unless a cap is configured.
+pub const DEFAULT_MAX_STREAM_LINES: usize = 0;
 pub const TRUNCATION_MARKER: &str = "[... output truncated ...]\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ struct Tail {
 }
 
 fn default_max_bytes() -> usize {
-    DEFAULT_MAX_STREAM_BYTES
+    usize::MAX
 }
 
 impl PartialEq for StreamBuffer {
@@ -70,18 +70,21 @@ impl Default for StreamBuffer {
 }
 
 impl StreamBuffer {
+    /// Keep at most `max_lines` lines (0: all of them).
     pub fn with_cap(max_lines: usize) -> Self {
-        Self::with_caps(max_lines, DEFAULT_MAX_STREAM_BYTES)
+        Self::with_caps(max_lines, 0)
     }
 
-    /// Keep at most `max_lines` lines and roughly `max_bytes` bytes; the
-    /// oldest whole lines go first, and the last line is never dropped.
+    /// Keep at most `max_lines` lines and roughly `max_bytes` bytes (0: no
+    /// limit); the oldest whole lines go first, and the last line is never
+    /// dropped.
     pub fn with_caps(max_lines: usize, max_bytes: usize) -> Self {
+        let unlimited_if_zero = |cap: usize| if cap == 0 { usize::MAX } else { cap };
         Self {
             text: String::new(),
-            max_lines: max_lines.max(1),
+            max_lines: unlimited_if_zero(max_lines),
             truncated_lines: 0,
-            max_bytes: max_bytes.max(1),
+            max_bytes: unlimited_if_zero(max_bytes),
             revision: 0,
             tail: None,
         }
