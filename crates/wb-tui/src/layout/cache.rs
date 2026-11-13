@@ -1,9 +1,16 @@
 //! `CellId`-keyed layout cache with 64 MiB LRU eviction, idle resize warming, and per-line syntax cache.
 
+use crate::builtins::markdown::render_markdown_cell;
 use crate::layout::fenwick::FenwickTree;
-use ratatui::text::Line;
-use std::collections::{HashMap, VecDeque};
-use wb_core::{CellId, CellRevisions, Document, OutputId};
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
+use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
+use unicode_width::UnicodeWidthChar;
+use wb_core::{Cell, CellId, CellKind, CellRevisions, Document, OutputId};
 use wb_sdk::{OutputView, Theme};
 
 pub const RENDER_CACHE_BUDGET_BYTES: usize = 64 << 20;
@@ -23,15 +30,35 @@ pub struct CachedCellLayout {
     pub total_rows: u32,
     pub last_seen_frame: u64,
     pub approx_bytes: usize,
+    pub source_line_map: Vec<usize>,
 }
 
-#[derive(Default)]
 pub struct LayoutCache {
     cells: HashMap<CellId, CachedCellLayout>,
+    order: Vec<CellId>,
     heights: FenwickTree,
     idle_warm_queue: VecDeque<CellId>,
     frame_counter: u64,
     last_width: u16,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+    line_highlights: HashMap<(CellId, u64, usize, u64), Line<'static>>,
+}
+
+impl Default for LayoutCache {
+    fn default() -> Self {
+        Self {
+            cells: HashMap::new(),
+            order: Vec::new(),
+            heights: FenwickTree::default(),
+            idle_warm_queue: VecDeque::new(),
+            frame_counter: 0,
+            last_width: 0,
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
+            line_highlights: HashMap::new(),
+        }
+    }
 }
 
 impl LayoutCache {
@@ -43,33 +70,346 @@ impl LayoutCache {
         self.last_width
     }
 
+    pub fn cached(&self, cell_id: &CellId) -> Option<&CachedCellLayout> {
+        self.cells.get(cell_id)
+    }
+
+    pub fn cached_len(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn approx_bytes(&self) -> usize {
+        self.cells.values().map(|cell| cell.approx_bytes).sum()
+    }
+
+    pub fn idle_queue_len(&self) -> usize {
+        self.idle_warm_queue.len()
+    }
+
+    fn output_revision(cell: &Cell, output_views: &HashMap<OutputId, Box<dyn OutputView>>) -> u64 {
+        cell.outputs.iter().fold(0u64, |revision, output| {
+            let view_revision = output_views
+                .get(&output.id)
+                .map_or(0, |view| view.view_revision());
+            revision
+                .wrapping_mul(1_000_003)
+                .wrapping_add(output.rev)
+                .wrapping_add(view_revision)
+        })
+    }
+
+    fn estimate_height(cell: &Cell, max_output_rows: u16) -> u32 {
+        if cell.collapsed {
+            return 2;
+        }
+        let source_rows = cell.buffer.line_count() as u32;
+        let output_rows = cell
+            .outputs
+            .iter()
+            .map(|_| u32::from(max_output_rows.max(1)))
+            .sum::<u32>();
+        1u32.saturating_add(source_rows).saturating_add(output_rows)
+    }
+
+    fn ensure_tree(&mut self, doc: &Document, max_output_rows: u16) {
+        if self.heights.len() == doc.order().len() && self.order == doc.order() {
+            return;
+        }
+        self.order = doc.order().to_vec();
+        self.heights = FenwickTree::with_len(doc.order().len());
+        for (index, cell_id) in doc.order().iter().enumerate() {
+            let height = self.cells.get(cell_id).map_or_else(
+                || {
+                    doc.cell(cell_id)
+                        .map_or(1, |cell| Self::estimate_height(cell, max_output_rows))
+                },
+                |cell| cell.total_rows,
+            );
+            self.heights.set(index, height.max(1));
+        }
+    }
+
+    fn visible_indices(
+        &self,
+        doc: &Document,
+        scroll_row: u32,
+        viewport_height: u16,
+    ) -> HashSet<usize> {
+        let mut visible = HashSet::new();
+        let Some((mut index, _)) = self.heights.find_row(scroll_row) else {
+            return visible;
+        };
+        let end_row = scroll_row.saturating_add(u32::from(viewport_height.max(1)));
+        while index < doc.order().len() {
+            let start = self.heights.prefix_sum(index);
+            if start >= end_row && !visible.is_empty() {
+                break;
+            }
+            visible.insert(index);
+            index += 1;
+        }
+        visible
+    }
+
+    fn measure_cell(
+        &mut self,
+        doc: &Document,
+        cell_id: &CellId,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        width: u16,
+        max_output_rows: u16,
+        theme: &Theme,
+    ) -> Option<u32> {
+        let cell = doc.cell(cell_id)?;
+        let output_views_rev = Self::output_revision(cell, output_views);
+        let key = CellLayoutKey {
+            revs: cell.revs,
+            output_views_rev,
+            width,
+            theme_rev: theme.revision,
+        };
+        if let Some(cached) = self.cells.get_mut(cell_id) {
+            if cached.key == key {
+                cached.last_seen_frame = self.frame_counter;
+                return Some(cached.total_rows);
+            }
+        }
+
+        let (wrapped_source, source_line_map) = self.render_source(cell, width, theme);
+        let mut total_rows = 1u32;
+        if cell.collapsed {
+            total_rows = total_rows.saturating_add(1);
+        } else {
+            total_rows = total_rows.saturating_add(wrapped_source.len() as u32);
+            for output in &cell.outputs {
+                if let Some(view) = output_views.get_mut(&output.id) {
+                    let metrics = view.measure(
+                        output,
+                        width.saturating_sub(4).max(1),
+                        theme,
+                        Some(max_output_rows),
+                    );
+                    total_rows = total_rows.saturating_add(metrics.shown_rows.max(1));
+                } else {
+                    total_rows = total_rows.saturating_add(1);
+                }
+            }
+        }
+        let approx_bytes = size_of::<CachedCellLayout>()
+            + wrapped_source
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.len() + size_of::<Span<'static>>())
+                .sum::<usize>();
+        self.cells.insert(
+            cell_id.clone(),
+            CachedCellLayout {
+                key,
+                wrapped_source,
+                total_rows: total_rows.max(1),
+                last_seen_frame: self.frame_counter,
+                approx_bytes,
+                source_line_map,
+            },
+        );
+        Some(total_rows.max(1))
+    }
+
+    fn render_source(
+        &mut self,
+        cell: &Cell,
+        width: u16,
+        theme: &Theme,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
+        if cell.kind == CellKind::Markdown {
+            let rendered = render_markdown_cell(cell.buffer.as_str(), width, theme);
+            return (rendered.lines, rendered.source_line_map);
+        }
+        let mut lines = Vec::new();
+        let mut source_map = Vec::new();
+        let source_lines: Vec<&str> = cell.buffer.as_str().lines().collect();
+        for (index, source_line) in source_lines.iter().enumerate() {
+            let rendered = if cell.kind == CellKind::Code {
+                self.highlight_code_line(cell, index, source_line, theme)
+            } else {
+                Line::from((*source_line).to_string())
+            };
+            for line in wrap_line(rendered, width.max(1)) {
+                lines.push(line);
+                source_map.push(index);
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::default());
+            source_map.push(0);
+        }
+        (lines, source_map)
+    }
+
+    fn highlight_code_line(
+        &mut self,
+        cell: &Cell,
+        index: usize,
+        source: &str,
+        theme: &Theme,
+    ) -> Line<'static> {
+        let cache_key = (cell.id.clone(), cell.revs.source_rev, index, theme.revision);
+        if let Some(line) = self.line_highlights.get(&cache_key) {
+            return line.clone();
+        }
+        let syntax = self
+            .syntax_set
+            .find_syntax_by_extension("py")
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+        let syntax_theme = self
+            .theme_set
+            .themes
+            .get(&theme.syntect_theme)
+            .or_else(|| self.theme_set.themes.get("base16-ocean.dark"))
+            .or_else(|| self.theme_set.themes.values().next());
+        let line = if let Some(syntax_theme) = syntax_theme {
+            let mut highlighter = HighlightLines::new(syntax, syntax_theme);
+            let source_with_newline = format!("{source}\n");
+            let regions = highlighter
+                .highlight_line(&source_with_newline, &self.syntax_set)
+                .unwrap_or_default();
+            Line::from(
+                regions
+                    .into_iter()
+                    .map(|(style, text)| {
+                        Span::styled(
+                            text.trim_end_matches(['\r', '\n']).to_string(),
+                            Style::default().fg(Color::Rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            )),
+                        )
+                    })
+                    .filter(|span| !span.content.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Line::from(source.to_string())
+        };
+        self.line_highlights.insert(cache_key, line.clone());
+        line
+    }
+
     /// Synchronize visible cells immediately for `width` and enqueue off-screen cells
     /// into `idle_warm_queue` on terminal resize so frame times stay well below 16 ms.
     pub fn sync_viewport(
         &mut self,
-        _doc: &Document,
-        _output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
-        _width: u16,
-        _scroll_row: u32,
-        _viewport_height: u16,
-        _max_output_rows: u16,
-        _theme: &Theme,
+        doc: &Document,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        width: u16,
+        scroll_row: u32,
+        viewport_height: u16,
+        max_output_rows: u16,
+        theme: &Theme,
     ) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
-        todo!("wb-tui::layout::cache: measure visible cells, update FenwickTree, evict beyond 64 MiB")
+        self.ensure_tree(doc, max_output_rows);
+        let width = width.max(1);
+        let resized = self.last_width != 0 && self.last_width != width;
+        let visible = self.visible_indices(doc, scroll_row, viewport_height);
+        for index in &visible {
+            if let Some(cell_id) = doc.order().get(*index) {
+                if let Some(height) =
+                    self.measure_cell(doc, cell_id, output_views, width, max_output_rows, theme)
+                {
+                    self.heights.set(*index, height);
+                }
+            }
+        }
+        if self.last_width == 0 || resized {
+            self.idle_warm_queue.clear();
+            for (index, cell_id) in doc.order().iter().enumerate() {
+                if !visible.contains(&index) && !self.idle_warm_queue.contains(cell_id) {
+                    self.idle_warm_queue.push_back(cell_id.clone());
+                }
+            }
+        }
+        self.last_width = width;
+        let visible_ids = visible
+            .iter()
+            .filter_map(|index| doc.order().get(*index).cloned())
+            .collect::<HashSet<_>>();
+        self.evict(&visible_ids);
+    }
+
+    fn evict(&mut self, visible: &HashSet<CellId>) {
+        while self.approx_bytes() > RENDER_CACHE_BUDGET_BYTES {
+            let Some(cell_id) = self
+                .cells
+                .iter()
+                .filter(|(cell_id, _)| !visible.contains(*cell_id))
+                .min_by_key(|(_, cell)| cell.last_seen_frame)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.cells.remove(&cell_id);
+        }
     }
 
     /// Measure up to `max_cells` off-screen cells during idle ticks after a terminal resize.
     pub fn warm_idle_chunk(
         &mut self,
-        _doc: &Document,
-        _output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
-        _max_cells: usize,
-        _max_output_rows: u16,
-        _theme: &Theme,
+        doc: &Document,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        max_cells: usize,
+        max_output_rows: u16,
+        theme: &Theme,
     ) -> bool {
-        let _ = &self.cells;
-        let _ = &self.idle_warm_queue;
-        todo!("wb-tui::layout::cache: drain up to max_cells from idle_warm_queue")
+        let width = self.last_width.max(1);
+        let mut measured = 0usize;
+        while measured < max_cells {
+            let Some(cell_id) = self.idle_warm_queue.pop_front() else {
+                break;
+            };
+            if let Some(index) = doc.position_of(&cell_id) {
+                if let Some(height) =
+                    self.measure_cell(doc, &cell_id, output_views, width, max_output_rows, theme)
+                {
+                    self.heights.set(index, height);
+                }
+            }
+            measured += 1;
+        }
+        self.evict(&HashSet::new());
+        !self.idle_warm_queue.is_empty()
     }
+}
+
+fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut output = Vec::new();
+    let mut current = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cw > 0 && used > 0 && used + cw > width {
+                output.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+            }
+            if let Some(last) = current.last_mut() {
+                if last.style == span.style {
+                    last.content.to_mut().push(ch);
+                } else {
+                    current.push(Span::styled(ch.to_string(), span.style));
+                }
+            } else {
+                current.push(Span::styled(ch.to_string(), span.style));
+            }
+            used = used.saturating_add(cw);
+        }
+    }
+    if current.is_empty() && output.is_empty() {
+        output.push(Line::default());
+    } else {
+        output.push(Line::from(current));
+    }
+    output
 }
