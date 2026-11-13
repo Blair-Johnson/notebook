@@ -161,6 +161,7 @@ pub struct Coordinator {
     autosaved_stamp: Option<u64>,
     /// The periodic autosave's write and fsync, off the UI thread.
     autosave_write: Option<std::thread::JoinHandle<bool>>,
+    disk_watch: MtimeWatch,
 }
 
 impl Coordinator {
@@ -193,6 +194,7 @@ impl Coordinator {
         } else {
             settings
         };
+        let disk_watch = MtimeWatch::spawn(path.clone());
         let mut coordinator = Self {
             path,
             document,
@@ -249,6 +251,7 @@ impl Coordinator {
             last_autosave: None,
             autosaved_stamp: None,
             autosave_write: None,
+            disk_watch,
         };
         coordinator.sync_settings();
         coordinator.observed_file_mtime = coordinator.path.as_deref().and_then(file_mtime);
@@ -994,7 +997,7 @@ impl Coordinator {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             changed = true;
         }
-        changed |= self.check_external_disk_change();
+        changed |= self.check_external_disk_change(false);
         if self.settings.save_if_due().is_err() {
             self.notice = Some("could not save settings".into());
             changed = true;
@@ -1025,7 +1028,7 @@ impl Coordinator {
                 self.last_autosave = Some(Instant::now());
             }
         }
-        self.check_external_disk_change();
+        self.check_external_disk_change(false);
     }
 
     /// Changes whenever any cell's source or outputs change, or cells are
@@ -1079,7 +1082,7 @@ impl Coordinator {
         if self.settings.poll_external_reload(&self.registry) {
             self.sync_settings();
         }
-        self.check_external_disk_change();
+        self.check_external_disk_change(true);
     }
 
     pub fn on_signal(&mut self, _signal_name: &str) {
@@ -3505,11 +3508,19 @@ impl Coordinator {
         }
     }
 
-    fn check_external_disk_change(&mut self) -> bool {
+    /// Offer a reload when the notebook changed on disk. `stat_now` checks
+    /// the file directly; otherwise the background watch's last look is used,
+    /// so the periodic checks never block on the file system.
+    fn check_external_disk_change(&mut self, stat_now: bool) -> bool {
         let Some(path) = self.path.clone() else {
             return false;
         };
-        let Some(mtime) = file_mtime(&path) else {
+        let mtime = if stat_now {
+            file_mtime(&path)
+        } else {
+            self.disk_watch.latest(&path)
+        };
+        let Some(mtime) = mtime else {
             return false;
         };
         if self.observed_file_mtime.is_some_and(|old| mtime <= old) {
@@ -3675,11 +3686,7 @@ fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
     OutputItem::new(data, late)
 }
 
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-}
+use crate::platform::mtime_watch::{MtimeWatch, mtime_of as file_mtime};
 
 /// Commands that mean the same thing whichever layer has focus.
 fn is_global_command(id: &str) -> bool {
