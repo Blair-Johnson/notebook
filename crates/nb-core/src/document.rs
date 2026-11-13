@@ -207,10 +207,21 @@ impl Document {
             self.append_session_log(item);
             return;
         };
+        // Index just this output; a full rebuild would visit every output
+        // of every cell for each display() call.
+        if let OutputData::Rich {
+            display_id: Some(display_id),
+            ..
+        } = &item.data
+        {
+            self.display_index
+                .entry(display_id.clone())
+                .or_default()
+                .push((cell_id.clone(), item.id));
+        }
         cell.outputs.push(item);
         cell.bump_output();
         self.dirty_outputs = true;
-        self.rebuild_display_index();
     }
 
     pub fn append_session_log(&mut self, item: OutputItem) {

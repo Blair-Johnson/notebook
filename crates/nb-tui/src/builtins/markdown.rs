@@ -7,6 +7,7 @@ use ratatui::{
 use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
+use std::sync::OnceLock;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use nb_sdk::Theme;
 
@@ -563,8 +564,12 @@ fn render_fenced_code(
     width: usize,
     theme: &Theme,
 ) -> Vec<(Line<'static>, usize)> {
-    let syntax_set = SyntaxSet::load_defaults_newlines();
-    let theme_set = ThemeSet::load_defaults();
+    // Loading syntect's bundled sets takes milliseconds: once per process,
+    // not once per fenced block per render.
+    static SETS: OnceLock<(SyntaxSet, ThemeSet)> = OnceLock::new();
+    let (syntax_set, theme_set) = SETS.get_or_init(|| {
+        (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults())
+    });
     let syntax = syntax_set
         .find_syntax_by_token(language)
         .or_else(|| syntax_set.find_syntax_by_extension(language))
@@ -589,7 +594,7 @@ fn render_fenced_code(
     let mut output = Vec::new();
     for (index, line) in LinesWithEndings::from(code).enumerate() {
         let regions = highlighter
-            .highlight_line(line, &syntax_set)
+            .highlight_line(line, syntax_set)
             .unwrap_or_default();
         let spans = regions
             .into_iter()
