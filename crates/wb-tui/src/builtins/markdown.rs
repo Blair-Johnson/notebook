@@ -184,10 +184,9 @@ fn render_markdown_line(
     tag(wrap_words(parse_inline(line, theme), width, 0))
 }
 
+/// Inline `code`: colored text only, no background chip.
 fn code_span_style(theme: &Theme) -> Style {
-    Style::default()
-        .fg(theme.palette.accent_code)
-        .bg(theme.palette.surface)
+    Style::default().fg(theme.palette.accent_code)
 }
 
 /// Inline Markdown: `code`, **bold**, *italic*, _italic_, [links](url).
