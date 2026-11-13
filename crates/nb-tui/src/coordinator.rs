@@ -632,7 +632,12 @@ impl Coordinator {
             return Effect::None;
         };
         if matches!(normalized, Key::Esc) && matches!(self.focus.top(), FocusLayer::PdbInput) {
-            self.pop_pdb();
+            // The kernel keeps waiting for an answer: leave the prompt on
+            // screen, unfocused, rather than lose it (and every later run).
+            self.focus.pop();
+            self.term_effects.set_cursor_shape(CursorShape::SteadyBlock);
+            self.notice =
+                Some("the kernel is waiting for input: Enter answers, Ctrl-C interrupts".into());
             return Effect::None;
         }
         let context = self.focus.top().key_context();
@@ -918,7 +923,7 @@ impl Coordinator {
                     }
                 }
                 self.kernel_busy = self.active_runs() > 0;
-                if matches!(self.focus.top(), FocusLayer::PdbInput) {
+                if self.overlays.pdb_dock.is_some() {
                     self.pop_pdb();
                 }
             }
@@ -958,6 +963,9 @@ impl Coordinator {
                     if matches!(state, RunState::Running | RunState::Queued) {
                         *state = RunState::Failed;
                     }
+                }
+                if self.overlays.pdb_dock.is_some() {
+                    self.pop_pdb();
                 }
                 self.notice = Some(format!("kernel died: {exit_status}"));
                 for line in stderr_tail {
@@ -1697,7 +1705,13 @@ impl Coordinator {
                 Effect::None
             }
             "cell.run" => {
-                self.run_selected();
+                if self.overlays.pdb_dock.is_some() {
+                    // Nothing runs until the pending input is answered.
+                    self.focus.push(FocusLayer::PdbInput);
+                    self.term_effects.set_cursor_shape(CursorShape::SteadyBar);
+                } else {
+                    self.run_selected();
+                }
                 Effect::None
             }
             // Space: on an output, cycle preview → full → hidden; on a
