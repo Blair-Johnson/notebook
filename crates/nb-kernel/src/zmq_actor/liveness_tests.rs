@@ -25,8 +25,12 @@ fn fast() -> Liveness {
         heartbeat_timeout: Duration::from_millis(500),
         heartbeat_misses: 2,
         shutdown_grace: Duration::from_millis(300),
+        quit_grace: Duration::from_millis(300),
     }
 }
+
+/// The subshell a `WireKernel` with subshells hands out.
+const SUBSHELL_ID: &str = "wire-subshell";
 
 fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("nb-kernel-{label}-{}", uuid::Uuid::new_v4()));
@@ -40,21 +44,62 @@ fn message(msg_type: &str, content: Value, parent: Option<&JupyterMessage>) -> J
     JupyterMessage::new(content, parent)
 }
 
-fn kernel_info_reply(parent: &JupyterMessage) -> JupyterMessage {
-    message(
-        "kernel_info_reply",
-        json!({
+fn kernel_info_reply(parent: &JupyterMessage, subshells: bool) -> JupyterMessage {
+    // Like ipykernel 7, report features in the content. The typed reply would drop
+    // them, so this is sent untyped.
+    let features = if subshells {
+        json!(["kernel subshells"])
+    } else {
+        json!([])
+    };
+    let reply = UnknownMessage {
+        msg_type: "kernel_info_reply".to_owned(),
+        content: json!({
             "status": "ok",
-            "protocol_version": "5.3",
+            "protocol_version": "5.5",
             "implementation": "wire",
             "implementation_version": "0",
             "language_info": {"name": "python", "version": "3"},
             "banner": "",
             "help_links": [],
             "debugger": false,
+            "supported_features": features,
         }),
-        Some(parent),
+    };
+    JupyterMessage::new(reply, Some(parent))
+}
+
+/// Parse a signed shell request, keeping the JEP 91 `subshell_id` that the typed
+/// header drops. `None` when the signature or framing is invalid.
+fn parse_request(
+    frames: ZmqMessage,
+    key: &Option<ring::hmac::Key>,
+) -> Option<(JupyterMessage, Option<String>)> {
+    let raw = RawMessage::from_multipart(frames, key).ok()?;
+    let [header, parent, metadata, content, ..] = raw.jparts.as_slice() else {
+        return None;
+    };
+    let header: Value = serde_json::from_slice(header).ok()?;
+    let subshell_id = header
+        .get("subshell_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let header: jupyter_protocol::messaging::Header = serde_json::from_value(header).ok()?;
+    let content = JupyterMessageContent::from_type_and_content(
+        &header.msg_type,
+        serde_json::from_slice(content).ok()?,
     )
+    .ok()?;
+    let message = JupyterMessage {
+        zmq_identities: raw.zmq_identities,
+        header,
+        parent_header: serde_json::from_slice(parent).ok(),
+        metadata: serde_json::from_slice(metadata).ok()?,
+        content,
+        buffers: Vec::new(),
+        channel: None,
+    };
+    Some((message, subshell_id))
 }
 
 fn execute_reply(parent: &JupyterMessage) -> JupyterMessage {
@@ -116,10 +161,12 @@ where
 }
 
 /// An in-process kernel that answers `kernel_info_request` and heartbeats by
-/// itself and hands every other shell and control request to the test.
+/// itself and hands every other shell and control request to the test. With
+/// subshells it also answers `create_subshell_request` with [`SUBSHELL_ID`].
 struct WireKernel {
     info: ConnectionInfo,
-    shell_requests: mpsc::UnboundedReceiver<JupyterMessage>,
+    /// Shell requests and the subshell their header addresses.
+    shell_requests: mpsc::UnboundedReceiver<(JupyterMessage, Option<String>)>,
     control_requests: mpsc::UnboundedReceiver<JupyterMessage>,
     shell_replies: mpsc::UnboundedSender<JupyterMessage>,
     /// Messages to publish, and whether to sign them.
@@ -130,12 +177,16 @@ struct WireKernel {
 
 impl WireKernel {
     async fn ephemeral() -> Self {
+        Self::ephemeral_with(false).await
+    }
+
+    async fn ephemeral_with(subshells: bool) -> Self {
         let (ports, listeners) =
             jupyter_zmq_client::peek_ports_with_listeners(IpAddr::V4(Ipv4Addr::LOCALHOST), 5)
                 .await
                 .expect("allocate ports");
         drop(listeners);
-        Self::start(ConnectionInfo {
+        let info = ConnectionInfo {
             ip: Ipv4Addr::LOCALHOST.to_string(),
             transport: Transport::TCP,
             shell_port: ports[0],
@@ -146,11 +197,15 @@ impl WireKernel {
             key: uuid::Uuid::new_v4().to_string(),
             signature_scheme: "hmac-sha256".to_owned(),
             kernel_name: Some("wire".to_owned()),
-        })
-        .await
+        };
+        Self::start_with(info, subshells).await
     }
 
     async fn start(info: ConnectionInfo) -> Self {
+        Self::start_with(info, false).await
+    }
+
+    async fn start_with(info: ConnectionInfo, subshells: bool) -> Self {
         let session = uuid::Uuid::new_v4().to_string();
         let mut heartbeat =
             bind(|| jupyter_zmq_client::create_kernel_heartbeat_connection(&info)).await;
@@ -169,10 +224,14 @@ impl WireKernel {
         let (requests_tx, shell_requests) = mpsc::unbounded_channel();
         let kernel_info_tx = shell_replies.clone();
         tasks.push(tokio::spawn(async move {
-            while let Ok(request) = shell_in.read().await {
+            while let Ok(frames) = shell_in.socket.recv().await {
+                // A request that fails the signature check never reaches the test.
+                let Some((request, subshell_id)) = parse_request(frames, &shell_in.mac) else {
+                    continue;
+                };
                 if matches!(request.content, JupyterMessageContent::KernelInfoRequest(_)) {
-                    let _ = kernel_info_tx.send(kernel_info_reply(&request));
-                } else if requests_tx.send(request).is_err() {
+                    let _ = kernel_info_tx.send(kernel_info_reply(&request, subshells));
+                } else if requests_tx.send((request, subshell_id)).is_err() {
                     break;
                 }
             }
@@ -189,7 +248,15 @@ impl WireKernel {
         tasks.push(tokio::spawn(async move {
             let _stdin = stdin;
             while let Ok(request) = control.read().await {
-                if control_tx.send(request).is_err() {
+                if subshells && request.header.msg_type == "create_subshell_request" {
+                    let reply = UnknownMessage {
+                        msg_type: "create_subshell_reply".to_owned(),
+                        content: json!({"status": "ok", "subshell_id": SUBSHELL_ID}),
+                    };
+                    let _ = control
+                        .send(JupyterMessage::new(reply, Some(&request)))
+                        .await;
+                } else if control_tx.send(request).is_err() {
                     break;
                 }
             }
@@ -227,6 +294,11 @@ impl WireKernel {
     }
 
     async fn next_shell(&mut self) -> JupyterMessage {
+        self.next_shell_routed().await.0
+    }
+
+    /// The next shell request and the subshell its header addresses.
+    async fn next_shell_routed(&mut self) -> (JupyterMessage, Option<String>) {
         tokio::time::timeout(WAIT, self.shell_requests.recv())
             .await
             .expect("timed out waiting for a shell request")
@@ -480,8 +552,12 @@ async fn queued_queries_coalesce_and_replaced_ones_are_answered_empty() {
     let mut kernel = WireKernel::ephemeral().await;
     let mut session = Session::attach(&kernel.info);
     session.ready().await;
-    session.send(execute("busy"));
-    let busy = kernel.next_shell().await;
+    session.send(KernelCmd::Complete {
+        req_id: 9,
+        code: "x".to_owned(),
+        cursor_char_pos: 1,
+    });
+    let first = kernel.next_shell().await;
 
     for (req_id, code) in [(1, "a"), (2, "ab")] {
         session.send(KernelCmd::Complete {
@@ -512,8 +588,11 @@ async fn queued_queries_coalesce_and_replaced_ones_are_answered_empty() {
         Some(KernelEvent::InspectReply { doc: None, .. })
     ));
 
-    kernel.reply(execute_reply(&busy));
-    kernel.publish(idle(&busy));
+    kernel.reply(message(
+        "complete_reply",
+        json!({"status": "ok", "matches": [], "cursor_start": 0, "cursor_end": 1, "metadata": {}}),
+        Some(&first),
+    ));
     let complete = kernel.next_shell().await;
     assert!(matches!(
         &complete.content,
@@ -554,6 +633,159 @@ async fn queued_queries_coalesce_and_replaced_ones_are_answered_empty() {
         events.last(),
         Some(KernelEvent::InspectReply { doc: Some(doc), .. }) if doc == "g doc"
     ));
+}
+
+#[tokio::test]
+async fn without_subshells_a_query_behind_a_cell_is_answered_empty_at_once() {
+    let _shared = SPAWN_LOCK.read().await;
+    let mut kernel = WireKernel::ephemeral().await;
+    let mut session = Session::attach(&kernel.info);
+    assert!(!session.ready().await.supports_subshells);
+    let complete = |req_id, code: &str| KernelCmd::Complete {
+        req_id,
+        code: code.to_owned(),
+        cursor_char_pos: code.len(),
+    };
+
+    // An execute queued behind an in-flight completion.
+    session.send(complete(1, "a"));
+    let first = kernel.next_shell().await;
+    session.send(execute("cell"));
+    session.send(complete(2, "b"));
+    session.send(KernelCmd::Inspect {
+        req_id: 3,
+        code: "f(".to_owned(),
+        cursor_char_pos: 2,
+        detail_level: 0,
+    });
+    let events = session
+        .until("the inspection behind the queued cell", |event| {
+            matches!(event, KernelEvent::InspectReply { req_id: 3, .. })
+        })
+        .await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        KernelEvent::CompleteReply { req_id: 2, items, .. } if items.is_empty()
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(KernelEvent::InspectReply { doc: None, .. })
+    ));
+
+    // An execute in flight. Neither answered query was ever sent.
+    kernel.reply(message(
+        "complete_reply",
+        json!({"status": "ok", "matches": [], "cursor_start": 0, "cursor_end": 1, "metadata": {}}),
+        Some(&first),
+    ));
+    let cell = kernel.next_shell().await;
+    assert_eq!(cell.header.msg_type, "execute_request");
+    session.send(complete(4, "c"));
+    session
+        .until("the completion behind the running cell", |event| {
+            matches!(event, KernelEvent::CompleteReply { req_id: 4, items, .. } if items.is_empty())
+        })
+        .await;
+
+    // An idle lane sends queries to the kernel again.
+    kernel.reply(execute_reply(&cell));
+    kernel.publish(idle(&cell));
+    session
+        .until("the cell to finish", |event| {
+            matches!(event, KernelEvent::ExecutionFinished { .. })
+        })
+        .await;
+    session.send(complete(5, "d"));
+    let request = kernel.next_shell().await;
+    assert!(matches!(
+        &request.content,
+        JupyterMessageContent::CompleteRequest(request) if request.code == "d"
+    ));
+}
+
+#[tokio::test]
+async fn with_subshells_queries_reach_the_subshell_while_a_cell_runs() {
+    let _shared = SPAWN_LOCK.read().await;
+    let mut kernel = WireKernel::ephemeral_with(true).await;
+    let mut session = Session::attach(&kernel.info);
+    assert!(session.ready().await.supports_subshells);
+    session.subscribe(&kernel).await;
+
+    session.send(execute("cell"));
+    let (cell, subshell) = kernel.next_shell_routed().await;
+    assert_eq!(cell.header.msg_type, "execute_request");
+    assert_eq!(subshell, None, "cells run on the main shell");
+
+    session.send(KernelCmd::Complete {
+        req_id: 1,
+        code: "impo".to_owned(),
+        cursor_char_pos: 4,
+    });
+    let (complete, subshell) = kernel.next_shell_routed().await;
+    assert_eq!(complete.header.msg_type, "complete_request");
+    assert_eq!(subshell.as_deref(), Some(SUBSHELL_ID));
+    kernel.reply(message(
+        "complete_reply",
+        json!({"status": "ok", "matches": ["import"], "cursor_start": 0, "cursor_end": 4, "metadata": {}}),
+        Some(&complete),
+    ));
+    let events = session
+        .until("the completion", |event| {
+            matches!(event, KernelEvent::CompleteReply { req_id: 1, .. })
+        })
+        .await;
+    assert!(matches!(
+        events.last(),
+        Some(KernelEvent::CompleteReply { items, .. }) if items[0].replace_text == "import"
+    ));
+
+    // The subshell going idle says nothing about the running cell; the cell's status does.
+    kernel.publish(idle(&complete));
+    kernel.publish(message(
+        "status",
+        json!({"execution_state": "busy"}),
+        Some(&cell),
+    ));
+    let events = session
+        .until("the cell's busy status", |event| {
+            matches!(event, KernelEvent::BusyStateChanged { .. })
+        })
+        .await;
+    assert!(matches!(
+        events.last(),
+        Some(KernelEvent::BusyStateChanged { busy: true })
+    ));
+
+    session.send(KernelCmd::Inspect {
+        req_id: 2,
+        code: "f(".to_owned(),
+        cursor_char_pos: 2,
+        detail_level: 0,
+    });
+    let (inspect, subshell) = kernel.next_shell_routed().await;
+    assert_eq!(inspect.header.msg_type, "inspect_request");
+    assert_eq!(subshell.as_deref(), Some(SUBSHELL_ID));
+
+    // The subshell lane keeps its deadline: an unanswered inspection frees it.
+    session
+        .until("the timed-out inspection", |event| {
+            matches!(
+                event,
+                KernelEvent::InspectReply {
+                    req_id: 2,
+                    doc: None
+                }
+            )
+        })
+        .await;
+    session.send(KernelCmd::Complete {
+        req_id: 3,
+        code: "x".to_owned(),
+        cursor_char_pos: 1,
+    });
+    let (next, subshell) = kernel.next_shell_routed().await;
+    assert_eq!(next.header.msg_type, "complete_request");
+    assert_eq!(subshell.as_deref(), Some(SUBSHELL_ID));
 }
 
 #[tokio::test]

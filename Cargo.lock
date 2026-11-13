@@ -1346,11 +1346,13 @@ dependencies = [
  "jupyter-zmq-client",
  "libc",
  "nb-core",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "zeromq",
 ]
 
 [[package]]

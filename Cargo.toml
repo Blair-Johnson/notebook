@@ -34,6 +34,7 @@ jupyter-zmq-client = { version = "1.0", features = ["tokio-runtime"] }
 libc = "0.2"
 ratatui = "0.30"
 resvg = "0.45"
+ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 syntect = "5.2"
@@ -43,6 +44,7 @@ toml = "0.9"
 toml_edit = "0.23"
 unicode-width = "0.2"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+zeromq = { version = "0.6", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

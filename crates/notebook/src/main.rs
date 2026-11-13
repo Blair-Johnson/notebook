@@ -131,19 +131,22 @@ async fn main() -> Result<()> {
     // PTY that can panic again through ratatui's panic hook.
     std::mem::forget(terminal);
 
+    // Usually the terminal closed mid-draw or mid-read.
+    if !matches!(result, Ok(Ok(()))) {
+        coordinator.emergency_autosave();
+    }
+    // Returning ends the runtime, which would SIGKILL the kernel and leak its
+    // connection file; an attached kernel is only disconnected.
+    coordinator.kernel.shutdown(KERNEL_SHUTDOWN_TIMEOUT).await;
+
     match result {
-        Ok(Err(error)) => {
-            // Usually the terminal closed mid-draw or mid-read.
-            coordinator.emergency_autosave();
-            Err(error)
-        }
-        Ok(ok) => ok,
-        Err(payload) => {
-            coordinator.emergency_autosave();
-            std::panic::resume_unwind(payload)
-        }
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
+
+/// How long quitting waits for the kernel to shut down before giving up on it.
+const KERNEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The kernel runs next to the notebook: its folder, or the current
 /// directory for a bare file name (`nb demo.py`, whose parent is "").

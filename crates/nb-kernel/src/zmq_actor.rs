@@ -1,13 +1,10 @@
 //! ZeroMQ kernel process launcher, socket pumps, JEP 91 subshell setup, and comm channels.
 //!
-//! `jupyter-protocol` 2.0.3 exposes a closed `Header` and
-//! `jupyter-zmq-client` accepts only `JupyterMessage`, so its typed sender cannot
-//! put JEP 91's `subshell_id` in the wire header. We still keep a dedicated
-//! inspection queue/sender and serialize [`SubshellHeader`] in one place. Until
-//! the upstream client exposes a raw-header send path, the inspection id is also
-//! copied into message metadata as a documented compatibility marker; ordinary
-//! kernels ignore that extra metadata and the queue remains correct for kernels
-//! that do not advertise subshells.
+//! `jupyter-protocol` 2.0.3 has a closed `Header` and drops unknown reply fields,
+//! so two JEP 91 details bypass its typed messages: requests for the inspection
+//! subshell are framed and signed here with [`SubshellHeader`] (ipykernel 7 routes
+//! on `header.subshell_id`), and `kernel_info_reply` is read raw because ipykernel
+//! reports `supported_features` in its content.
 
 use crate::client::{KernelClient, KernelError};
 use crate::discovery::{KernelLaunchSpec, ResolvedKernelspec, resolve_kernelspec};
@@ -25,11 +22,13 @@ use jupyter_protocol::messaging::{
     ShutdownRequest, Stdio, UnknownMessage,
 };
 use jupyter_protocol::{ConnectionInfo, Transport};
-use jupyter_zmq_client::RuntimeError;
+use jupyter_zmq_client::{RawMessage, RuntimeError};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio as ProcessStdio};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
@@ -38,12 +37,14 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use zeromq::{SocketRecv, SocketSend, ZmqMessage};
 use nb_core::{CommId, ExecId, MimeBundle, StreamKind};
 
 pub struct LocalZmqKernel {
     cmd_tx: mpsc::UnboundedSender<KernelCmd>,
     event_rx: mpsc::UnboundedReceiver<KernelEvent>,
     connection_file: Option<PathBuf>,
+    supervisor: Option<JoinHandle<()>>,
 }
 
 impl LocalZmqKernel {
@@ -61,7 +62,7 @@ impl LocalZmqKernel {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let supervisor_connection_file = connection_file.clone();
-        tokio::spawn(async move {
+        let supervisor = tokio::spawn(async move {
             supervise(
                 spec,
                 supervisor_connection_file,
@@ -75,6 +76,7 @@ impl LocalZmqKernel {
             cmd_tx,
             event_rx,
             connection_file,
+            supervisor: Some(supervisor),
         }
     }
 }
@@ -105,6 +107,25 @@ impl KernelClient for LocalZmqKernel {
 
     fn connection_file(&self) -> Option<&Path> {
         self.connection_file.as_deref()
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // The supervisor asks an owned kernel to exit, kills it after
+            // `quit_grace`, and removes its connection file; an attached kernel
+            // is only disconnected.
+            let _ = self.cmd_tx.send(KernelCmd::Shutdown {
+                kill_process: false,
+            });
+            if let Some(mut supervisor) = self.supervisor.take()
+                && tokio::time::timeout(timeout, &mut supervisor)
+                    .await
+                    .is_err()
+            {
+                // Dropping its process handle makes the monitor kill the kernel.
+                supervisor.abort();
+            }
+        })
     }
 }
 
@@ -138,6 +159,8 @@ struct Liveness {
     heartbeat_misses: u32,
     /// How long a kernel may take to exit after `shutdown_request` before SIGKILL.
     shutdown_grace: Duration,
+    /// The same, when nb is quitting and should not linger.
+    quit_grace: Duration,
 }
 
 impl Default for Liveness {
@@ -149,6 +172,7 @@ impl Default for Liveness {
             heartbeat_timeout: Duration::from_secs(10),
             heartbeat_misses: 3,
             shutdown_grace: Duration::from_secs(5),
+            quit_grace: Duration::from_millis(1500),
         }
     }
 }
@@ -446,6 +470,7 @@ async fn run_kernel(
     tasks.push(spawn_shell_worker(
         shell,
         Lane::Main,
+        None,
         main_rx,
         internal_tx.clone(),
         liveness.query_deadline,
@@ -455,6 +480,7 @@ async fn run_kernel(
         tasks.push(spawn_shell_worker(
             connection,
             Lane::Inspect,
+            subshell_id.clone(),
             inspect_rx,
             internal_tx.clone(),
             liveness.query_deadline,
@@ -484,8 +510,10 @@ async fn run_kernel(
     let mut router = ExecRouter::default();
     let mut main_queue = VecDeque::new();
     let mut inspect_queue = VecDeque::new();
-    let mut main_inflight = false;
-    let mut inspect_inflight = false;
+    let mut main_inflight = None;
+    let mut inspect_inflight = None;
+    // Requests sent to the subshell; their busy/idle says nothing about the main shell.
+    let mut subshell_requests = HashSet::new();
     let mut pending_input: Option<JupyterMessage> = None;
 
     let outcome = 'session: {
@@ -495,8 +523,11 @@ async fn run_kernel(
 
         loop {
             schedule_shell(&mut main_queue, &main_tx, &mut main_inflight);
-            if subshell_id.is_some() {
-                schedule_shell(&mut inspect_queue, &inspect_tx, &mut inspect_inflight);
+            if subshell_id.is_some()
+                && let Some(msg_id) =
+                    schedule_shell(&mut inspect_queue, &inspect_tx, &mut inspect_inflight)
+            {
+                subshell_requests.insert(msg_id);
             }
 
             tokio::select! {
@@ -504,10 +535,7 @@ async fn run_kernel(
                     let Some(command) = command else { break Outcome::Stop { kill: true } };
                     match command {
                         KernelCmd::Execute { target, lane, code, silent, store_history, stop_on_error } => {
-                            let mut message = execute_message(code, silent, store_history, stop_on_error);
-                            if lane == Lane::Inspect && let Some(id) = subshell_id.as_deref() {
-                                message = decorate_subshell_message(message, id);
-                            }
+                            let message = execute_message(code, silent, store_history, stop_on_error);
                             let exec_id = ExecId(message.header.msg_id.clone());
                             let execution_count = None;
                             router.register(exec_id.clone(), target.clone());
@@ -529,27 +557,32 @@ async fn run_kernel(
                             }
                         }
                         KernelCmd::Complete { req_id, code, cursor_char_pos } => {
-                            enqueue_query(&mut main_queue, ShellRequest {
-                                message: complete_message(code, cursor_char_pos),
-                                kind: ShellKind::Complete,
-                                stop_on_error: false,
-                                request_id: Some(req_id),
-                            }, event_tx);
+                            submit_query(
+                                ShellRequest {
+                                    message: complete_message(code, cursor_char_pos),
+                                    kind: ShellKind::Complete,
+                                    stop_on_error: false,
+                                    request_id: Some(req_id),
+                                },
+                                subshell_id.is_some().then_some(&mut inspect_queue),
+                                &mut main_queue,
+                                main_inflight,
+                                event_tx,
+                            );
                         }
                         KernelCmd::Inspect { req_id, code, cursor_char_pos, detail_level } => {
-                            let mut message = inspect_message(code, cursor_char_pos, detail_level);
-                            let queue = if let Some(id) = subshell_id.as_deref() {
-                                message = decorate_subshell_message(message, id);
-                                &mut inspect_queue
-                            } else {
-                                &mut main_queue
-                            };
-                            enqueue_query(queue, ShellRequest {
-                                message,
-                                kind: ShellKind::Inspect,
-                                stop_on_error: false,
-                                request_id: Some(req_id),
-                            }, event_tx);
+                            submit_query(
+                                ShellRequest {
+                                    message: inspect_message(code, cursor_char_pos, detail_level),
+                                    kind: ShellKind::Inspect,
+                                    stop_on_error: false,
+                                    request_id: Some(req_id),
+                                },
+                                subshell_id.is_some().then_some(&mut inspect_queue),
+                                &mut main_queue,
+                                main_inflight,
+                                event_tx,
+                            );
                         }
                         KernelCmd::ReplyInput { value } => {
                             if let Some(parent) = pending_input.take() {
@@ -632,7 +665,7 @@ async fn run_kernel(
                     let Some(message) = message else { break Outcome::Stop { kill: true } };
                     match message {
                         SupervisorMessage::IoPub(message) => {
-                            if handle_iopub(message, &mut router, event_tx) {
+                            if handle_iopub(message, &mut router, &mut subshell_requests, event_tx) {
                                 send_died(
                                     event_tx,
                                     generation,
@@ -655,12 +688,12 @@ async fn run_kernel(
                         SupervisorMessage::ShellFinished { lane, failed, stop_on_error } => {
                             match lane {
                                 Lane::Main => {
-                                    main_inflight = false;
+                                    main_inflight = None;
                                     if failed && stop_on_error {
                                         cancel_queued_executes(&mut main_queue, &mut router, event_tx);
                                     }
                                 }
-                                Lane::Inspect => inspect_inflight = false,
+                                Lane::Inspect => inspect_inflight = None,
                             }
                         }
                         SupervisorMessage::QueryTimedOut { kind, request_id } => {
@@ -732,7 +765,8 @@ async fn run_kernel(
     drop(tasks);
     if let Some(process) = process.as_mut() {
         let grace = match outcome {
-            Outcome::Stop { kill: false } | Outcome::Restart => liveness.shutdown_grace,
+            Outcome::Restart => liveness.shutdown_grace,
+            Outcome::Stop { kill: false } => liveness.quit_grace,
             Outcome::Stop { kill: true } | Outcome::Dead => Duration::ZERO,
         };
         process.stop(grace).await;
@@ -783,7 +817,7 @@ async fn connect_kernel(
         .send(kernel_info_request)
         .await
         .map_err(|error| format!("kernel_info send: {error}"))?;
-    let (kernel_info, kernel_info_metadata) = match tokio::time::timeout(
+    let (kernel_info, features) = match tokio::time::timeout(
         Duration::from_secs(30),
         read_kernel_info(&mut shell, &kernel_info_id),
     )
@@ -794,7 +828,6 @@ async fn connect_kernel(
         Err(_) => return Err("timed out waiting for kernel_info_reply".to_owned()),
     };
 
-    let features = supported_features(&kernel_info_metadata);
     let supports_debugger = kernel_info.debugger || features.iter().any(|f| f == "debugger");
     let mut subshell_id = None;
     if features.iter().any(|feature| feature == "kernel subshells") {
@@ -1294,9 +1327,12 @@ fn lane_channel(lane: Lane) -> &'static str {
     }
 }
 
+/// Drive one shell lane. With `subshell_id`, every request is addressed to that
+/// JEP 91 subshell, which the kernel serves even while its main shell is busy.
 fn spawn_shell_worker(
     mut connection: jupyter_zmq_client::ClientShellConnection,
     lane: Lane,
+    subshell_id: Option<String>,
     mut requests: mpsc::UnboundedReceiver<ShellRequest>,
     internal_tx: mpsc::UnboundedSender<SupervisorMessage>,
     query_deadline: Duration,
@@ -1308,7 +1344,13 @@ fn spawn_shell_worker(
             let kind = request.kind;
             let stop_on_error = request.stop_on_error;
             let request_id = request.request_id;
-            if let Err(error) = connection.send(request.message).await {
+            let sent = match subshell_id.as_deref() {
+                Some(subshell_id) => {
+                    send_to_subshell(&mut connection, request.message, subshell_id).await
+                }
+                None => connection.send(request.message).await,
+            };
+            if let Err(error) = sent {
                 let _ = internal_tx.send(SupervisorMessage::ChannelFailed {
                     channel,
                     reason: error.to_string(),
@@ -1403,20 +1445,40 @@ fn shell_reply_is_terminal(message: &JupyterMessage, kind: ShellKind) -> bool {
     }
 }
 
+/// Read the `kernel_info_reply` and its supported features. The typed reply drops
+/// `supported_features`, which ipykernel 7 sends in the content (and some kernels
+/// in the metadata), so the frames are parsed here.
 async fn read_kernel_info(
     connection: &mut jupyter_zmq_client::ClientShellConnection,
     request_id: &str,
-) -> Result<(Box<KernelInfoReply>, Value), String> {
+) -> Result<(KernelInfoReply, Vec<String>), String> {
     loop {
-        let message = connection.read().await.map_err(|error| error.to_string())?;
-        if message
-            .parent_header
-            .as_ref()
-            .is_some_and(|parent| parent.msg_id == request_id)
-            && let JupyterMessageContent::KernelInfoReply(reply) = message.content
+        let frames = connection
+            .socket
+            .recv()
+            .await
+            .map_err(|error| error.to_string())?;
+        let raw = RawMessage::from_multipart(frames, &connection.mac)
+            .map_err(|error| error.to_string())?;
+        let [header, parent, metadata, content, ..] = raw.jparts.as_slice() else {
+            continue;
+        };
+        let field = |frame: &[u8], key: &str| {
+            serde_json::from_slice::<Value>(frame)
+                .ok()
+                .and_then(|value| value.get(key)?.as_str().map(str::to_owned))
+        };
+        if field(parent, "msg_id").as_deref() != Some(request_id)
+            || field(header, "msg_type").as_deref() != Some("kernel_info_reply")
         {
-            return Ok((reply, message.metadata));
+            continue;
         }
+        let content: Value = serde_json::from_slice(content).map_err(|error| error.to_string())?;
+        let metadata: Value = serde_json::from_slice(metadata).unwrap_or_default();
+        let mut features = supported_features(&content);
+        features.extend(supported_features(&metadata));
+        let reply = serde_json::from_value(content).map_err(|error| error.to_string())?;
+        return Ok((reply, features));
     }
 }
 
@@ -1451,8 +1513,8 @@ async fn read_subshell_reply(
     }
 }
 
-fn supported_features(metadata: &Value) -> Vec<String> {
-    metadata
+fn supported_features(content_or_metadata: &Value) -> Vec<String> {
+    content_or_metadata
         .get("supported_features")
         .and_then(Value::as_array)
         .into_iter()
@@ -1492,20 +1554,21 @@ fn inspect_message(code: String, cursor_pos: usize, detail_level: u8) -> Jupyter
     .into()
 }
 
+/// Send the next queued request if the lane is free, returning its message id.
 fn schedule_shell(
     queue: &mut VecDeque<ShellRequest>,
     sender: &mpsc::UnboundedSender<ShellRequest>,
-    inflight: &mut bool,
-) {
-    if *inflight {
-        return;
+    inflight: &mut Option<ShellKind>,
+) -> Option<String> {
+    if inflight.is_some() {
+        return None;
     }
-    let Some(request) = queue.pop_front() else {
-        return;
-    };
-    if sender.send(request).is_ok() {
-        *inflight = true;
-    }
+    let request = queue.pop_front()?;
+    let kind = request.kind;
+    let msg_id = request.message.header.msg_id.clone();
+    sender.send(request).ok()?;
+    *inflight = Some(kind);
+    Some(msg_id)
 }
 
 fn cancel_queued_executes(
@@ -1530,6 +1593,30 @@ fn cancel_queued_executes(
         }
     }
     *queue = retained;
+}
+
+/// Route a completion or inspection where it is answered without waiting for a
+/// cell: to the subshell lane when the kernel has one, otherwise to the main lane
+/// unless an execute is running or queued there. Then it would wait for the cell,
+/// so it is answered empty at once instead.
+fn submit_query(
+    request: ShellRequest,
+    subshell_queue: Option<&mut VecDeque<ShellRequest>>,
+    main_queue: &mut VecDeque<ShellRequest>,
+    main_inflight: Option<ShellKind>,
+    event_tx: &mpsc::UnboundedSender<KernelEvent>,
+) {
+    if let Some(queue) = subshell_queue {
+        enqueue_query(queue, request, event_tx);
+    } else if main_inflight == Some(ShellKind::Execute)
+        || main_queue
+            .iter()
+            .any(|queued| queued.kind == ShellKind::Execute)
+    {
+        send_empty_reply(request.kind, request.request_id, event_tx);
+    } else {
+        enqueue_query(main_queue, request, event_tx);
+    }
 }
 
 /// Queue a completion or inspection, keeping at most one of each kind waiting so
@@ -1582,6 +1669,7 @@ fn send_empty_reply(
 fn handle_iopub(
     message: JupyterMessage,
     router: &mut ExecRouter,
+    subshell_requests: &mut HashSet<String>,
     event_tx: &mpsc::UnboundedSender<KernelEvent>,
 ) -> bool {
     let parent = parent_exec_id(&message);
@@ -1672,8 +1760,17 @@ fn handle_iopub(
             if status.execution_state == ExecutionState::Dead {
                 return true;
             }
-            let busy = matches!(status.execution_state, ExecutionState::Busy);
-            let _ = event_tx.send(KernelEvent::BusyStateChanged { busy });
+            let from_subshell = parent.as_ref().is_some_and(|id| {
+                if status.execution_state == ExecutionState::Idle {
+                    subshell_requests.remove(&id.0)
+                } else {
+                    subshell_requests.contains(&id.0)
+                }
+            });
+            if !from_subshell {
+                let busy = matches!(status.execution_state, ExecutionState::Busy);
+                let _ = event_tx.send(KernelEvent::BusyStateChanged { busy });
+            }
             if status.execution_state == ExecutionState::Idle
                 && let Some(exec_id) = parent
                 && let Some((target, ok, elapsed)) = router.mark_iopub_idle(&exec_id)
@@ -1857,25 +1954,62 @@ fn ring_tail(ring: &Arc<Mutex<RingLog>>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn serialize_subshell_header(header: &SubshellHeader) -> serde_json::Result<Value> {
-    serde_json::to_value(header)
+async fn send_to_subshell(
+    connection: &mut jupyter_zmq_client::ClientShellConnection,
+    message: JupyterMessage,
+    subshell_id: &str,
+) -> Result<(), RuntimeError> {
+    let frames = subshell_frames(
+        message,
+        &connection.session_id,
+        subshell_id,
+        connection.mac.as_ref(),
+    )?;
+    connection.socket.send(frames).await?;
+    Ok(())
 }
 
-fn decorate_subshell_message(mut message: JupyterMessage, subshell_id: &str) -> JupyterMessage {
+/// Frame and sign `message` as `Connection::send` does, but with JEP 91's
+/// `subshell_id` in the header, which `jupyter-protocol`'s `Header` cannot carry.
+fn subshell_frames(
+    message: JupyterMessage,
+    session: &str,
+    subshell_id: &str,
+    key: Option<&ring::hmac::Key>,
+) -> Result<ZmqMessage, RuntimeError> {
+    let message = message.with_session(session);
     let header = SubshellHeader {
-        inner: message.header.clone(),
+        inner: message.header,
         subshell_id: Some(subshell_id.to_owned()),
     };
-    if let Ok(Value::Object(serialized)) = serialize_subshell_header(&header)
-        && let Some(id) = serialized.get("subshell_id").cloned()
-    {
-        if let Value::Object(metadata) = &mut message.metadata {
-            metadata.insert("subshell_id".to_owned(), id);
-        } else {
-            message.metadata = serde_json::json!({ "subshell_id": id });
-        }
+    let parts = [
+        serde_json::to_vec(&header)?,
+        match &message.parent_header {
+            Some(parent) => serde_json::to_vec(parent)?,
+            None => b"{}".to_vec(),
+        },
+        serde_json::to_vec(&message.metadata)?,
+        serde_json::to_vec(&message.content)?,
+    ];
+    // The signature covers header, parent header, metadata and content, not buffers.
+    let signature = key
+        .map(|key| {
+            ring::hmac::sign(key, &parts.concat())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let mut frames = ZmqMessage::from(b"<IDS|MSG>".to_vec());
+    frames.push_back(signature.into_bytes().into());
+    for part in parts {
+        frames.push_back(part.into());
     }
-    message
+    for buffer in message.buffers {
+        frames.push_back(buffer);
+    }
+    Ok(frames)
 }
 
 #[allow(unsafe_code)]
@@ -1905,16 +2039,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subshell_header_serializes_the_extension_without_losing_header_fields() {
-        let request: JupyterMessage = KernelInfoRequest::default().into();
+    fn subshell_frames_carry_the_id_in_a_signed_header() {
+        let request = complete_message("impo".to_owned(), 4);
         let original_id = request.header.msg_id.clone();
-        let header = SubshellHeader {
-            inner: request.header,
-            subshell_id: Some("inspect-123".to_owned()),
-        };
-        let value = serialize_subshell_header(&header).expect("serialize header");
-        assert_eq!(value["msg_id"], original_id);
-        assert_eq!(value["subshell_id"], "inspect-123");
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"secret");
+        let frames = subshell_frames(request, "session-1", "inspect-123", Some(&key))
+            .expect("frame message");
+
+        // The upstream reader checks the signature, so these frames pass as signed.
+        let raw = RawMessage::from_multipart(frames, &Some(key)).expect("valid signature");
+        let header: Value = serde_json::from_slice(&raw.jparts[0]).expect("header json");
+        assert_eq!(header["msg_id"], original_id);
+        assert_eq!(header["msg_type"], "complete_request");
+        assert_eq!(header["session"], "session-1");
+        assert_eq!(header["subshell_id"], "inspect-123");
+        assert_eq!(&raw.jparts[1][..], b"{}");
+        let content: Value = serde_json::from_slice(&raw.jparts[3]).expect("content json");
+        assert_eq!(content["code"], "impo");
     }
 
     #[test]
