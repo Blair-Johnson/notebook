@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub const DEFAULT_MAX_STREAM_LINES: usize = 10_000;
+const TRUNCATION_MARKER: &str = "[... output truncated ...]\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum StreamKind {
@@ -16,11 +17,17 @@ pub enum StreamKind {
 }
 
 /// Coalesced terminal stream text supporting `\r` progress-bar overwrites and line caps.
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct StreamBuffer {
     text: String,
     max_lines: usize,
     truncated_lines: usize,
+}
+
+impl Default for StreamBuffer {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_MAX_STREAM_LINES)
+    }
 }
 
 impl StreamBuffer {
@@ -41,8 +48,87 @@ impl StreamBuffer {
     }
 
     /// Append a streamed chunk using terminal `\r` overwrite semantics and line capping.
-    pub fn push_chunk(&mut self, _chunk: &str) {
-        todo!("wb-core::output: coalesce chunk, apply bare '\\r' line overwrites, enforce max_lines")
+    pub fn push_chunk(&mut self, chunk: &str) {
+        let existing = self
+            .text
+            .strip_prefix(TRUNCATION_MARKER)
+            .unwrap_or(&self.text);
+        let mut lines: Vec<Vec<char>> = vec![Vec::new()];
+        let mut cursor = 0usize;
+        for ch in existing.chars() {
+            match ch {
+                '\n' => {
+                    lines.push(Vec::new());
+                    cursor = 0;
+                }
+                '\r' => {
+                    cursor = 0;
+                }
+                ch => {
+                    let line = lines.last_mut().expect("stream always has one line");
+                    if cursor < line.len() {
+                        line[cursor] = ch;
+                    } else {
+                        line.push(ch);
+                    }
+                    cursor += 1;
+                }
+            }
+        }
+
+        let normalized = chunk.replace("\r\n", "\n");
+        let mut pending_overwrite = existing.ends_with('\r');
+        for ch in normalized.chars() {
+            match ch {
+                '\n' => {
+                    lines.push(Vec::new());
+                    cursor = 0;
+                    pending_overwrite = false;
+                }
+                '\r' => {
+                    cursor = 0;
+                    pending_overwrite = true;
+                }
+                ch => {
+                    let line = lines.last_mut().expect("stream always has one line");
+                    if cursor < line.len() {
+                        line[cursor] = ch;
+                    } else {
+                        line.push(ch);
+                    }
+                    cursor += 1;
+                    pending_overwrite = false;
+                }
+            }
+        }
+
+        let mut logical = lines
+            .iter()
+            .map(|line| line.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if pending_overwrite {
+            logical.push('\r');
+        }
+
+        let pending = logical.ends_with('\r');
+        if pending {
+            logical.pop();
+        }
+        let mut logical_lines: Vec<&str> = logical.split('\n').collect();
+        if logical_lines.len() > self.max_lines {
+            let dropped = logical_lines.len() - self.max_lines;
+            self.truncated_lines = self.truncated_lines.saturating_add(dropped);
+            logical_lines.drain(..dropped);
+        }
+        let mut result = logical_lines.join("\n");
+        if self.truncated_lines > 0 {
+            result.insert_str(0, TRUNCATION_MARKER);
+        }
+        if pending {
+            result.push('\r');
+        }
+        self.text = result;
     }
 }
 
