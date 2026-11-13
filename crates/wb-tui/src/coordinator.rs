@@ -7,7 +7,7 @@ use crate::intelligence::{
     CompletionPopup, InspectPager, SignaturePopup, scan_notebook_identifiers,
 };
 use crate::keymap::normalize_crossterm_key;
-use crate::layout::{LayoutCache, text_width};
+use crate::layout::{CardRows, LayoutCache, text_width};
 use crate::overlays::{
     CommandPaletteState, ConfirmAction, OverlayStates, PdbDockState, PromptBar, PromptKind,
     SettingsModalOutcome,
@@ -40,6 +40,9 @@ use wb_sdk::{
     ExtensionRegistry, InputOutcome, Key, KeyContextId, MotionOrObject, MountCtx, OutputHost,
     OutputView, ResolvedInput,
 };
+
+/// How long a status-bar notice stays before the key hints come back.
+const NOTICE_TTL: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]
 pub enum Effect {
@@ -90,6 +93,9 @@ pub struct Coordinator {
     /// draw. Set by keyboard actions; cleared by mouse-wheel scrolling.
     follow_focus: bool,
     pub notice: Option<String>,
+    /// The notice last seen by `on_tick` and when it appeared; notices
+    /// clear themselves after `NOTICE_TTL`.
+    notice_seen: Option<(String, Instant)>,
     pub registry: ExtensionRegistry,
     pub settings: SettingsStore,
     pub output_views: HashMap<OutputId, Box<dyn OutputView>>,
@@ -164,6 +170,7 @@ impl Coordinator {
             spinner_tick: 0,
             follow_focus: true,
             notice: None,
+            notice_seen: None,
             registry,
             settings,
             output_views: HashMap::new(),
@@ -313,7 +320,8 @@ impl Coordinator {
                         .layout_cache
                         .cached(&self.selected_cell)
                         .map_or(1, |cached| cached.wrapped_source.len() as u32);
-                    let outputs_top = top + 1 + source_rows;
+                    let outputs_top =
+                        top + CardRows::from_total(cell_rows, source_rows).outputs_top();
                     let entered = matches!(self.focus.base(), FocusLayer::OutputFocus { .. });
                     let (want_top, want_bottom) = match editing.as_ref() {
                         Some(id) if id == &self.selected_cell => {
@@ -357,7 +365,9 @@ impl Coordinator {
             .layout_cache
             .cached(&out.cell_id)
             .map_or(1, |cached| cached.wrapped_source.len() as u32);
-        let region = heights.height(index).saturating_sub(1 + source_rows).max(1);
+        let region = CardRows::from_total(heights.height(index), source_rows)
+            .outputs
+            .max(1);
         let segments = vim::wrap_segments(out.buffer.as_str(), text_w);
         let cursor_row = vim::segment_of(&segments, out.buffer.cursor()) as u32;
         let max_scroll = (segments.len() as u32).saturating_sub(region);
@@ -811,6 +821,17 @@ impl Coordinator {
 
     pub fn on_tick(&mut self, now: Instant) -> bool {
         let mut changed = self.grammar.expire_chord(now);
+        match (&self.notice, &self.notice_seen) {
+            (Some(notice), Some((seen, at))) if notice == seen => {
+                if now.duration_since(*at) >= NOTICE_TTL {
+                    self.notice = None;
+                    self.notice_seen = None;
+                    changed = true;
+                }
+            }
+            (Some(notice), _) => self.notice_seen = Some((notice.clone(), now)),
+            (None, _) => self.notice_seen = None,
+        }
         if self.active_runs() > 0 {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             changed = true;
@@ -1861,13 +1882,15 @@ impl Coordinator {
         } else {
             1
         };
-        let source = 1 + self
+        let source = self
             .layout_cache
             .cached(id)
-            .map_or(1, |cached| cached.wrapped_source.len());
+            .map_or(1, |cached| cached.wrapped_source.len() as u32);
+        let rows = CardRows::from_total(total as u32, source);
+        let source_rows = rows.divider() as usize;
         match part {
-            CellPart::Source => source.min(total),
-            CellPart::Output => total.saturating_sub(source).max(1),
+            CellPart::Source => source_rows.min(total),
+            CellPart::Output => total.saturating_sub(source_rows).max(1),
         }
     }
 

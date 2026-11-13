@@ -3,7 +3,7 @@
 
 [display]
 theme = "midnight"
-syntect_theme = "base16-ocean.dark"
+syntect_theme = "auto"
 max_output_rows = 18
 wheel_scroll_lines = 3
 

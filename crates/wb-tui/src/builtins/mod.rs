@@ -925,10 +925,8 @@ impl Plugin for BuiltinsPlugin {
             "display.syntect_theme",
             "display",
             "Syntax theme",
-            "Syntect theme name",
-            SettingKind::Text {
-                default: "base16-ocean.dark",
-            },
+            "Syntect theme for code; `auto` follows the color theme",
+            SettingKind::Text { default: "auto" },
         );
         setting(
             reg,

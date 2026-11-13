@@ -105,6 +105,14 @@ pub fn render_app(
         view.focus,
         view.settings,
     );
+    // The whole body takes the theme's colors, not just the chrome.
+    let area = frame.area();
+    frame.buffer_mut().set_style(
+        area,
+        ratatui::style::Style::default()
+            .bg(theme.palette.bg)
+            .fg(theme.palette.fg),
+    );
     let status_ctx = StatusCtx {
         path: view.path,
         dirty: view.document.dirty_source || view.document.dirty_outputs,
@@ -171,7 +179,7 @@ pub fn render_app(
 
     // The terminal cursor goes wherever keys are typed.
     let cursor = match view.focus.top() {
-        FocusLayer::CellEdit { .. } => cell_cursor,
+        FocusLayer::CellEdit { .. } | FocusLayer::OutputFocus { .. } => cell_cursor,
         FocusLayer::PdbInput => dock_cursor,
         FocusLayer::Modal(ModalKind::SearchPrompt | ModalKind::ExCommandBar) => prompt_cursor,
         _ => None,

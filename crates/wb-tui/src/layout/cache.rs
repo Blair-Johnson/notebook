@@ -1,6 +1,7 @@
 //! `CellId`-keyed layout cache with 64 MiB LRU eviction, idle resize warming, and per-line syntax cache.
 
 use crate::builtins::markdown::render_markdown_cell;
+use crate::layout::CardRows;
 use crate::layout::fenwick::FenwickTree;
 use ratatui::{
     style::{Color, Style},
@@ -102,15 +103,17 @@ impl LayoutCache {
 
     fn estimate_height(cell: &Cell, max_output_rows: u16) -> u32 {
         if cell.collapsed {
-            return 2;
+            return CardRows { source: 1, outputs: 0 }.total();
         }
-        let source_rows = cell.buffer.line_count() as u32;
-        let output_rows = cell
-            .outputs
-            .iter()
-            .map(|_| u32::from(max_output_rows.max(1)))
-            .sum::<u32>();
-        1u32.saturating_add(source_rows).saturating_add(output_rows)
+        CardRows {
+            source: cell.buffer.line_count() as u32,
+            outputs: cell
+                .outputs
+                .iter()
+                .map(|_| u32::from(max_output_rows.max(1)))
+                .sum::<u32>(),
+        }
+        .total()
     }
 
     fn ensure_tree(&mut self, doc: &Document, max_output_rows: u16) {
@@ -181,20 +184,26 @@ impl LayoutCache {
         }
 
         let (wrapped_source, source_line_map) = self.render_source(cell, width, theme, raw_source);
-        let mut total_rows = 1u32;
-        if cell.collapsed {
-            total_rows = total_rows.saturating_add(1);
+        let rows = if cell.collapsed {
+            CardRows { source: 1, outputs: 0 }
         } else {
-            total_rows = total_rows.saturating_add(wrapped_source.len() as u32);
-            for output in &cell.outputs {
-                if let Some(view) = output_views.get_mut(&output.id) {
-                    let metrics = view.measure(output, width, theme, Some(max_output_rows));
-                    total_rows = total_rows.saturating_add(metrics.shown_rows.max(1));
-                } else {
-                    total_rows = total_rows.saturating_add(1);
-                }
+            let outputs = cell
+                .outputs
+                .iter()
+                .map(|output| {
+                    output_views.get_mut(&output.id).map_or(1, |view| {
+                        view.measure(output, width, theme, Some(max_output_rows))
+                            .shown_rows
+                            .max(1)
+                    })
+                })
+                .sum();
+            CardRows {
+                source: wrapped_source.len() as u32,
+                outputs,
             }
-        }
+        };
+        let total_rows = rows.total();
         let approx_bytes = size_of::<CachedCellLayout>()
             + wrapped_source
                 .iter()

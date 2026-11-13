@@ -11,8 +11,10 @@ use wb_core::CellId;
 
 pub const MIN_HISTORY_ROWS: u16 = 3;
 
-/// Columns left of cell text: the selection bar and one space.
+/// Columns left of cell text: the card's left border and one space.
 pub const GUTTER_COLS: u16 = 2;
+/// Columns right of cell text: one space and the card's right border.
+pub const CARD_RIGHT_COLS: u16 = 2;
 /// Columns reserved on the right edge for the scrollbar.
 pub const SCROLLBAR_COLS: u16 = 1;
 
@@ -21,8 +23,46 @@ pub const SCROLLBAR_COLS: u16 = 1;
 /// the renderer draws at it, so measured and drawn rows always agree.
 pub fn text_width(notebook_width: u16) -> u16 {
     notebook_width
-        .saturating_sub(GUTTER_COLS + SCROLLBAR_COLS)
+        .saturating_sub(GUTTER_COLS + CARD_RIGHT_COLS + SCROLLBAR_COLS)
         .max(1)
+}
+
+/// Rows of a cell card, top to bottom: the top border (title), the source,
+/// then — only when there are outputs — a divider and the outputs, and the
+/// bottom border. Every module that maps rows to parts uses these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardRows {
+    pub source: u32,
+    pub outputs: u32,
+}
+
+impl CardRows {
+    /// Row offset of the first source row (just below the top border).
+    pub const SOURCE_TOP: u32 = 1;
+
+    /// Row offset of the first output row (below the divider).
+    pub fn outputs_top(self) -> u32 {
+        Self::SOURCE_TOP + self.source + 1
+    }
+
+    /// Row offset of the divider between source and outputs.
+    pub fn divider(self) -> u32 {
+        Self::SOURCE_TOP + self.source
+    }
+
+    pub fn total(self) -> u32 {
+        let outputs = if self.outputs > 0 { 1 + self.outputs } else { 0 };
+        Self::SOURCE_TOP + self.source + outputs + 1
+    }
+
+    /// Recover the parts from a measured card height.
+    pub fn from_total(total: u32, source: u32) -> Self {
+        let rest = total.saturating_sub(Self::SOURCE_TOP + source + 1);
+        Self {
+            source,
+            outputs: rest.saturating_sub(1),
+        }
+    }
 }
 
 /// Preserves the exact reading position across terminal resizes, cell folds, and dock toggles.

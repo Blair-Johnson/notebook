@@ -1,27 +1,40 @@
-//! Notebook cells: header row, gutter bar, source (with cursor and
-//! selection), outputs, and the scrollbar.
+//! Notebook cells drawn as cards: a titled top border, the source (code on
+//! its own panel), an `Out` divider with the outputs, and a bottom border.
+//!
+//! ```text
+//! ╭─ In [3] ───────────────────────────── ✓ 81 ms ─╮
+//! │ y = mlp_step(w, x)                              │   code panel
+//! ├─ Out [3] ───────────────────────────────────────┤
+//! │ {'shape': [512, 512], 'dtype': 'float32'}       │   output
+//! ╰─────────────────────────────────────────────────╯
+//! ```
+//!
+//! Type shows in the title color and the source background; the selected
+//! item (source or outputs) has its borders in the focus mode's color.
 
 use super::geometry::{FrameGeometry, HitTarget, RowHit, ScrollbarGeometry};
 use super::style::mode_color;
 use super::{AppView, RunState};
 use crate::focus::{CellMode, CellPart, FocusLayer};
-use crate::layout::{CachedCellLayout, GUTTER_COLS, LayoutCache};
+use crate::layout::{CachedCellLayout, CardRows, GUTTER_COLS, LayoutCache};
 use crate::vim::{OutputText, segment_of, wrap_segments};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
 use std::collections::HashMap;
 use std::time::Duration;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use wb_core::{Cell, CellKind, OutputId, TextBuffer, VisualKind};
+use unicode_width::UnicodeWidthChar;
+use wb_core::{Cell, CellKind, OutputData, OutputId, StreamKind, TextBuffer, VisualKind};
 use wb_sdk::{OutputView, Theme};
 
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Draw every visible cell; returns the screen position for the terminal
-/// cursor when a cell is being edited.
+/// cursor when a cell or output is being edited.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_cells(
     frame: &mut Frame<'_>,
@@ -33,6 +46,7 @@ pub(super) fn draw_cells(
     text_w: u16,
     geometry: &mut FrameGeometry,
 ) -> Option<(u16, u16)> {
+    geometry.text_x = area.x + GUTTER_COLS;
     let mut cursor = None;
     let Some((mut index, _)) = cache.heights().find_row(view.scroll_row) else {
         return None;
@@ -72,6 +86,17 @@ struct CellCtx<'a> {
     cell_start: u32,
 }
 
+/// Per-cell drawing state worked out once.
+struct Look {
+    editing: Option<CellMode>,
+    output_mode: Option<CellMode>,
+    source_selected: bool,
+    outputs_selected: bool,
+    source_border: Color,
+    output_border: Color,
+    accent: Color,
+}
+
 impl CellCtx<'_> {
     fn screen_y(&self, local_row: u32) -> Option<u16> {
         let global = self.cell_start.checked_add(local_row)?;
@@ -86,17 +111,20 @@ impl CellCtx<'_> {
         Rect::new(self.area.x + GUTTER_COLS, y, self.text_w, 1)
     }
 
-    fn draw(
-        &self,
-        frame: &mut Frame<'_>,
-        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
-        geometry: &mut FrameGeometry,
-    ) -> Option<(u16, u16)> {
+    /// Everything between the two side borders (text plus its padding).
+    fn inner_rect(&self, y: u16) -> Rect {
+        Rect::new(self.area.x + 1, y, self.text_w + 2, 1)
+    }
+
+    fn right_x(&self) -> u16 {
+        self.area.x + GUTTER_COLS + self.text_w + 1
+    }
+
+    fn look(&self) -> Look {
         let view = self.view;
-        let theme = self.theme;
-        let p = &theme.palette;
+        let p = &self.theme.palette;
         let base = view.focus.base();
-        let editing_mode = match base {
+        let editing = match base {
             FocusLayer::CellEdit { cell_id, mode, .. } if cell_id == &self.cell.id => Some(*mode),
             _ => None,
         };
@@ -104,25 +132,43 @@ impl CellCtx<'_> {
             FocusLayer::OutputFocus { cell_id, mode } if cell_id == &self.cell.id => Some(*mode),
             _ => None,
         };
-        let cell_selected = view.selected_cell == &self.cell.id;
-        // The source and the outputs are separate selectable items.
-        let outputs_selected = cell_selected
-            && (output_mode.is_some() || view.selected_part == CellPart::Output);
-        let selected = cell_selected && !outputs_selected;
-        let accent = mode_color(base, theme);
-        let bar = |frame: &mut Frame<'_>, y: u16, glyph: &str, color| {
-            frame.render_widget(
-                Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(color))),
-                Rect::new(self.area.x, y, 1, 1),
-            );
-        };
+        let selected = view.selected_cell == &self.cell.id;
+        let outputs_selected =
+            selected && (output_mode.is_some() || view.selected_part == CellPart::Output);
+        let source_selected = selected && !outputs_selected;
+        let accent = mode_color(base, self.theme);
+        let running = matches!(
+            view.run_states.get(&self.cell.id),
+            Some(RunState::Running | RunState::Queued)
+        );
+        let idle = if running { p.warning } else { p.border };
+        Look {
+            editing,
+            output_mode,
+            source_selected,
+            outputs_selected,
+            source_border: if source_selected { accent } else { idle },
+            output_border: if outputs_selected { accent } else { idle },
+            accent,
+        }
+    }
 
-        // Header row.
+    fn draw(
+        &self,
+        frame: &mut Frame<'_>,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        geometry: &mut FrameGeometry,
+    ) -> Option<(u16, u16)> {
+        let look = self.look();
+        let source_rows = if self.cell.collapsed {
+            1
+        } else {
+            self.cached.wrapped_source.len() as u32
+        };
+        let rows = CardRows::from_total(self.cached.total_rows, source_rows);
+
         if let Some(y) = self.screen_y(0) {
-            if selected {
-                bar(frame, y, "▌", accent);
-            }
-            self.draw_header(frame, y, selected, accent);
+            self.draw_top_border(frame, y, &look);
             geometry.row_hits.push(RowHit {
                 screen_y: y,
                 target: HitTarget::CellHeader {
@@ -131,70 +177,232 @@ impl CellCtx<'_> {
             });
         }
 
-        if self.cell.collapsed {
-            if let Some(y) = self.screen_y(1) {
-                if selected {
-                    bar(frame, y, "▌", accent);
+        let mut cursor = if self.cell.collapsed {
+            self.draw_folded(frame, &look, geometry);
+            None
+        } else {
+            self.draw_source(frame, &look, geometry)
+        };
+
+        let mut hidden_rows = 0u32;
+        if rows.outputs > 0 {
+            if let Some(y) = self.screen_y(rows.divider()) {
+                self.draw_divider(frame, y, &look);
+                if let Some(output) = self.cell.outputs.first() {
+                    geometry.row_hits.push(RowHit {
+                        screen_y: y,
+                        target: HitTarget::CellOutput {
+                            cell_id: self.cell.id.clone(),
+                            output_id: output.id,
+                            local_row: 0,
+                        },
+                    });
                 }
-                let hidden = self.cell.buffer.line_count();
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!("⋯ {hidden} line{} folded", if hidden == 1 { "" } else { "s" }),
-                        Style::default().fg(p.muted),
-                    )),
-                    self.text_rect(y),
-                );
-                geometry.row_hits.push(RowHit {
-                    screen_y: y,
-                    target: HitTarget::FoldToggle {
-                        cell_id: self.cell.id.clone(),
-                    },
-                });
             }
-            return None;
+            let (position, hidden) =
+                self.draw_outputs(frame, output_views, &look, rows, geometry);
+            cursor = position.or(cursor);
+            hidden_rows = hidden;
         }
 
-        // Source rows.
+        if let Some(y) = self.screen_y(rows.total() - 1) {
+            let color = if rows.outputs > 0 {
+                look.output_border
+            } else {
+                look.source_border
+            };
+            let label = (hidden_rows > 0 && look.output_mode.is_none()).then(|| {
+                vec![Span::styled(
+                    format!(" {hidden_rows} more lines · enter to scroll "),
+                    Style::default().fg(self.theme.palette.muted).bg(self.theme.palette.bg),
+                )]
+            });
+            self.hline(frame, y, ("╰", "╯"), color, &[], &label.unwrap_or_default());
+            geometry.row_hits.push(RowHit {
+                screen_y: y,
+                target: HitTarget::CellHeader {
+                    cell_id: self.cell.id.clone(),
+                },
+            });
+        }
+        cursor
+    }
+
+    /// A horizontal border row: `left` + title + rule + right label + `right`.
+    fn hline(
+        &self,
+        frame: &mut Frame<'_>,
+        y: u16,
+        (left, right): (&str, &str),
+        color: Color,
+        title: &[Span<'static>],
+        right_label: &[Span<'static>],
+    ) {
+        let p = &self.theme.palette;
+        let border = Style::default().fg(color).bg(p.bg);
+        let width = usize::from(self.text_w + 4);
+        let title_w: usize = title.iter().map(|span| span.width()).sum();
+        let right_w: usize = right_label.iter().map(|span| span.width()).sum();
+        let mut spans = vec![Span::styled(format!("{left}─"), border)];
+        let mut used = 2;
+        if title_w > 0 && used + title_w + 2 <= width {
+            spans.extend(title.iter().cloned());
+            used += title_w;
+        }
+        let show_right = right_w > 0 && used + right_w + 3 <= width;
+        let fill = width.saturating_sub(used + 2 + if show_right { right_w } else { 0 });
+        spans.push(Span::styled("─".repeat(fill), border));
+        if show_right {
+            spans.extend(right_label.iter().cloned());
+        }
+        spans.push(Span::styled(format!("─{right}"), border));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(self.area.x, y, self.text_w + 4, 1),
+        );
+    }
+
+    fn side_borders(&self, frame: &mut Frame<'_>, y: u16, color: Color, fill: Color) {
+        let p = &self.theme.palette;
+        let style = Style::default().fg(color).bg(p.bg);
+        let buf = frame.buffer_mut();
+        buf.set_style(self.inner_rect(y), Style::default().bg(fill));
+        buf.set_string(self.area.x, y, "│", style);
+        buf.set_string(self.right_x(), y, "│", style);
+    }
+
+    fn draw_top_border(&self, frame: &mut Frame<'_>, y: u16, look: &Look) {
+        let p = &self.theme.palette;
+        let bg = p.bg;
+        let state = self.view.run_states.get(&self.cell.id).copied();
+        let strong = |color: Color, bold: bool| {
+            let style = Style::default().fg(color).bg(bg);
+            if bold { style.add_modifier(Modifier::BOLD) } else { style }
+        };
+        let (label, kind_color) = match self.cell.kind {
+            CellKind::Code => {
+                let count = match state {
+                    Some(RunState::Running) => "*".to_string(),
+                    Some(RunState::Queued) => "·".to_string(),
+                    _ => self
+                        .cell
+                        .execution_count
+                        .map_or_else(|| " ".to_string(), |count| count.to_string()),
+                };
+                (format!("In [{count}]"), p.accent_code)
+            }
+            CellKind::Markdown => ("Markdown".to_string(), p.accent_markdown),
+            CellKind::Raw => ("Raw".to_string(), p.accent_raw),
+        };
+        let mut title = vec![Span::styled(
+            format!(" {label} "),
+            strong(kind_color, look.source_selected),
+        )];
+        if let Some(mode) = look.editing {
+            let name = match mode {
+                CellMode::Normal => "normal",
+                CellMode::Insert => "insert",
+                CellMode::Visual(VisualKind::Char) => "visual",
+                CellMode::Visual(VisualKind::Line) => "visual line",
+            };
+            title.push(Span::styled(format!("{name} "), strong(look.accent, false)));
+        }
+        let status: Option<(String, Color)> = match state {
+            Some(RunState::Queued) => Some(("queued".into(), p.muted)),
+            Some(RunState::Running) => Some((
+                format!("{} running", SPINNER[self.view.spinner_tick % SPINNER.len()]),
+                p.warning,
+            )),
+            Some(RunState::Failed) => Some((
+                format!("✗ {}", self.cell.last_elapsed.map_or_else(String::new, fmt_elapsed)),
+                p.error,
+            )),
+            Some(RunState::Done) | None => self
+                .cell
+                .last_elapsed
+                .map(|elapsed| (format!("✓ {}", fmt_elapsed(elapsed)), p.muted)),
+        };
+        let right = status
+            .map(|(text, color)| {
+                vec![Span::styled(
+                    format!(" {} ", text.trim_end()),
+                    strong(color, false),
+                )]
+            })
+            .unwrap_or_default();
+        self.hline(frame, y, ("╭", "╮"), look.source_border, &title, &right);
+    }
+
+    fn source_fill(&self) -> Color {
+        let p = &self.theme.palette;
+        match self.cell.kind {
+            CellKind::Markdown => p.bg,
+            CellKind::Code | CellKind::Raw => p.code_bg,
+        }
+    }
+
+    fn draw_folded(&self, frame: &mut Frame<'_>, look: &Look, geometry: &mut FrameGeometry) {
+        let Some(y) = self.screen_y(CardRows::SOURCE_TOP) else {
+            return;
+        };
+        let p = &self.theme.palette;
+        self.side_borders(frame, y, look.source_border, self.source_fill());
+        let hidden = self.cell.buffer.line_count();
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("⋯ {hidden} line{} folded", if hidden == 1 { "" } else { "s" }),
+                Style::default().fg(p.muted),
+            )),
+            self.text_rect(y),
+        );
+        geometry.row_hits.push(RowHit {
+            screen_y: y,
+            target: HitTarget::FoldToggle {
+                cell_id: self.cell.id.clone(),
+            },
+        });
+    }
+
+    fn draw_source(
+        &self,
+        frame: &mut Frame<'_>,
+        look: &Look,
+        geometry: &mut FrameGeometry,
+    ) -> Option<(u16, u16)> {
+        let p = &self.theme.palette;
         let lines = &self.cached.wrapped_source;
-        let segments = editing_mode.map(|_| self.segments());
+        let segments = look
+            .editing
+            .map(|_| wrap_segments(self.cell.buffer.as_str(), self.text_w));
         // Raw source rows map 1:1 onto wrap segments; rendered markdown doesn't.
         let hit_segments = segments
             .clone()
-            .or_else(|| (self.cell.kind != CellKind::Markdown).then(|| self.segments()))
+            .or_else(|| {
+                (self.cell.kind != CellKind::Markdown)
+                    .then(|| wrap_segments(self.cell.buffer.as_str(), self.text_w))
+            })
             .filter(|segs| segs.len() == lines.len());
-        geometry.text_x = self.area.x + GUTTER_COLS;
+        let fill = self.source_fill();
         let mut cursor = None;
         for (index, line) in lines.iter().enumerate() {
-            let Some(y) = self.screen_y(1 + index as u32) else {
+            let Some(y) = self.screen_y(CardRows::SOURCE_TOP + index as u32) else {
                 continue;
             };
-            if selected {
-                bar(frame, y, "▌", accent);
-            } else if self.cell.kind == CellKind::Code {
-                bar(frame, y, "▏", p.border);
-            }
+            self.side_borders(frame, y, look.source_border, fill);
             let rect = self.text_rect(y);
             frame.render_widget(Paragraph::new(line.clone()), rect);
             let logical = self.cached.source_line_map.get(index).copied().unwrap_or(index);
-            if let (Some(mode), Some(segments)) = (editing_mode, segments.as_ref()) {
-                let cursor_pos = self.cell.buffer.cursor();
-                if logical == cursor_pos.row && !matches!(mode, CellMode::Visual(_)) {
+            if let (Some(mode), Some(segments)) = (look.editing, segments.as_ref()) {
+                let buf = &self.cell.buffer;
+                if logical == buf.cursor().row && !matches!(mode, CellMode::Visual(_)) {
                     frame
                         .buffer_mut()
-                        .set_style(rect, Style::default().bg(p.surface));
+                        .set_style(self.inner_rect(y), Style::default().bg(p.cursor_line));
                 }
-                if let Some(selection) = self.cell.buffer.selection() {
-                    paint_selection(
-                        frame,
-                        rect,
-                        index,
-                        segments,
-                        &self.cell.buffer,
-                        selection,
-                        theme,
-                    );
+                if let Some(selection) = buf.selection() {
+                    paint_selection(frame, rect, index, segments, buf, selection, self.theme);
                 }
-                if let Some((row, col)) = cursor_visual(&self.cell.buffer, segments) {
+                if let Some((row, col)) = cursor_visual(buf, segments) {
                     if row == index {
                         cursor = Some((rect.x + col.min(self.text_w.saturating_sub(1)), y));
                     }
@@ -212,62 +420,117 @@ impl CellCtx<'_> {
                 },
             });
         }
+        cursor
+    }
 
-        // Outputs, directly below the source at the same indent.
-        let outputs_top = 1u32.saturating_add(lines.len() as u32);
-        let mut local = outputs_top;
-        let entered = output_mode.zip(
-            view.output_text
-                .filter(|out| out.cell_id == self.cell.id),
-        );
-        if let Some((mode, out)) = entered {
-            let region: u32 = self
-                .cell
-                .outputs
-                .iter()
-                .map(|output| {
-                    output_views.get_mut(&output.id).map_or(1, |output_view| {
-                        output_view
-                            .measure(output, self.text_w, theme, Some(view.settings.max_output_rows))
-                            .shown_rows
-                            .max(1)
-                    })
-                })
-                .sum();
-            let position =
-                self.draw_output_text(frame, out, mode, outputs_top, region, accent, geometry);
-            return position.or(cursor);
+    /// `├─ Out [3] ──┤`, `├─ Error · ValueError ──┤`, or the stream names.
+    fn draw_divider(&self, frame: &mut Frame<'_>, y: u16, look: &Look) {
+        let p = &self.theme.palette;
+        let bg = p.bg;
+        let mut error = None;
+        let mut result = false;
+        let (mut stdout, mut stderr, mut late) = (false, false, false);
+        for output in &self.cell.outputs {
+            late |= output.transient_late;
+            match &output.data {
+                OutputData::Error { ename, .. } => error = Some(ename.clone()),
+                OutputData::Rich { .. } => result = true,
+                OutputData::Stream {
+                    stream: StreamKind::Stdout,
+                    ..
+                } => stdout = true,
+                OutputData::Stream {
+                    stream: StreamKind::Stderr,
+                    ..
+                } => stderr = true,
+            }
         }
+        let bold = |color: Color| {
+            let style = Style::default().fg(color).bg(bg);
+            if look.outputs_selected {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            }
+        };
+        let mut title = Vec::new();
+        if let Some(ename) = error {
+            title.push(Span::styled(format!(" Error · {ename} "), bold(p.error)));
+        } else if result {
+            let count = self
+                .cell
+                .execution_count
+                .map_or_else(String::new, |count| format!(" [{count}]"));
+            title.push(Span::styled(format!(" Out{count} "), bold(p.success)));
+        } else {
+            let name = match (stdout, stderr) {
+                (true, true) => "stdout · stderr",
+                (false, true) => "stderr",
+                _ => "stdout",
+            };
+            let color = if stderr { p.warning } else { p.muted };
+            title.push(Span::styled(format!(" {name} "), bold(color)));
+        }
+        if late {
+            title.push(Span::styled(
+                "late ",
+                Style::default()
+                    .fg(p.warning)
+                    .bg(bg)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        let right = match look.output_mode {
+            Some(CellMode::Visual(_)) => vec![Span::styled(" visual ", bold(look.accent))],
+            Some(_) => vec![Span::styled(" reading ", bold(look.accent))],
+            None => Vec::new(),
+        };
+        self.hline(frame, y, ("├", "┤"), look.output_border, &title, &right);
+    }
+
+    /// Output rows; returns the edit cursor (when entered) and how many
+    /// rows the views clipped.
+    fn draw_outputs(
+        &self,
+        frame: &mut Frame<'_>,
+        output_views: &mut HashMap<OutputId, Box<dyn OutputView>>,
+        look: &Look,
+        rows: CardRows,
+        geometry: &mut FrameGeometry,
+    ) -> (Option<(u16, u16)>, u32) {
+        let p = &self.theme.palette;
+        let theme = self.theme;
+        let top = rows.outputs_top();
+        let entered = look
+            .output_mode
+            .zip(self.view.output_text.filter(|out| out.cell_id == self.cell.id));
+        if let Some((mode, out)) = entered {
+            let cursor = self.draw_output_text(frame, out, mode, top, rows.outputs, look, geometry);
+            return (cursor, 0);
+        }
+        let mut local = top;
+        let mut hidden = 0u32;
         for output in &self.cell.outputs {
             let Some(output_view) = output_views.get_mut(&output.id) else {
                 local = local.saturating_add(1);
                 continue;
             };
-            let shown = output_view
-                .measure(output, self.text_w, theme, Some(view.settings.max_output_rows))
-                .shown_rows
-                .max(1);
+            let metrics = output_view.measure(
+                output,
+                self.text_w,
+                theme,
+                Some(self.view.settings.max_output_rows),
+            );
+            let shown = metrics.shown_rows.max(1);
+            hidden += metrics.total_rows.saturating_sub(shown);
             let mut rendered = Vec::new();
             output_view.render_slice(output, self.text_w, 0..shown, false, theme, &mut rendered);
             for row in 0..shown {
                 let Some(y) = self.screen_y(local + row) else {
                     continue;
                 };
-                if outputs_selected {
-                    bar(frame, y, "▌", accent);
-                } else if cell_selected {
-                    bar(frame, y, "▏", p.border);
-                }
-                if let Some(mut line) = rendered.get(row as usize).cloned() {
-                    if row == 0 && output.transient_late {
-                        line.spans.insert(
-                            0,
-                            Span::styled(
-                                "late ",
-                                Style::default().fg(p.warning).add_modifier(Modifier::ITALIC),
-                            ),
-                        );
-                    }
+                self.side_borders(frame, y, look.output_border, p.bg);
+                if let Some(line) = rendered.get(row as usize).cloned() {
                     frame.render_widget(Paragraph::new(line), self.text_rect(y));
                 }
                 geometry.row_hits.push(RowHit {
@@ -276,68 +539,13 @@ impl CellCtx<'_> {
                         cell_id: self.cell.id.clone(),
                         output_id: output.id,
                         // Row within the whole output block (≈ its text row).
-                        local_row: local - outputs_top + row,
+                        local_row: local - top + row,
                     },
                 });
             }
             local = local.saturating_add(shown);
         }
-        cursor
-    }
-
-    fn draw_header(&self, frame: &mut Frame<'_>, y: u16, selected: bool, accent: ratatui::style::Color) {
-        let p = &self.theme.palette;
-        let state = self.view.run_states.get(&self.cell.id).copied();
-        let label_style = if selected {
-            Style::default().fg(accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(p.muted)
-        };
-        let label = match self.cell.kind {
-            CellKind::Code => {
-                let count = match state {
-                    Some(RunState::Running) => "*".to_string(),
-                    Some(RunState::Queued) => "·".to_string(),
-                    _ => self
-                        .cell
-                        .execution_count
-                        .map_or_else(|| " ".to_string(), |count| count.to_string()),
-                };
-                format!("In [{count}]")
-            }
-            CellKind::Markdown => String::new(),
-            CellKind::Raw => "raw".to_string(),
-        };
-        let status: Option<(String, ratatui::style::Color)> = match state {
-            Some(RunState::Queued) => Some(("queued".into(), p.muted)),
-            Some(RunState::Running) => Some(("● running".into(), p.warning)),
-            Some(RunState::Failed) => Some((
-                format!("✗ {}", self.cell.last_elapsed.map_or_else(String::new, fmt_elapsed)),
-                p.error,
-            )),
-            Some(RunState::Done) | None => self
-                .cell
-                .last_elapsed
-                .map(|elapsed| (format!("✓ {}", fmt_elapsed(elapsed)), p.muted)),
-        };
-        let rect = self.text_rect(y);
-        frame.render_widget(Paragraph::new(Span::styled(label, label_style)), rect);
-        if let Some((text, color)) = status {
-            let text = text.trim_end().to_string();
-            let width = UnicodeWidthStr::width(text.as_str()) as u16;
-            if width < rect.width {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(text, Style::default().fg(color))),
-                    Rect::new(rect.right() - width, y, width, 1),
-                );
-            }
-        }
-    }
-
-    /// Per wrapped source row: (logical line, char range) — mirrors the
-    /// layout cache's character wrapping.
-    fn segments(&self) -> Vec<(usize, usize, usize)> {
-        wrap_segments(self.cell.buffer.as_str(), self.text_w)
+        (None, hidden)
     }
 
     /// An entered output: its plain text with cursor, selection and its own
@@ -350,7 +558,7 @@ impl CellCtx<'_> {
         mode: CellMode,
         first_local: u32,
         region: u32,
-        accent: ratatui::style::Color,
+        look: &Look,
         geometry: &mut FrameGeometry,
     ) -> Option<(u16, u16)> {
         let p = &self.theme.palette;
@@ -364,9 +572,8 @@ impl CellCtx<'_> {
                 continue;
             };
             let index = (out.scroll + row) as usize;
-            self.gutter(frame, y, "▌", accent);
+            self.side_borders(frame, y, look.output_border, p.bg);
             let rect = self.text_rect(y);
-            frame.buffer_mut().set_style(rect, Style::default().bg(p.surface));
             if let Some(&(line, start, end)) = segments.get(index) {
                 let text: String = buf
                     .line(line)
@@ -375,15 +582,15 @@ impl CellCtx<'_> {
                     .skip(start)
                     .take(end - start)
                     .collect();
+                if line == buf.cursor().row && !matches!(mode, CellMode::Visual(_)) {
+                    frame
+                        .buffer_mut()
+                        .set_style(self.inner_rect(y), Style::default().bg(p.cursor_line));
+                }
                 frame.render_widget(
                     Paragraph::new(Span::styled(text, Style::default().fg(p.fg))),
                     rect,
                 );
-                if line == buf.cursor().row && !matches!(mode, CellMode::Visual(_)) {
-                    frame
-                        .buffer_mut()
-                        .set_style(rect, Style::default().bg(p.panel_selection));
-                }
                 if let Some(selection) = buf.selection() {
                     paint_selection(frame, rect, index, &segments, buf, selection, self.theme);
                 }
@@ -403,13 +610,6 @@ impl CellCtx<'_> {
             });
         }
         cursor
-    }
-
-    fn gutter(&self, frame: &mut Frame<'_>, y: u16, glyph: &str, color: ratatui::style::Color) {
-        frame.render_widget(
-            Paragraph::new(Span::styled(glyph.to_string(), Style::default().fg(color))),
-            Rect::new(self.area.x, y, 1, 1),
-        );
     }
 }
 

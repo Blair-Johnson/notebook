@@ -326,8 +326,11 @@ fn build_snapshot(
 
     let theme_name = setting_text(&values, "display.theme").unwrap_or_else(|| "midnight".into());
     let mut theme = theme_preset(&theme_name).unwrap_or_else(|| Theme::default());
-    if let Some(syntect) = setting_text(&values, "display.syntect_theme") {
+    if let Some(syntect) = setting_text(&values, "display.syntect_theme")
+        .filter(|name| !name.is_empty() && name != "auto")
+    {
         theme.syntect_theme = syntect;
+        theme = theme.rehash();
     }
     let core = CoreSettings {
         max_output_rows: setting_int(&values, "display.max_output_rows", 18)
@@ -525,104 +528,97 @@ fn setting_bool(values: &HashMap<SettingId, SettingValue>, id: &str, default: bo
 }
 
 fn theme_preset(name: &str) -> Option<Theme> {
+    let rgb = |hex: u32| Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
     let (syntect_theme, palette) = match name {
-        "terminal" => ("base16-ocean.dark", Theme::default().palette),
+        // ANSI colors on the terminal's own background.
+        "terminal" => ("base16-ocean.dark", wb_sdk::Palette::default()),
         "midnight" => (
             "base16-ocean.dark",
-            // Transparent background so the terminal's own color shows
-            // through; RGB only for surfaces, selection, and accents.
             wb_sdk::Palette {
-                bg: Color::Reset,
-                surface: Color::Rgb(26, 32, 50),
-                panel_bg: Color::Rgb(20, 26, 42),
-                panel_selection: Color::Rgb(44, 62, 104),
-                fg: Color::Rgb(214, 220, 236),
-                muted: Color::Rgb(116, 128, 158),
-                border: Color::Rgb(58, 70, 100),
-                border_focused: Color::Rgb(108, 168, 255),
-                accent_code: Color::Rgb(108, 168, 255),
-                accent_markdown: Color::Rgb(196, 146, 255),
-                accent_raw: Color::Rgb(232, 190, 108),
-                success: Color::Rgb(122, 214, 152),
-                warning: Color::Rgb(238, 196, 104),
-                error: Color::Rgb(242, 112, 124),
+                bg: rgb(0x10131e),
+                surface: rgb(0x1a2032),
+                code_bg: rgb(0x161b2b),
+                cursor_line: rgb(0x232b42),
+                panel_bg: rgb(0x141927),
+                panel_selection: rgb(0x2c3e68),
+                fg: rgb(0xd6dcec),
+                muted: rgb(0x74809e),
+                border: rgb(0x2f3a55),
+                border_focused: rgb(0x6ca8ff),
+                accent_code: rgb(0x6ca8ff),
+                accent_markdown: rgb(0xc492ff),
+                accent_raw: rgb(0xe8be6c),
+                success: rgb(0x7ad698),
+                warning: rgb(0xeec468),
+                error: rgb(0xf2707c),
             },
         ),
         "light" => (
             "InspiredGitHub",
-            palette(
-                Color::Rgb(250, 250, 248),
-                Color::Rgb(238, 240, 244),
-                Color::Rgb(255, 255, 255),
-                Color::Rgb(214, 220, 230),
-                Color::Rgb(32, 36, 42),
-                Color::Rgb(102, 110, 122),
-                Color::Rgb(156, 164, 176),
-                Color::Rgb(28, 104, 180),
-            ),
+            wb_sdk::Palette {
+                bg: rgb(0xfafaf8),
+                surface: rgb(0xeceff4),
+                code_bg: rgb(0xf1f3f7),
+                cursor_line: rgb(0xe2e8f2),
+                panel_bg: rgb(0xffffff),
+                panel_selection: rgb(0xc8daf4),
+                fg: rgb(0x20242a),
+                muted: rgb(0x6b7480),
+                border: rgb(0xc9cfd8),
+                border_focused: rgb(0x1c68b4),
+                accent_code: rgb(0x1c68b4),
+                accent_markdown: rgb(0x8a3fc0),
+                accent_raw: rgb(0xa86a00),
+                success: rgb(0x1e8a4a),
+                warning: rgb(0xa86a00),
+                error: rgb(0xc2303a),
+            },
         ),
         "gruvbox" => (
             "base16-eighties.dark",
-            palette(
-                Color::Rgb(40, 40, 32),
-                Color::Rgb(60, 56, 40),
-                Color::Rgb(48, 45, 38),
-                Color::Rgb(102, 82, 54),
-                Color::Rgb(235, 219, 178),
-                Color::Rgb(168, 153, 132),
-                Color::Rgb(124, 111, 96),
-                Color::Rgb(215, 153, 33),
-            ),
+            wb_sdk::Palette {
+                bg: rgb(0x282828),
+                surface: rgb(0x32302f),
+                code_bg: rgb(0x2f2d2c),
+                cursor_line: rgb(0x3c3836),
+                panel_bg: rgb(0x1d2021),
+                panel_selection: rgb(0x504945),
+                fg: rgb(0xebdbb2),
+                muted: rgb(0xa89984),
+                border: rgb(0x504945),
+                border_focused: rgb(0x83a598),
+                accent_code: rgb(0x83a598),
+                accent_markdown: rgb(0xd3869b),
+                accent_raw: rgb(0xfabd2f),
+                success: rgb(0xb8bb26),
+                warning: rgb(0xfabd2f),
+                error: rgb(0xfb4934),
+            },
         ),
         "solarized-dark" => (
             "Solarized (dark)",
-            palette(
-                Color::Rgb(0, 43, 54),
-                Color::Rgb(7, 54, 66),
-                Color::Rgb(0, 43, 54),
-                Color::Rgb(38, 72, 78),
-                Color::Rgb(238, 232, 213),
-                Color::Rgb(147, 161, 161),
-                Color::Rgb(88, 110, 117),
-                Color::Rgb(42, 161, 152),
-            ),
+            wb_sdk::Palette {
+                bg: rgb(0x002b36),
+                surface: rgb(0x073642),
+                code_bg: rgb(0x04313d),
+                cursor_line: rgb(0x0b3f4c),
+                panel_bg: rgb(0x00252e),
+                panel_selection: rgb(0x1d4a55),
+                fg: rgb(0xc3cbc9),
+                muted: rgb(0x657b83),
+                border: rgb(0x2a4f58),
+                border_focused: rgb(0x268bd2),
+                accent_code: rgb(0x268bd2),
+                accent_markdown: rgb(0xd33682),
+                accent_raw: rgb(0xb58900),
+                success: rgb(0x859900),
+                warning: rgb(0xb58900),
+                error: rgb(0xdc322f),
+            },
         ),
         _ => return None,
     };
-    Some(Theme {
-        name: name.into(),
-        revision: 1,
-        syntect_theme: syntect_theme.into(),
-        palette,
-    })
-}
-
-fn palette(
-    bg: Color,
-    surface: Color,
-    panel_bg: Color,
-    panel_selection: Color,
-    fg: Color,
-    muted: Color,
-    border: Color,
-    accent: Color,
-) -> wb_sdk::Palette {
-    wb_sdk::Palette {
-        bg,
-        surface,
-        panel_bg,
-        panel_selection,
-        fg,
-        muted,
-        border,
-        border_focused: accent,
-        accent_code: accent,
-        accent_markdown: Color::Magenta,
-        accent_raw: Color::Yellow,
-        success: Color::Green,
-        warning: Color::Yellow,
-        error: Color::Red,
-    }
+    Some(Theme::new(name, syntect_theme, palette))
 }
 
 #[cfg(test)]

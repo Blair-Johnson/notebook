@@ -47,6 +47,10 @@ enum Mode {
         out: PathBuf,
         #[arg(long)]
         text: bool,
+        /// Config file to use (e.g. one setting `display.theme`); default is
+        /// a fresh temporary file with built-in defaults.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Send keys to a live tmux pane and capture it.
     Tmux {
@@ -101,6 +105,7 @@ async fn main() -> Result<()> {
             kernel_timeout_ms,
             out,
             text,
+            config,
         } => {
             let (width, height) = parse_size(&size)?;
             let kernel = match kernel.as_str() {
@@ -108,7 +113,9 @@ async fn main() -> Result<()> {
                 "real" => KernelChoice::Real,
                 other => bail!("--kernel must be fake or real, not {other}"),
             };
-            let config = std::env::temp_dir().join(format!("wb-snap-{}-config.toml", std::process::id()));
+            let config = config.unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("wb-snap-{}-config.toml", std::process::id()))
+            });
             let mut session = HeadlessSession::open(notebook.as_deref(), width, height, kernel, config)?;
             if kernel == KernelChoice::Real {
                 let ready = session
