@@ -131,7 +131,7 @@ impl PlainTextView {
 
     fn motion(input: &ResolvedInput, name: &str) -> Option<u32> {
         match input {
-            ResolvedInput::Move { motion, count } if motion.0.as_ref() == name => Some(*count),
+            ResolvedInput::Move { motion, count, .. } if motion.0.as_ref() == name => Some(*count),
             _ => None,
         }
     }

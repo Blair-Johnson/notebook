@@ -17,6 +17,7 @@ pub mod layout;
 pub mod overlays;
 pub mod platform;
 pub mod render;
+pub mod vim;
 
 pub use builtins::BuiltinsPlugin;
 pub use config_store::{ConfigSnapshot, CoreSettings, SettingsStore};

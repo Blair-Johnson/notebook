@@ -15,6 +15,7 @@ use crate::overlays::{
 use crate::platform::{
     ClipboardSink, CursorShape, MemoryClipboard, NoopTerminalEffects, TerminalEffects,
 };
+use crate::vim;
 use crate::render::{
     AppView, FrameGeometry, HitTarget, KernelPhase, RunState, frame_layout, render_app,
 };
@@ -32,7 +33,7 @@ use wb_core::codec::ipynb::{parse_ipynb, serialize_ipynb};
 use wb_core::codec::{reload_external, save_path, write_atomic};
 use wb_core::{
     Cell, CellId, CellKind, CommId, CursorPos, DocOp, Document, OutputData, OutputId, OutputItem,
-    Selection, StreamKind, TargetId, VisualKind,
+    StreamKind, TargetId,
 };
 use wb_kernel::{CompletionCandidate, KernelClient, KernelCmd, KernelEvent, Lane, WireOutput};
 use wb_sdk::{
@@ -100,6 +101,8 @@ pub struct Coordinator {
     marks: HashMap<char, (CellId, usize)>,
     yank_cells: Vec<Cell>,
     yank_text: String,
+    /// Register, sticky column and last `f`/`t` shared by every vim buffer.
+    vim: vim::VimState,
     cell_baselines: HashMap<CellId, String>,
     search_query: Option<String>,
     logs: VecDeque<String>,
@@ -170,6 +173,7 @@ impl Coordinator {
             marks: HashMap::new(),
             yank_cells: Vec::new(),
             yank_text: String::new(),
+            vim: vim::VimState::default(),
             cell_baselines: HashMap::new(),
             search_query: None,
             logs: VecDeque::with_capacity(2_000),
@@ -282,6 +286,7 @@ impl Coordinator {
             editing.as_ref(),
         );
         let height = u32::from(viewport.height.max(1));
+        self.vim.half_page = usize::from(viewport.height / 2).max(1);
         if self.follow_focus {
             self.follow_focus = false;
             if let Some(index) = self.document.position_of(&self.selected_cell) {
@@ -1253,7 +1258,7 @@ impl Coordinator {
 
     fn dispatch_notebook(&mut self, input: ResolvedInput) -> Effect {
         match input {
-            ResolvedInput::Move { motion, count } => {
+            ResolvedInput::Move { motion, count, .. } => {
                 self.move_selected(motion.0.as_ref(), count);
                 Effect::None
             }
@@ -1484,8 +1489,8 @@ impl Coordinator {
             ResolvedInput::RollbackChars(count) => {
                 self.mutate_cell_buffer(cell_id, |buffer| buffer.rollback_chars(count));
             }
-            ResolvedInput::Move { motion, count } => {
-                self.move_cell_cursor(cell_id, motion.0.as_ref(), count);
+            ResolvedInput::Move { motion, .. } => {
+                self.move_insert_cursor(cell_id, motion.0.as_ref());
                 self.completion = None;
             }
             ResolvedInput::Command { id, .. } if is_text_edit_command(id.0.as_ref()) => {
@@ -1500,7 +1505,7 @@ impl Coordinator {
                 self.request_completion(cell_id);
             }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "focus.up" => {
-                self.set_cell_mode(CellMode::Normal);
+                self.leave_insert(cell_id);
             }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "cell.toggle_expand_split" => {
                 self.toggle_split();
@@ -1516,69 +1521,74 @@ impl Coordinator {
         mode: CellMode,
         input: ResolvedInput,
     ) -> Effect {
+        let vim_mode = match mode {
+            CellMode::Visual(kind) => vim::Mode::Visual(kind),
+            _ => vim::Mode::Normal,
+        };
         match input {
-            ResolvedInput::Move { motion, count } => {
-                self.move_cell_cursor(cell_id, motion.0.as_ref(), count);
-                if let CellMode::Visual(_) = mode {
-                    self.update_visual_head(cell_id);
-                }
+            ResolvedInput::Move { motion, count, arg } => {
+                self.with_cell_vim(cell_id, |vim, buf| {
+                    vim.move_cursor(buf, vim_mode, motion.0.as_ref(), arg, count)
+                });
             }
             ResolvedInput::OperateSelf { op, count } => {
-                self.apply_cell_operator(cell_id, mode, op.0.as_ref(), None, count);
+                self.with_cell_vim(cell_id, |vim, buf| {
+                    vim.operate(buf, vim_mode, op.0.as_ref(), None, count, false)
+                });
             }
             ResolvedInput::Operate { op, target, count } => {
-                self.apply_cell_operator(cell_id, mode, op.0.as_ref(), Some(target), count);
+                self.with_cell_vim(cell_id, |vim, buf| {
+                    vim.operate(buf, vim_mode, op.0.as_ref(), Some(&target), count, false)
+                });
             }
             ResolvedInput::Command { id, count, arg } => {
-                self.dispatch_cell_command(cell_id, mode, id.0.as_ref(), count.unwrap_or(1), arg);
+                let id = id.0.to_string();
+                let outcome = self.with_cell_vim(cell_id, |vim, buf| {
+                    vim.command(buf, vim_mode, &id, count.unwrap_or(1), arg, false)
+                });
+                if !outcome.handled {
+                    self.dispatch_cell_command(cell_id, mode, &id);
+                }
             }
             ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => {}
         }
         Effect::None
     }
 
-    fn dispatch_cell_command(
-        &mut self,
-        cell_id: &CellId,
-        mode: CellMode,
-        id: &str,
-        _count: u32,
-        arg: Option<char>,
-    ) {
+    /// Run a vim edit against a cell's buffer and apply what it asks for.
+    fn with_cell_vim<F>(&mut self, cell_id: &CellId, edit: F) -> vim::Outcome
+    where
+        F: FnOnce(&mut vim::VimState, &mut wb_core::TextBuffer) -> vim::Outcome,
+    {
+        let Some(cell) = self.document.cell_mut(cell_id) else {
+            return vim::Outcome::default();
+        };
+        let outcome = edit(&mut self.vim, &mut cell.buffer);
+        if outcome.changed {
+            cell.bump_source();
+            self.document.dirty_source = true;
+        }
+        self.apply_vim_outcome(outcome);
+        outcome
+    }
+
+    fn apply_vim_outcome(&mut self, outcome: vim::Outcome) {
+        if outcome.yanked {
+            self.yank_text = self.vim.register.text.clone();
+            let _ = self.clipboard.copy(&self.vim.register.text);
+        }
+        if outcome.insert {
+            self.set_cell_mode(CellMode::Insert);
+        } else if let Some(kind) = outcome.visual {
+            self.set_cell_mode(CellMode::Visual(kind));
+        } else if outcome.normal {
+            self.set_cell_mode(CellMode::Normal);
+        }
+    }
+
+    /// Cell commands that are not text edits.
+    fn dispatch_cell_command(&mut self, cell_id: &CellId, mode: CellMode, id: &str) {
         match id {
-            "cell.enter_insert" | "cell.append_char" => self.set_cell_mode(CellMode::Insert),
-            "cell.append_end" => {
-                if let Some(cell) = self.document.cell_mut(cell_id) {
-                    let row = cell.buffer.line_count().saturating_sub(1);
-                    let col = cell.buffer.line_char_len(row);
-                    cell.buffer.set_cursor(CursorPos { row, col });
-                }
-                self.set_cell_mode(CellMode::Insert);
-            }
-            "cell.open_line_below" => {
-                if let Some(cell) = self.document.cell_mut(cell_id) {
-                    let row = cell.buffer.cursor().row;
-                    let col = cell.buffer.line_char_len(row);
-                    cell.buffer.set_cursor(CursorPos { row, col });
-                    cell.buffer.checkpoint();
-                    cell.buffer.insert_newline();
-                    cell.bump_source();
-                    self.document.dirty_source = true;
-                }
-                self.set_cell_mode(CellMode::Insert);
-            }
-            "cell.open_line_above" => {
-                if let Some(cell) = self.document.cell_mut(cell_id) {
-                    let row = cell.buffer.cursor().row;
-                    cell.buffer.set_cursor(CursorPos { row, col: 0 });
-                    cell.buffer.checkpoint();
-                    cell.buffer.insert_newline();
-                    cell.buffer.set_cursor(CursorPos { row, col: 0 });
-                    cell.bump_source();
-                    self.document.dirty_source = true;
-                }
-                self.set_cell_mode(CellMode::Insert);
-            }
             "cell.run" => {
                 self.commit_cell(cell_id);
                 self.run_cell(cell_id);
@@ -1594,30 +1604,11 @@ impl Coordinator {
                 } else {
                     self.commit_cell(cell_id);
                     self.focus.pop();
-                    self.term_effects.set_cursor_shape(CursorShape::SteadyBlock);
                 }
             }
             "cell.toggle_expand_split" => self.toggle_split(),
             "cell.split_at_cursor" => self.split_cell(cell_id),
             "intel.inspect_doc" => self.request_inspect(cell_id, false),
-            "edit.delete_char" => {
-                self.mutate_cell_buffer(cell_id, |buffer| buffer.delete_char_forward());
-            }
-            "edit.replace_char" => {
-                if let Some(ch) = arg {
-                    self.mutate_cell_buffer(cell_id, |buffer| buffer.replace_char(ch));
-                }
-            }
-            "edit.paste_after" => self.paste_text_in_cell(cell_id, true),
-            "edit.paste_before" => self.paste_text_in_cell(cell_id, false),
-            "edit.undo" => self.mutate_cell_buffer(cell_id, |buffer| {
-                let _ = buffer.undo();
-            }),
-            "edit.redo" => self.mutate_cell_buffer(cell_id, |buffer| {
-                let _ = buffer.redo();
-            }),
-            "visual.char" => self.enter_visual(cell_id, VisualKind::Char),
-            "visual.line" => self.enter_visual(cell_id, VisualKind::Line),
             _ => {}
         }
     }
@@ -1697,67 +1688,26 @@ impl Coordinator {
         }
     }
 
-    fn move_cell_cursor(&mut self, cell_id: &CellId, motion: &str, count: u32) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        let current = cell.buffer.cursor();
-        let target = match motion {
-            "motion.down" => CursorPos {
-                row: current
-                    .row
-                    .saturating_add(count as usize)
-                    .min(cell.buffer.line_count().saturating_sub(1)),
-                col: current.col,
-            },
-            "motion.up" => CursorPos {
-                row: current.row.saturating_sub(count as usize),
-                col: current.col,
-            },
-            "motion.top" => CursorPos { row: 0, col: 0 },
-            "motion.bottom" => CursorPos {
-                row: cell.buffer.line_count().saturating_sub(1),
-                col: 0,
-            },
-            "motion.half_page_down" => CursorPos {
-                row: current
-                    .row
-                    .saturating_add((count as usize).saturating_mul(10))
-                    .min(cell.buffer.line_count().saturating_sub(1)),
-                col: current.col,
-            },
-            "motion.half_page_up" => CursorPos {
-                row: current
-                    .row
-                    .saturating_sub((count as usize).saturating_mul(10)),
-                col: current.col,
-            },
-            "motion.left" => CursorPos {
-                row: current.row,
-                col: current.col.saturating_sub(count as usize),
-            },
-            "motion.right" => CursorPos {
-                row: current.row,
-                col: current.col.saturating_add(count as usize),
-            },
-            "motion.word_next" => cell.buffer.word_next(count),
-            "motion.word_back" => cell.buffer.word_back(count),
-            "motion.word_end" => cell.buffer.word_end(count),
-            "motion.line_start" => CursorPos {
-                row: current.row,
-                col: 0,
-            },
-            "motion.line_first_nonblank" => CursorPos {
-                row: current.row,
-                col: cell.buffer.first_nonblank_col(current.row),
-            },
-            "motion.line_end" => CursorPos {
-                row: current.row,
-                col: cell.buffer.line_char_len(current.row),
-            },
-            _ => current,
-        };
-        cell.buffer.set_cursor(target);
+    /// Insert-mode cursor keys: the cursor may sit after the last character.
+    fn move_insert_cursor(&mut self, cell_id: &CellId, motion: &str) {
+        if let Some(cell) = self.document.cell_mut(cell_id) {
+            apply_text_motion(&mut cell.buffer, motion);
+        }
+        self.vim.reset_column();
+    }
+
+    /// Esc from insert: back to normal mode one character left, like vim.
+    fn leave_insert(&mut self, cell_id: &CellId) {
+        if let Some(cell) = self.document.cell_mut(cell_id) {
+            let cursor = cell.buffer.cursor();
+            cell.buffer.set_cursor(CursorPos {
+                row: cursor.row,
+                col: cursor.col.saturating_sub(1),
+            });
+            vim::clamp_normal(&mut cell.buffer);
+        }
+        self.vim.reset_column();
+        self.set_cell_mode(CellMode::Normal);
     }
 
     fn apply_notebook_operator(&mut self, op: &str, target: Option<MotionOrObject>, count: u32) {
@@ -1819,153 +1769,19 @@ impl Coordinator {
         }
     }
 
-    fn apply_cell_operator(
-        &mut self,
-        cell_id: &CellId,
-        mode: CellMode,
-        op: &str,
-        target: Option<MotionOrObject>,
-        count: u32,
-    ) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        if matches!(mode, CellMode::Visual(_)) && target.is_none() {
-            let Some(selection) = cell.buffer.selection() else {
-                return;
-            };
-            let text = match op {
-                "op.yank" => cell.buffer.yank_span(selection.anchor, selection.head),
-                "op.delete" | "op.change" => {
-                    cell.buffer.checkpoint();
-                    let text = cell.buffer.delete_span(selection.anchor, selection.head);
-                    cell.bump_source();
-                    text
-                }
-                _ => String::new(),
-            };
-            if op == "op.yank" {
-                self.yank_text = text.clone();
-                let _ = self.clipboard.copy(&text);
-            }
-            if op == "op.change" {
-                cell.buffer.clear_selection();
-                self.set_cell_mode(CellMode::Insert);
-            } else if op == "op.delete" {
-                cell.buffer.clear_selection();
-                self.set_cell_mode(CellMode::Normal);
-            }
-            self.document.dirty_source = true;
-            return;
-        }
-        let cursor = cell.buffer.cursor();
-        match target {
-            Some(MotionOrObject::TextObject(object)) => {
-                let (a, b) = if object.0.as_ref() == "textobj.around_word" {
-                    cell.buffer.around_word_span()
-                } else {
-                    cell.buffer.inner_word_span()
-                };
-                self.apply_text_span(cell_id, op, a, b);
-            }
-            Some(MotionOrObject::Motion(motion)) => {
-                if matches!(
-                    motion.0.as_ref(),
-                    "motion.word_next" | "motion.word_back" | "motion.word_end"
-                ) {
-                    let target_pos = match motion.0.as_ref() {
-                        "motion.word_next" => cell.buffer.word_next(count),
-                        "motion.word_back" => cell.buffer.word_back(count),
-                        _ => cell.buffer.word_end(count),
-                    };
-                    self.apply_text_span(cell_id, op, cursor, target_pos);
-                } else {
-                    let last = cell.buffer.line_count().saturating_sub(1);
-                    let target_row = match motion.0.as_ref() {
-                        "motion.down" => cursor.row.saturating_add(count as usize).min(last),
-                        "motion.up" => cursor.row.saturating_sub(count as usize),
-                        "motion.bottom" => last,
-                        _ => cursor.row,
-                    };
-                    let start = cursor.row.min(target_row);
-                    let end = cursor.row.max(target_row).saturating_add(1);
-                    self.apply_line_span(cell_id, op, start..end);
-                }
-            }
-            None => {
-                let end = cursor
-                    .row
-                    .saturating_add(count.saturating_sub(1) as usize)
-                    .saturating_add(1);
-                self.apply_line_span(cell_id, op, cursor.row..end);
-            }
-        }
-    }
-
-    fn apply_line_span(&mut self, cell_id: &CellId, op: &str, rows: std::ops::Range<usize>) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        let rows = rows.start..rows.end.min(cell.buffer.line_count());
-        let text = match op {
-            "op.yank" => cell.buffer.yank_line_range(rows),
-            "op.delete" | "op.change" => {
-                cell.buffer.checkpoint();
-                cell.buffer.delete_line_range(rows)
-            }
-            _ => String::new(),
-        };
-        if op == "op.yank" {
-            self.yank_text = text.clone();
-            let _ = self.clipboard.copy(&text);
-        } else if matches!(op, "op.delete" | "op.change") {
-            cell.bump_source();
-            self.document.dirty_source = true;
-            if op == "op.change" {
-                self.set_cell_mode(CellMode::Insert);
-            }
-        }
-    }
-
-    fn apply_text_span(&mut self, cell_id: &CellId, op: &str, a: CursorPos, b: CursorPos) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        let text = match op {
-            "op.yank" => cell.buffer.yank_span(a, b),
-            "op.delete" | "op.change" => {
-                cell.buffer.checkpoint();
-                cell.buffer.delete_span(a, b)
-            }
-            _ => String::new(),
-        };
-        if op == "op.yank" {
-            self.yank_text = text.clone();
-            let _ = self.clipboard.copy(&text);
-        } else if matches!(op, "op.delete" | "op.change") {
-            cell.bump_source();
-            self.document.dirty_source = true;
-            if op == "op.change" {
-                self.set_cell_mode(CellMode::Insert);
-            }
-        }
-    }
-
     fn begin_cell_edit(&mut self, mode: CellMode) {
         let id = self.selected_cell.clone();
         self.cell_baselines
             .insert(id.clone(), self.cell_source(&id));
-        // Vim normal mode never rests past the last character of a line.
-        if matches!(mode, CellMode::Normal) {
-            if let Some(cell) = self.document.cell_mut(&id) {
-                let cursor = cell.buffer.cursor();
-                let len = cell.buffer.line_char_len(cursor.row);
-                cell.buffer.set_cursor(CursorPos {
-                    row: cursor.row,
-                    col: cursor.col.min(len.saturating_sub(1)),
-                });
+        if let Some(cell) = self.document.cell_mut(&id) {
+            match mode {
+                // One undo step per insert session.
+                CellMode::Insert => cell.buffer.checkpoint(),
+                // Vim normal mode never rests past the last character.
+                _ => vim::clamp_normal(&mut cell.buffer),
             }
         }
+        self.vim.reset_column();
         self.focus.push(FocusLayer::CellEdit {
             cell_id: id,
             mode,
@@ -2018,35 +1834,10 @@ impl Coordinator {
         }
     }
 
-    fn enter_visual(&mut self, cell_id: &CellId, kind: VisualKind) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        let cursor = cell.buffer.cursor();
-        cell.buffer.set_selection(Selection {
-            kind,
-            anchor: cursor,
-            head: cursor,
-        });
-        self.set_cell_mode(CellMode::Visual(kind));
-    }
-
-    fn update_visual_head(&mut self, cell_id: &CellId) {
-        let Some(cell) = self.document.cell_mut(cell_id) else {
-            return;
-        };
-        let Some(mut selection) = cell.buffer.selection() else {
-            return;
-        };
-        selection.head = cell.buffer.cursor();
-        cell.buffer.set_selection(selection);
-    }
-
+    /// Typed or pasted text in insert mode. The undo checkpoint was taken on
+    /// entering insert, so one `u` undoes the whole insert session.
     fn insert_cell_text(&mut self, cell_id: &CellId, text: &str) {
-        self.mutate_cell_buffer(cell_id, |buffer| {
-            buffer.checkpoint();
-            buffer.insert_str(text);
-        });
+        self.mutate_cell_buffer(cell_id, |buffer| buffer.insert_str(text));
     }
 
     fn mutate_cell_buffer<F>(&mut self, cell_id: &CellId, mutator: F)
@@ -2457,25 +2248,6 @@ impl Coordinator {
             self.selected_cell = selected;
         }
         self.remount_output_views();
-    }
-
-    fn paste_text_in_cell(&mut self, cell_id: &CellId, after: bool) {
-        if self.yank_text.is_empty() {
-            return;
-        }
-        if let Some(cell) = self.document.cell_mut(cell_id) {
-            let cursor = cell.buffer.cursor();
-            let mut offset = cell.buffer.char_offset_of(cursor);
-            if after {
-                offset = offset.saturating_add(1);
-            }
-            let pos = cursor_at_char_offset(&cell.buffer, offset);
-            cell.buffer.set_cursor(pos);
-            cell.buffer.checkpoint();
-            cell.buffer.insert_str(&self.yank_text.clone());
-            cell.bump_source();
-            self.document.dirty_source = true;
-        }
     }
 
     fn toggle_kind(&mut self) {

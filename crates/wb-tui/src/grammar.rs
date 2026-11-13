@@ -23,7 +23,9 @@ pub struct VimGrammar {
     seq: Vec<Key>,
     seq_started: Option<Instant>,
     speculative_chars: usize,
-    pending_char_arg: Option<(String, Option<u32>)>,
+    /// Action waiting for its character argument, its count, and whether it
+    /// is a motion (`f`, `t`) rather than a command (`r`, `m`).
+    pending_char_arg: Option<(String, Option<u32>, bool)>,
     pub insert_escape_chord: Duration,
 }
 
@@ -203,13 +205,28 @@ impl VimGrammar {
             return vec![GrammarStep::Cancelled];
         }
 
-        if let Some((action, count)) = self.pending_char_arg.clone() {
+        if let Some((action, count, is_motion)) = self.pending_char_arg.clone() {
             if let Some(argument) = key.printable() {
+                let pending_op = self.pending_op.clone();
                 self.reset();
-                return vec![GrammarStep::Resolved(ResolvedInput::Command {
-                    id: command_id(&action),
-                    count,
-                    arg: Some(argument),
+                if !is_motion {
+                    return vec![GrammarStep::Resolved(ResolvedInput::Command {
+                        id: command_id(&action),
+                        count,
+                        arg: Some(argument),
+                    })];
+                }
+                return vec![GrammarStep::Resolved(match pending_op {
+                    Some((op, op_count)) => ResolvedInput::Operate {
+                        op,
+                        target: MotionOrObject::MotionWithArg(motion_id(&action), argument),
+                        count: op_count.unwrap_or(1).saturating_mul(count.unwrap_or(1)),
+                    },
+                    None => ResolvedInput::Move {
+                        motion: motion_id(&action),
+                        count: count.unwrap_or(1),
+                        arg: Some(argument),
+                    },
                 })];
             }
             self.reset();
@@ -266,7 +283,7 @@ impl VimGrammar {
     fn resolve_exact(
         &mut self,
         keymap: &Keymap,
-        _ctx: &KeyContextId,
+        ctx: &KeyContextId,
         action: &str,
     ) -> Vec<GrammarStep> {
         let Some(kind) = keymap.action_spec(action).map(|spec| spec.kind) else {
@@ -278,6 +295,13 @@ impl VimGrammar {
 
         if let Some((pending_operator, operator_count)) = self.pending_op.clone() {
             match kind {
+                ActionKind::CharArgMotion => {
+                    // Keep the operator armed; the next key completes `df,`.
+                    let total = operator_count.map_or(count, |n| Some(n.saturating_mul(count.unwrap_or(1))));
+                    self.pending_op = Some((pending_operator, None));
+                    self.pending_char_arg = Some((action.to_string(), total, true));
+                    return vec![GrammarStep::Pending];
+                }
                 ActionKind::Operator if pending_operator.0.as_ref() == action => {
                     let motion_count = count.unwrap_or(1);
                     let total = operator_count.unwrap_or(1).saturating_mul(motion_count);
@@ -317,6 +341,14 @@ impl VimGrammar {
         }
 
         match kind {
+            // In visual mode the selection is the operand: act right away.
+            ActionKind::Operator if keymap.context_spec(ctx).is_some_and(|spec| spec.visual) => {
+                self.reset();
+                vec![GrammarStep::Resolved(ResolvedInput::OperateSelf {
+                    op: operator_id(action),
+                    count: count.unwrap_or(1),
+                })]
+            }
             ActionKind::Operator => {
                 self.pending_op = Some((operator_id(action), count));
                 vec![GrammarStep::Pending]
@@ -326,10 +358,15 @@ impl VimGrammar {
                 vec![GrammarStep::Resolved(ResolvedInput::Move {
                     motion: motion_id(action),
                     count: count.unwrap_or(1),
+                    arg: None,
                 })]
             }
             ActionKind::CharArgCommand => {
-                self.pending_char_arg = Some((action.to_string(), count));
+                self.pending_char_arg = Some((action.to_string(), count, false));
+                vec![GrammarStep::Pending]
+            }
+            ActionKind::CharArgMotion => {
+                self.pending_char_arg = Some((action.to_string(), count, true));
                 vec![GrammarStep::Pending]
             }
             ActionKind::Command => {
@@ -364,6 +401,7 @@ impl VimGrammar {
             ActionKind::Motion => Some(ResolvedInput::Move {
                 motion: motion_id(action),
                 count: count.unwrap_or(1),
+                arg,
             }),
             _ => None,
         }

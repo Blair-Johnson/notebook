@@ -9,6 +9,7 @@ pub mod cell;
 pub mod codec;
 pub mod document;
 pub mod id;
+pub mod motion;
 pub mod ops;
 pub mod output;
 
@@ -16,6 +17,7 @@ pub use buffer::{BufferSnapshot, CursorPos, Selection, TextBuffer, VisualKind};
 pub use cell::{Cell, CellKind, CellRevisions};
 pub use codec::{CoreError, NotebookFormat};
 pub use document::{Document, ExternalReloadOutcome, FormatBacking};
+pub use motion::{Motion, MotionCtx, MotionKind, MotionTarget, Span, TextObject};
 pub use id::{CellId, CommId, ExecId, OutputId, TargetId};
 pub use ops::{DocOp, UndoHistory};
 pub use output::{MimeBundle, OutputData, OutputItem, StreamBuffer, StreamKind};

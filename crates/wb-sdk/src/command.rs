@@ -28,6 +28,8 @@ pub enum ActionKind {
     TextObject,
     /// Command consuming one subsequent printable character argument (`m a`, `' a`, `r x`).
     CharArgCommand,
+    /// Motion consuming one subsequent character (`f x`, `t x`); usable after an operator.
+    CharArgMotion,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,8 @@ pub struct ActionSpec {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MotionOrObject {
     Motion(MotionId),
+    /// A character-argument motion with its character (`df,`).
+    MotionWithArg(MotionId, char),
     TextObject(TextObjectId),
 }
 
@@ -57,6 +61,8 @@ pub enum ResolvedInput {
     Move {
         motion: MotionId,
         count: u32,
+        /// Character argument of `f`/`t`-style motions.
+        arg: Option<char>,
     },
     OperateSelf {
         op: OperatorId,

@@ -64,4 +64,7 @@ pub struct KeyContextSpec {
     pub parents: Vec<KeyContextId>,
     pub text_entry: bool,
     pub operator_pending: Option<KeyContextId>,
+    /// Visual-mode context: operators act on the selection immediately
+    /// instead of waiting for a motion.
+    pub visual: bool,
 }

@@ -36,6 +36,7 @@ fn context(
             .collect(),
         text_entry,
         operator_pending: operator_pending.map(KeyContextId::new_static),
+        visual: id.ends_with(".visual"),
     });
 }
 
@@ -102,9 +103,17 @@ impl Plugin for BuiltinsPlugin {
         );
         context(
             reg,
+            "text.motions",
+            "In-Text Motions (cells and outputs)",
+            &[],
+            false,
+            None,
+        );
+        context(
+            reg,
             "cell.normal",
             "Cell Normal Mode",
-            &["vim.normal"],
+            &["text.motions", "vim.normal"],
             false,
             Some("text.pending"),
         );
@@ -112,7 +121,23 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "cell.visual",
             "Cell Visual Mode",
-            &["vim.normal"],
+            &["text.motions", "vim.normal"],
+            false,
+            Some("text.pending"),
+        );
+        context(
+            reg,
+            "output.normal",
+            "Output (read-only text)",
+            &["text.motions", "vim.normal"],
+            false,
+            Some("text.pending"),
+        );
+        context(
+            reg,
+            "output.visual",
+            "Output Visual Mode",
+            &["text.motions", "vim.normal"],
             false,
             Some("text.pending"),
         );
@@ -433,6 +458,72 @@ impl Plugin for BuiltinsPlugin {
             (84, "edit.delete_to_line_end", "Delete to end of line"),
         ] {
             action(reg, id, ActionKind::Command, "Editing", order, title, false);
+        }
+        for (order, id, title) in [
+            (85, "edit.delete_char_back", "Delete character before cursor (X)"),
+            (86, "edit.substitute", "Substitute character (s)"),
+            (87, "edit.substitute_line", "Substitute line (S)"),
+            (88, "edit.delete_to_eol", "Delete to end of line (D)"),
+            (89, "edit.change_to_eol", "Change to end of line (C)"),
+            (90, "edit.yank_line", "Yank line (Y)"),
+            (91, "edit.toggle_case", "Toggle case (~)"),
+            (92, "edit.join_lines", "Join lines (J)"),
+            (93, "edit.insert_line_start", "Insert at first non-blank (I)"),
+            (94, "edit.append_line_end", "Append at end of line (A)"),
+            (95, "edit.open_below", "Open line below (o)"),
+            (96, "edit.open_above", "Open line above (O)"),
+            (97, "visual.swap_ends", "Swap selection ends (o)"),
+        ] {
+            action(reg, id, ActionKind::Command, "Editing", order, title, false);
+        }
+        for (order, id, title) in [
+            (60, "motion.current_line", "Current line, first non-blank (_)"),
+            (61, "motion.bigword_next", "Next WORD (W)"),
+            (62, "motion.bigword_back", "Previous WORD (B)"),
+            (63, "motion.bigword_end", "End of WORD (E)"),
+            (64, "motion.paragraph_next", "Next paragraph (})"),
+            (65, "motion.paragraph_prev", "Previous paragraph ({)"),
+            (66, "motion.match_pair", "Matching bracket (%)"),
+            (67, "motion.repeat_find", "Repeat f/t (;)"),
+            (68, "motion.repeat_find_reverse", "Repeat f/t backwards (,)"),
+        ] {
+            action(reg, id, ActionKind::Motion, "Navigation", order, title, false);
+        }
+        for (order, id, title) in [
+            (70, "motion.find_forward", "Find character forward (f)"),
+            (71, "motion.find_backward", "Find character backward (F)"),
+            (72, "motion.till_forward", "Till character forward (t)"),
+            (73, "motion.till_backward", "Till character backward (T)"),
+        ] {
+            action(reg, id, ActionKind::CharArgMotion, "Navigation", order, title, false);
+        }
+        for (order, id, title) in [
+            (40, "op.indent", "Indent (>)"),
+            (41, "op.dedent", "Dedent (<)"),
+        ] {
+            action(reg, id, ActionKind::Operator, "Editing", order, title, false);
+        }
+        for (order, name, title) in [
+            (10, "bigword", "WORD"),
+            (11, "dquote", "double-quoted string"),
+            (12, "squote", "single-quoted string"),
+            (13, "backtick", "backtick string"),
+            (14, "paren", "parentheses"),
+            (15, "bracket", "square brackets"),
+            (16, "brace", "braces"),
+            (17, "angle", "angle brackets"),
+            (18, "paragraph", "paragraph"),
+        ] {
+            for (around, prefix) in [(false, "inner"), (true, "around")] {
+                reg.add_action(ActionSpec {
+                    id: format!("textobj.{prefix}_{name}"),
+                    kind: ActionKind::TextObject,
+                    category: "Text Objects".into(),
+                    order: order * 2 + u16::from(around),
+                    title: format!("{} {title}", if around { "Around" } else { "Inner" }).into(),
+                    cannot_unbind: false,
+                });
+            }
         }
         action(
             reg,

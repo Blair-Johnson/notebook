@@ -64,7 +64,7 @@ fn vim_normal_rebinding_inherits_through_multiple_levels() {
         &registry,
         r#"
 [keys."vim.normal"]
-"motion.down" = ["J"]
+"motion.down" = ["Q"]
 "#,
     );
     for id in [
@@ -74,7 +74,7 @@ fn vim_normal_rebinding_inherits_through_multiple_levels() {
         "output.stream",
     ] {
         assert_eq!(
-            keymap.lookup(&context(id), false, &[Key::Char('J')]),
+            keymap.lookup(&context(id), false, &[Key::Char('Q')]),
             LookupResult::Exact("motion.down".into())
         );
         assert_eq!(

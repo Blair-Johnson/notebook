@@ -164,3 +164,65 @@ fn global_commands_work_while_editing_a_cell() {
     keys(&mut c, ":");
     assert!(matches!(c.focus.top(), FocusLayer::Modal(ModalKind::ExCommandBar)));
 }
+
+/// Open cell 0 in normal mode with the cursor at `(row, col)`.
+fn editing(sources: &[&str], row: usize, col: usize) -> Coordinator {
+    let mut c = coordinator(sources);
+    press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+    let id = c.document.order()[0].clone();
+    c.document
+        .cell_mut(&id)
+        .unwrap()
+        .buffer
+        .set_cursor(wb_core::CursorPos { row, col });
+    c
+}
+
+#[test]
+fn vim_operators_through_the_real_keymap() {
+    let mut c = editing(&["x = compute(a, b)"], 0, 4);
+    keys(&mut c, "d$");
+    assert_eq!(source(&c, 0), "x = ");
+
+    let mut c = editing(&["f(a, b, c)"], 0, 0);
+    keys(&mut c, "df,");
+    assert_eq!(source(&c, 0), " b, c)");
+    keys(&mut c, "u");
+    assert_eq!(source(&c, 0), "f(a, b, c)");
+
+    let mut c = editing(&["print(\"hi\", x)"], 0, 7);
+    keys(&mut c, "ci(");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
+    keys(&mut c, "y");
+    assert_eq!(source(&c, 0), "print(y)");
+
+    let mut c = editing(&["one\ntwo\nthree"], 0, 0);
+    keys(&mut c, "ddp");
+    assert_eq!(source(&c, 0), "two\none\nthree");
+
+    let mut c = editing(&["one\ntwo\nthree"], 0, 1);
+    keys(&mut c, "Vjd");
+    assert_eq!(source(&c, 0), "three");
+    assert_eq!(mode(&c), Some(CellMode::Normal));
+
+    let mut c = editing(&["abc def ghi"], 0, 4);
+    keys(&mut c, "vex");
+    assert_eq!(source(&c, 0), "abc  ghi");
+
+    let mut c = editing(&["first\nsecond"], 0, 0);
+    keys(&mut c, "A!");
+    press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(source(&c, 0), "first!\nsecond");
+    keys(&mut c, "J");
+    assert_eq!(source(&c, 0), "first! second");
+}
+
+#[test]
+fn one_undo_reverts_a_whole_insert_session() {
+    let mut c = editing(&["base"], 0, 3);
+    keys(&mut c, "a more text");
+    press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(source(&c, 0), "base more text");
+    keys(&mut c, "u");
+    assert_eq!(source(&c, 0), "base");
+}
