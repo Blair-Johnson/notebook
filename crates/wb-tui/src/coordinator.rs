@@ -747,16 +747,28 @@ impl Coordinator {
                 ..
             } => {
                 if let TargetId::Cell(cell_id) = target {
-                    self.run_states.insert(
-                        cell_id.clone(),
-                        if ok { RunState::Done } else { RunState::Failed },
-                    );
-                    if let Some(cell) = self.document.cell_mut(&cell_id) {
-                        cell.last_elapsed = Some(elapsed);
-                        cell.bump_chrome();
-                    }
-                    if !ok {
-                        self.notice = Some("execution failed".into());
+                    // A queued cell that fails without ever starting was
+                    // cancelled after an earlier error or interrupt.
+                    let never_started =
+                        matches!(self.run_states.get(&cell_id), Some(RunState::Queued));
+                    if !ok && never_started {
+                        self.run_states.remove(&cell_id);
+                        if let Some(cell) = self.document.cell_mut(&cell_id) {
+                            cell.bump_chrome();
+                        }
+                        self.notice = Some("cancelled queued cells".into());
+                    } else {
+                        self.run_states.insert(
+                            cell_id.clone(),
+                            if ok { RunState::Done } else { RunState::Failed },
+                        );
+                        if let Some(cell) = self.document.cell_mut(&cell_id) {
+                            cell.last_elapsed = Some(elapsed);
+                            cell.bump_chrome();
+                        }
+                        if !ok {
+                            self.notice = Some("execution failed".into());
+                        }
                     }
                 }
                 self.kernel_busy = self.active_runs() > 0;
@@ -2395,6 +2407,14 @@ impl Coordinator {
         match payload {
             WireOutput::Stream { stream, text } => {
                 self.document.append_stream(&cell_id, stream, &text, late);
+                // The stream tab follows whichever stream is writing (so a
+                // tqdm bar on stderr is visible) until the user picks one.
+                if let Some(cell) = self.document.cell_mut(&cell_id) {
+                    if !cell.stream_tab_pinned && cell.stream_tab != stream {
+                        cell.stream_tab = stream;
+                        cell.bump_chrome();
+                    }
+                }
             }
             WireOutput::Rich {
                 bundle,
@@ -2567,10 +2587,10 @@ impl Coordinator {
         let Some(cell) = self.document.cell(&id).cloned() else {
             return;
         };
+        // `t` switches between code and markdown; raw goes back to code.
         let new_kind = match cell.kind {
             CellKind::Code => CellKind::Markdown,
-            CellKind::Markdown => CellKind::Raw,
-            CellKind::Raw => CellKind::Code,
+            CellKind::Markdown | CellKind::Raw => CellKind::Code,
         };
         self.document.apply(DocOp::SetCellKind {
             cell_id: id,
@@ -2593,6 +2613,7 @@ impl Coordinator {
             StreamKind::Stdout => StreamKind::Stderr,
             StreamKind::Stderr => StreamKind::Stdout,
         };
+        cell.stream_tab_pinned = true;
         cell.bump_chrome();
         self.follow_focus = true;
     }
@@ -2782,6 +2803,9 @@ impl Coordinator {
         if had_outputs {
             self.clear_outputs(cell_id);
         }
+        if let Some(cell) = self.document.cell_mut(cell_id) {
+            cell.stream_tab_pinned = false;
+        }
         self.run_states.insert(cell_id.clone(), RunState::Queued);
         self.send_command(KernelCmd::Execute {
             target: TargetId::Cell(cell_id.clone()),
@@ -2789,7 +2813,9 @@ impl Coordinator {
             code,
             silent: false,
             store_history: true,
-            stop_on_error: false,
+            // Like Jupyter: an error or interrupt cancels the cells queued
+            // behind this one.
+            stop_on_error: true,
         });
     }
 

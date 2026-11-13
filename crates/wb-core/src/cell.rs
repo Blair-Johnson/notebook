@@ -44,6 +44,8 @@ pub struct Cell {
     pub collapsed: bool,
     /// Which stream the card's stdout/stderr tabs show (not saved).
     pub stream_tab: StreamKind,
+    /// The user chose `stream_tab`; output no longer switches it.
+    pub stream_tab_pinned: bool,
     pub last_elapsed: Option<Duration>,
     pub revs: CellRevisions,
     /// Preserves unknown nbformat cell fields (`metadata`, custom keys).
@@ -60,6 +62,7 @@ impl Cell {
             execution_count: None,
             collapsed: false,
             stream_tab: StreamKind::Stdout,
+            stream_tab_pinned: false,
             last_elapsed: None,
             revs: CellRevisions::default(),
             extra: Map::new(),

@@ -114,6 +114,7 @@ fn hint_actions(
             ("cell.run", "run"),
             ("cell.run_and_advance", "run+next"),
             ("cell.insert_below", "new cell"),
+            ("cell.toggle_kind", "md/code"),
             ("op.delete", "delete"),
             ("app.palette", "commands"),
             ("app.help", "help"),

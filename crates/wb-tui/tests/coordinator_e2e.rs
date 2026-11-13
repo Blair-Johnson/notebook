@@ -473,3 +473,103 @@ fn rerunning_a_cell_replaces_its_outputs() {
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].plain_text(), "second");
 }
+
+fn ready(coordinator: &mut Coordinator) {
+    coordinator.apply_kernel_event(KernelEvent::Ready {
+        info: KernelSessionInfo {
+            generation: 1,
+            kernel_name: "python".into(),
+            display_name: "Python".into(),
+            spec_dir: PathBuf::new(),
+            connection_file: PathBuf::new(),
+            pid: None,
+            supports_subshells: false,
+            supports_debugger: false,
+        },
+    });
+}
+
+fn stream_event(cell_id: &wb_core::CellId, stream: wb_core::StreamKind, text: &str) -> KernelEvent {
+    KernelEvent::Output {
+        exec_id: None,
+        target: TargetId::Cell(cell_id.clone()),
+        late: false,
+        payload: WireOutput::Stream {
+            stream,
+            text: text.into(),
+        },
+    }
+}
+
+#[test]
+fn stream_tab_follows_the_writing_stream_until_the_user_picks_one() {
+    use wb_core::StreamKind::{Stderr, Stdout};
+    let (kernel, _handle) = FakeKernel::pair();
+    let document = document_with_sources(&["run()"], FormatBacking::PercentPy { header: None });
+    let cell_id = document.order()[0].clone();
+    let mut coordinator = Coordinator::headless(document, registry(), Box::new(kernel));
+    ready(&mut coordinator);
+    coordinator.on_key(key(KeyCode::Enter), Instant::now());
+    let tab = |c: &Coordinator| c.document.cell(&cell_id).unwrap().stream_tab;
+
+    coordinator.apply_kernel_event(stream_event(&cell_id, Stdout, "starting\n"));
+    assert_eq!(tab(&coordinator), Stdout);
+    // tqdm writes its bar to stderr: the tab follows so it stays visible.
+    coordinator.apply_kernel_event(stream_event(&cell_id, Stderr, "\r 10%|#"));
+    assert_eq!(tab(&coordinator), Stderr);
+
+    // Choosing a tab pins it.
+    coordinator.on_key(key(KeyCode::Char('j')), Instant::now());
+    coordinator.on_key(key(KeyCode::Tab), Instant::now());
+    assert_eq!(tab(&coordinator), Stdout);
+    coordinator.apply_kernel_event(stream_event(&cell_id, Stderr, "\r 20%|##"));
+    assert_eq!(tab(&coordinator), Stdout);
+}
+
+#[test]
+fn an_error_cancels_queued_cells_and_runs_send_stop_on_error() {
+    let (kernel, mut handle) = FakeKernel::pair();
+    let document = document_with_sources(&["fail()", "after()"], FormatBacking::PercentPy { header: None });
+    let order = document.order().to_vec();
+    let mut coordinator = Coordinator::headless(document, registry(), Box::new(kernel));
+    ready(&mut coordinator);
+    let _ = handle.drain_commands();
+    coordinator.on_key(key(KeyCode::Enter), Instant::now());
+    coordinator.on_key(key(KeyCode::Char('j')), Instant::now());
+    coordinator.on_key(key(KeyCode::Enter), Instant::now());
+    assert!(handle.drain_commands().iter().all(|command| matches!(
+        command,
+        KernelCmd::Execute { stop_on_error: true, .. }
+    )));
+
+    // The first cell started and failed; the second never started.
+    coordinator.apply_kernel_event(KernelEvent::ExecutionStarted {
+        exec_id: wb_core::ExecId("a".into()),
+        target: TargetId::Cell(order[0].clone()),
+        execution_count: Some(1),
+    });
+    for id in &order {
+        coordinator.apply_kernel_event(KernelEvent::ExecutionFinished {
+            exec_id: wb_core::ExecId("x".into()),
+            target: TargetId::Cell(id.clone()),
+            ok: false,
+            elapsed: std::time::Duration::from_millis(5),
+        });
+    }
+    assert!(coordinator.run_states.contains_key(&order[0]));
+    assert!(!coordinator.run_states.contains_key(&order[1]), "cancelled, not failed");
+    assert!(coordinator.document.cell(&order[1]).unwrap().last_elapsed.is_none());
+}
+
+#[test]
+fn t_toggles_between_code_and_markdown() {
+    let (kernel, _handle) = FakeKernel::pair();
+    let document = document_with_sources(&["# Title"], FormatBacking::PercentPy { header: None });
+    let cell_id = document.order()[0].clone();
+    let mut coordinator = Coordinator::headless(document, registry(), Box::new(kernel));
+    let kind = |c: &Coordinator| c.document.cell(&cell_id).unwrap().kind;
+    coordinator.on_key(key(KeyCode::Char('t')), Instant::now());
+    assert_eq!(kind(&coordinator), wb_core::CellKind::Markdown);
+    coordinator.on_key(key(KeyCode::Char('t')), Instant::now());
+    assert_eq!(kind(&coordinator), wb_core::CellKind::Code);
+}

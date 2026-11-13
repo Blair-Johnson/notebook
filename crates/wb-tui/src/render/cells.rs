@@ -311,7 +311,10 @@ impl CellCtx<'_> {
         let status: Option<(String, Color)> = match state {
             Some(RunState::Queued) => Some(("queued".into(), p.muted)),
             Some(RunState::Running) => Some((
-                format!("{} running", SPINNER[self.view.spinner_tick % SPINNER.len()]),
+                format!(
+                    "{} running · ctrl+c to stop",
+                    SPINNER[self.view.spinner_tick % SPINNER.len()]
+                ),
                 p.warning,
             )),
             Some(RunState::Failed) => Some((
