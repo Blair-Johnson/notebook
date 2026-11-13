@@ -213,3 +213,41 @@ fn a_notebook_that_fits_on_screen_does_not_follow() {
     }
     assert_eq!(c.scroll_row, 0, "nothing was scrolled, so nothing follows");
 }
+
+fn tick(c: &mut Coordinator) {
+    c.on_tick(Instant::now());
+    draw(c);
+}
+
+/// The user's freeze: at the bottom of a long notebook, run all; while cells
+/// run (the spinner redraws every tick) j/k must still move the cursor.
+#[test]
+fn keys_move_the_cursor_while_cells_run_at_the_bottom() {
+    let mut c = notebook();
+    let long: String = (0..60).map(|n| format!("saved {n}\n")).collect();
+    print_to(&mut c, 3, &long);
+    key(&mut c, KeyCode::Char('G'));
+    assert_eq!(c.scroll_row, max_scroll(&c));
+    // Run all: outputs clear, the first cell starts running.
+    key(&mut c, KeyCode::Char('X'));
+    let first = c.document.order()[0].clone();
+    c.apply_kernel_event(KernelEvent::ExecutionStarted {
+        exec_id: nb_core::ExecId("e0".into()),
+        target: TargetId::Cell(first),
+        execution_count: Some(1),
+    });
+    draw(&mut c);
+    let start = (c.selected_cell.clone(), c.scroll_row);
+    for _ in 0..6 {
+        key(&mut c, KeyCode::Char('k'));
+        tick(&mut c);
+        tick(&mut c);
+    }
+    let moved = (c.selected_cell.clone(), c.scroll_row);
+    assert_ne!(moved, start, "k moved the cursor while a cell was running");
+    let row_after_keys = c.scroll_row;
+    for _ in 0..10 {
+        tick(&mut c);
+    }
+    assert_eq!(c.scroll_row, row_after_keys, "ticks did not drag the view back");
+}

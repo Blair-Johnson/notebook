@@ -4,6 +4,7 @@ mod editor;
 mod input;
 mod runtime;
 mod terminal;
+mod watchdog;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -183,10 +184,16 @@ async fn run_loop(
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    let mut trace = LoopTrace::from_env();
+    let dog = watchdog::Watchdog::spawn();
+    dog.enter(watchdog::Phase::Draw);
     draw_frame(terminal, coordinator)?;
 
     while !coordinator.should_quit {
         let mut redraw = false;
+        let mut kind = "idle";
+        let mut started = Instant::now();
+        dog.enter(watchdog::Phase::Waiting);
         tokio::select! {
             biased;
             _ = sigterm.recv() => {
@@ -201,6 +208,9 @@ async fn run_loop(
             maybe_event = input.events.recv() => {
                 let Some(event_result) = maybe_event else { break };
                 let event = event_result?;
+                kind = "input";
+                dog.enter(watchdog::Phase::Input);
+                started = Instant::now();
                 handle_terminal_events(
                     terminal,
                     coordinator,
@@ -213,6 +223,9 @@ async fn run_loop(
             kernel_event = nb_kernel::recv_event(coordinator.kernel.as_mut()), if kernel_open => {
                 match kernel_event {
                     Some(first) => {
+                        kind = "kernel";
+                        dog.enter(watchdog::Phase::Kernel);
+                        started = Instant::now();
                         let mut queued = vec![first];
                         while queued.len() < 64 {
                             let Some(event) = coordinator.kernel.try_recv() else { break };
@@ -227,17 +240,75 @@ async fn run_loop(
                 }
             }
             _ = fast_tick.tick() => {
+                kind = "tick";
+                dog.enter(watchdog::Phase::Tick);
+                started = Instant::now();
                 redraw = coordinator.on_tick(Instant::now());
             }
             _ = autosave_tick.tick() => {
+                kind = "autosave";
+                dog.enter(watchdog::Phase::Autosave);
+                started = Instant::now();
                 coordinator.on_autosave_tick();
             }
         }
+        let handled = started.elapsed();
         if redraw && !coordinator.should_quit {
+            dog.enter(watchdog::Phase::Draw);
             draw_frame(terminal, coordinator)?;
         }
+        trace.record(coordinator, kind, handled, started.elapsed() - handled);
     }
     Ok(())
+}
+
+/// Loop iterations slower than this are reported in the log overlay.
+const SLOW_ITERATION: Duration = Duration::from_millis(100);
+
+/// Per-iteration timing: slow iterations go to the in-app log; with
+/// `NB_TRACE=FILE`, every iteration is also appended to FILE.
+struct LoopTrace {
+    file: Option<std::io::BufWriter<fs::File>>,
+    start: Instant,
+}
+
+impl LoopTrace {
+    fn from_env() -> Self {
+        let file = std::env::var_os("NB_TRACE")
+            .and_then(|path| fs::File::create(path).ok())
+            .map(std::io::BufWriter::new);
+        Self {
+            file,
+            start: Instant::now(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        coordinator: &mut Coordinator,
+        kind: &str,
+        handled: Duration,
+        drawn: Duration,
+    ) {
+        use std::io::Write;
+        if let Some(file) = self.file.as_mut() {
+            let _ = writeln!(
+                file,
+                "{:.3} {kind} handle_ms={:.1} draw_ms={:.1}",
+                self.start.elapsed().as_secs_f64(),
+                handled.as_secs_f64() * 1000.0,
+                drawn.as_secs_f64() * 1000.0
+            );
+            let _ = file.flush();
+        }
+        if handled + drawn >= SLOW_ITERATION {
+            coordinator.push_log(format!(
+                "slow {kind}: handle {} ms, draw {} ms",
+                handled.as_millis(),
+                drawn.as_millis()
+            ));
+        }
+    }
 }
 
 /// Handle `first` and everything else already queued, then draw once: a

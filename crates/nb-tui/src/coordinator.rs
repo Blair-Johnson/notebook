@@ -3543,7 +3543,7 @@ impl Coordinator {
         id
     }
 
-    fn push_log(&mut self, line: String) {
+    pub fn push_log(&mut self, line: String) {
         if self.logs.len() >= 2_000 {
             self.logs.pop_front();
         }
