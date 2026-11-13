@@ -198,7 +198,7 @@ pub fn confirm_text(action: &ConfirmAction) -> (&'static str, &'static [(&'stati
     match action {
         ConfirmAction::ReloadExternalDiskChange => (
             "The file changed on disk.",
-            &[("l", "load disk version"), ("esc", "keep mine")],
+            &[("L", "load disk version"), ("esc", "keep mine")],
         ),
         ConfirmAction::RestartLiveKernel { .. } => (
             "Restart the kernel? Its state will be lost.",

@@ -1,5 +1,5 @@
 //! Popups and modals: completion, signature help, help, command palette,
-//! settings, logs, docs pager, confirm dialog, debugger dock.
+//! settings, logs, docs pager, confirm dialog, input / debugger dock.
 
 use super::chrome::{confirm_text, help_context};
 use super::style::{centered, key_style, panel};
@@ -488,7 +488,16 @@ pub fn draw_dock(frame: &mut Frame<'_>, view: &AppView<'_>, theme: &Theme, area:
         return None;
     };
     let p = &theme.palette;
-    let inner = panel(frame, area, "debugger", theme);
+    // The same dock serves pdb and plain `input()`: name it after the prompt.
+    let prompt = dock.prompt.trim();
+    let title = if prompt.starts_with("(Pdb") || prompt.starts_with("ipdb>") {
+        "debugger"
+    } else if dock.password {
+        "password"
+    } else {
+        "input"
+    };
+    let inner = panel(frame, area, title, theme);
     let shown = if dock.password {
         "•".repeat(dock.composer.as_str().chars().count())
     } else {

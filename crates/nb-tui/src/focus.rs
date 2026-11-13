@@ -73,7 +73,7 @@ impl FocusLayer {
             Self::CellEdit { mode: CellMode::Visual(_), .. } => "VISUAL",
             Self::OutputFocus { mode: CellMode::Visual(_), .. } => "VISUAL",
             Self::OutputFocus { .. } => "OUTPUT",
-            Self::PdbInput => "DEBUGGER",
+            Self::PdbInput => "INPUT",
             Self::Modal(kind) => match kind {
                 ModalKind::CommandPalette => "COMMANDS",
                 ModalKind::SearchPrompt => "SEARCH",

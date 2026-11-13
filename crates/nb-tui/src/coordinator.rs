@@ -25,6 +25,7 @@ use ratatui::layout::Rect;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use crate::platform::mtime_watch::{MtimeWatch, mtime_of as file_mtime};
 use crate::platform::process::run_with_timeout;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -380,66 +381,36 @@ impl Coordinator {
                 }
             }
         }
-        let output_region = self.output_region_rows(text_w);
+        // Keeps an entered output's cursor inside its region.
+        self.output_region_rows(text_w);
         let followed = self.follow_focus;
         let notebook_level = matches!(self.focus.base(), FocusLayer::NotebookNormal);
         let scrolloff = u32::from(snap.core.scrolloff).min(height.saturating_sub(1) / 2);
-        let nb_global = if notebook_level {
-            self.nb_cursor()
-                .map(|(index, row)| self.layout_cache.heights().prefix_sum(index) + row)
-        } else {
-            None
-        };
+        if notebook_level {
+            // Keeps the notebook cursor on a valid row of its cell.
+            self.nb_cursor();
+        }
         if self.follow_focus {
             self.follow_focus = false;
-            if let Some(index) = self.document.position_of(&self.selected_cell) {
-                let heights = self.layout_cache.heights();
-                if index < heights.len() {
-                    let top = heights.prefix_sum(index);
-                    let cell_rows = heights.height(index);
-                    let source_rows = self
-                        .layout_cache
-                        .cached(&self.selected_cell)
-                        .map_or(1, |cached| cached.wrapped_source.len() as u32);
-                    let outputs_top =
-                        top + CardRows::from_total(cell_rows, source_rows).outputs_top();
-                    let entered = matches!(self.focus.base(), FocusLayer::OutputFocus { .. });
-                    let (want_top, want_bottom) = match editing.as_ref() {
-                        Some(id) if id == &self.selected_cell => {
-                            let row = top + 1 + self.cursor_visual_row(id, text_w);
-                            (row, row + 1)
-                        }
-                        _ if entered => {
-                            let row = output_region.map_or(0, |(cursor_row, scroll, _)| {
-                                cursor_row.saturating_sub(scroll)
-                            });
-                            // The text starts below the block's header divider.
-                            (outputs_top + 1 + row, outputs_top + row + 2)
-                        }
-                        // A cell jump to an off-screen target: its top (the
-                        // border or divider above the cursor row) at the top.
-                        _ if nb_global.is_some_and(|row| {
-                            self.align_jump && (row < self.scroll_row || row >= self.scroll_row + height)
-                        }) =>
-                        {
-                            let row = nb_global.unwrap_or(top).saturating_sub(1);
-                            (row, row + 1)
-                        }
-                        // The notebook cursor row, with a margin.
-                        _ if nb_global.is_some() => {
-                            let row = nb_global.unwrap_or(top);
-                            (row.saturating_sub(scrolloff), row + 1 + scrolloff)
-                        }
-                        _ => (top, top + cell_rows.min(height)),
-                    };
-                    let aligning = self.align_jump
-                        && nb_global.is_some_and(|row| row < self.scroll_row || row >= self.scroll_row + height);
-                    if aligning || want_top < self.scroll_row {
-                        self.scroll_row = want_top;
-                    } else if want_bottom > self.scroll_row + height {
-                        self.scroll_row = want_bottom - height;
-                    }
+            // Cells that were never drawn have estimated heights. Scrolling
+            // measures the cells that come into view, which can move the
+            // target (`G` would stop short): scroll again until it settles.
+            for _ in 0..4 {
+                let before = self.scroll_row;
+                self.scroll_to_focus(editing.as_ref(), text_w, height, scrolloff, notebook_level);
+                if self.scroll_row == before {
+                    break;
                 }
+                self.layout_cache.sync_viewport(
+                    &self.document,
+                    &mut self.output_views,
+                    text_w,
+                    self.scroll_row,
+                    viewport.height,
+                    snap.core.max_output_rows,
+                    &snap.theme,
+                    editing.as_ref(),
+                );
             }
         }
         let total = self.layout_cache.heights().total_height();
@@ -469,6 +440,73 @@ impl Coordinator {
                 let cell_id = self.document.order().get(index)?.clone();
                 Some((cell_id, offset, self.scroll_row))
             });
+    }
+
+    /// Scroll so the focus (edit cursor, entered output cursor, notebook
+    /// cursor, or the selected cell) is in view, against current heights.
+    fn scroll_to_focus(
+        &mut self,
+        editing: Option<&CellId>,
+        text_w: u16,
+        height: u32,
+        scrolloff: u32,
+        notebook_level: bool,
+    ) {
+        let Some(index) = self.document.position_of(&self.selected_cell) else {
+            return;
+        };
+        let nb_global = if notebook_level {
+            self.nb_cursor()
+                .map(|(index, row)| self.layout_cache.heights().prefix_sum(index) + row)
+        } else {
+            None
+        };
+        let output_region = self.output_region_rows(text_w);
+        let heights = self.layout_cache.heights();
+        if index >= heights.len() {
+            return;
+        }
+        let top = heights.prefix_sum(index);
+        let cell_rows = heights.height(index);
+        let source_rows = self
+            .layout_cache
+            .cached(&self.selected_cell)
+            .map_or(1, |cached| cached.wrapped_source.len() as u32);
+        let outputs_top = top + CardRows::from_total(cell_rows, source_rows).outputs_top();
+        let entered = matches!(self.focus.base(), FocusLayer::OutputFocus { .. });
+        let off_screen =
+            |row: u32, scroll: u32| row < scroll || row >= scroll + height;
+        let (want_top, want_bottom) = match editing {
+            Some(id) if id == &self.selected_cell => {
+                let row = top + 1 + self.cursor_visual_row(id, text_w);
+                (row, row + 1)
+            }
+            _ if entered => {
+                let row = output_region
+                    .map_or(0, |(cursor_row, scroll, _)| cursor_row.saturating_sub(scroll));
+                // The text starts below the block's header divider.
+                (outputs_top + 1 + row, outputs_top + row + 2)
+            }
+            // A cell jump to an off-screen target: its top (the border or
+            // divider above the cursor row) at the top.
+            _ if nb_global.is_some_and(|row| self.align_jump && off_screen(row, self.scroll_row)) => {
+                let row = nb_global.unwrap_or(top).saturating_sub(1);
+                (row, row + 1)
+            }
+            // The notebook cursor row, with a margin.
+            _ if nb_global.is_some() => {
+                let row = nb_global.unwrap_or(top);
+                (row.saturating_sub(scrolloff), row + 1 + scrolloff)
+            }
+            _ => (top, top + cell_rows.min(height)),
+        };
+        let aligning =
+            self.align_jump && nb_global.is_some_and(|row| off_screen(row, self.scroll_row));
+        if aligning || want_top < self.scroll_row {
+            self.scroll_row = want_top;
+        } else if want_bottom > self.scroll_row + height {
+            self.scroll_row = want_bottom - height;
+        }
     }
 
     /// For an entered output: keep its cursor inside the output region by
@@ -1396,7 +1434,9 @@ impl Coordinator {
         };
         match action {
             ConfirmAction::ReloadExternalDiskChange => match key {
-                Key::Char('l') => {
+                // Capital L: plain `l` enters a cell, and a stray press
+                // here would throw away the user's unsaved edits.
+                Key::Char('L') => {
                     self.overlays.confirm = None;
                     self.focus.pop();
                     self.reload_document_from_disk();
@@ -1768,7 +1808,7 @@ impl Coordinator {
             "cell.edit_external" => Effect::OpenExternalEditor(self.selected_cell.clone()),
             "cell.clear_outputs" => {
                 let id = self.selected_cell.clone();
-                self.clear_outputs(&id);
+                self.clear_outputs_undoable(&id);
                 Effect::None
             }
             "cell.format" => {
@@ -1792,14 +1832,18 @@ impl Coordinator {
                 Effect::None
             }
             "edit.undo" => {
+                let before = self.document.order().to_vec();
                 if self.document.undo() {
+                    self.select_restored(&before);
                     self.reconcile_selection();
                     self.remount_output_views();
                 }
                 Effect::None
             }
             "edit.redo" => {
+                let before = self.document.order().to_vec();
                 if self.document.redo() {
+                    self.select_restored(&before);
                     self.reconcile_selection();
                     self.remount_output_views();
                 }
@@ -2543,7 +2587,7 @@ impl Coordinator {
                     }
                 }
                 "op.delete" => {
-                    self.clear_outputs(&id);
+                    self.clear_outputs_undoable(&id);
                     self.selected_part = CellPart::Source;
                 }
                 _ => {}
@@ -3058,6 +3102,25 @@ impl Coordinator {
         }
     }
 
+    /// Clear a cell's outputs as an edit the user can undo (`dd` on an
+    /// output, `c`). Clears from a new run or the kernel are not undoable.
+    fn clear_outputs_undoable(&mut self, cell_id: &CellId) {
+        let Some(outputs) = self
+            .document
+            .cell(cell_id)
+            .map(|cell| cell.outputs.clone())
+            .filter(|outputs| !outputs.is_empty())
+        else {
+            return;
+        };
+        for item in &outputs {
+            self.output_views.remove(&item.id);
+        }
+        self.document.apply(DocOp::ClearOutputs {
+            cleared: vec![(cell_id.clone(), outputs)],
+        });
+    }
+
     fn insert_cell_at(&mut self, index: usize) {
         let cell = Cell::new_code();
         let id = cell.id.clone();
@@ -3368,6 +3431,21 @@ impl Coordinator {
 
     fn selected_index(&self) -> usize {
         self.document.position_of(&self.selected_cell).unwrap_or(0)
+    }
+
+    /// After undo/redo brought cells back (a deleted cell, a split's
+    /// halves), select the first of them, as the edit's location.
+    fn select_restored(&mut self, before: &[CellId]) {
+        let old: HashSet<&CellId> = before.iter().collect();
+        let restored = self
+            .document
+            .order()
+            .iter()
+            .find(|id| !old.contains(id))
+            .cloned();
+        if let Some(id) = restored {
+            self.select_cell(id);
+        }
     }
 
     fn reconcile_selection(&mut self) {
@@ -3690,6 +3768,7 @@ fn mount_view(
     };
     Some(registry.output_renderers[renderer].mount(item, &ctx))
 }
+
 fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
     let data = match payload {
         WireOutput::Stream { stream, text } => {
@@ -3722,8 +3801,6 @@ fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
     };
     OutputItem::new(data, late)
 }
-
-use crate::platform::mtime_watch::{MtimeWatch, mtime_of as file_mtime};
 
 /// Commands that mean the same thing whichever layer has focus.
 fn is_global_command(id: &str) -> bool {

@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn measured_rows_match_drawn_rows() {
-        let long = "z".repeat(150_000);
+        let long = "z".repeat(150_007);
         let lines = [
             "",
             "plain text that wraps across a few rows",
@@ -524,7 +524,7 @@ mod tests {
             wrapped_row_count(&long, 80) - 1..u32::MAX,
             &mut last,
         );
-        assert_eq!(text_of(&last), ["z".repeat(150_000 % 80)]);
+        assert_eq!(text_of(&last), ["z".repeat(150_007 % 80)]);
     }
 
     /// Growing, rewriting and truncating keeps the index equal to a fresh one.
