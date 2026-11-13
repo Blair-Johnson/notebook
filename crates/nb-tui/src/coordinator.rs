@@ -95,9 +95,13 @@ pub struct Coordinator {
     /// draw. Set when a key moves the selection or cursor; cleared by
     /// mouse-wheel scrolling.
     follow_focus: bool,
-    /// The view was at the bottom after the last draw: keep following the
-    /// bottom as content grows, until the user scrolls or moves away.
+    /// The user put the view at the very bottom of the scroll range: keep
+    /// it there as content grows, until they scroll or move away. Only the
+    /// user's own scrolling and navigation change this, never content
+    /// growing or shrinking under the view.
     stick_bottom: bool,
+    /// A wheel scroll happened since the last draw.
+    user_scrolled: bool,
     pub notice: Option<String>,
     /// The notice last seen by `on_tick` and when it appeared; notices
     /// clear themselves after `display.notice_secs`.
@@ -181,6 +185,7 @@ impl Coordinator {
             spinner_tick: 0,
             follow_focus: true,
             stick_bottom: false,
+            user_scrolled: false,
             notice: None,
             notice_seen: None,
             registry,
@@ -365,14 +370,17 @@ impl Coordinator {
         }
         let total = self.layout_cache.heights().total_height();
         let max_scroll = total.saturating_sub(height);
-        if !followed && self.stick_bottom && snap.core.follow_output {
+        if !followed && !self.user_scrolled && self.stick_bottom && snap.core.follow_output {
             self.scroll_row = max_scroll;
         }
         self.scroll_row = self.scroll_row.min(max_scroll);
-        // At the bottom means "follow the bottom". When everything fits on
-        // screen that is only meant if the last cell is the one in view.
-        let last_selected = self.document.order().last() == Some(&self.selected_cell);
-        self.stick_bottom = self.scroll_row >= max_scroll && (max_scroll > 0 || last_selected);
+        // Intention comes from the user's own scrolling or navigation this
+        // frame: ending at the very bottom of a scrollable notebook means
+        // "follow". Content changing under the view leaves it as it was.
+        if followed || self.user_scrolled {
+            self.stick_bottom = max_scroll > 0 && self.scroll_row >= max_scroll;
+        }
+        self.user_scrolled = false;
     }
 
     /// For an entered output: keep its cursor inside the output region by
@@ -578,15 +586,13 @@ impl Coordinator {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.follow_focus = false;
-                // An explicit scroll; at the bottom, the next draw re-arms it.
-                self.stick_bottom = false;
+                self.user_scrolled = true;
                 self.scroll_row = self.scroll_row.saturating_sub(wheel_lines);
                 return;
             }
             MouseEventKind::ScrollDown => {
                 self.follow_focus = false;
-                // An explicit scroll; at the bottom, the next draw re-arms it.
-                self.stick_bottom = false;
+                self.user_scrolled = true;
                 self.scroll_row = self.scroll_row.saturating_add(wheel_lines);
                 return;
             }

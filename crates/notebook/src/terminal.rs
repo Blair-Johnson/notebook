@@ -3,10 +3,11 @@
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    EnableFocusChange, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use std::io::Write;
 use crossterm::terminal::{Clear, ClearType};
 use std::io::stdout;
 use nb_tui::platform::{CursorShape, TerminalEffects, TmuxPaneTitle};
@@ -54,7 +55,7 @@ impl TerminalEffects for CrosstermTerminalEffects {
             return;
         }
         if enabled {
-            let _ = execute!(stdout(), EnableMouseCapture);
+            enable_mouse();
         } else {
             let _ = execute!(stdout(), DisableMouseCapture);
         }
@@ -64,6 +65,16 @@ impl TerminalEffects for CrosstermTerminalEffects {
     fn set_pane_title(&mut self, title: &str) {
         self.pane_title.update(title);
     }
+}
+
+/// Mouse reporting for clicks, drags and the wheel, in SGR encoding.
+/// crossterm's `EnableMouseCapture` also turns on any-motion tracking
+/// (1003): a report for every pointer movement, which nb never uses and
+/// which floods the terminal's input buffer.
+fn enable_mouse() {
+    let mut out = stdout();
+    let _ = out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    let _ = out.flush();
 }
 
 /// Physically blank the terminal without issuing a cursor-position query.
@@ -79,7 +90,7 @@ pub fn enter_extras(mouse_capture: bool) {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     if mouse_capture {
-        let _ = execute!(stdout(), EnableMouseCapture);
+        enable_mouse();
     }
     let _ = execute!(stdout(), EnableFocusChange);
     let _ = execute!(stdout(), EnableBracketedPaste);

@@ -157,3 +157,59 @@ fn not_at_the_bottom_means_not_following() {
     draw(&mut c);
     assert_eq!(c.scroll_row, 0);
 }
+
+fn print_to(c: &mut Coordinator, index: usize, text: &str) {
+    let id = c.document.order()[index].clone();
+    c.apply_kernel_event(KernelEvent::Output {
+        exec_id: None,
+        target: TargetId::Cell(id),
+        late: false,
+        payload: WireOutput::Stream {
+            stream: StreamKind::Stdout,
+            text: text.into(),
+        },
+    });
+    draw(c);
+}
+
+#[test]
+fn rerunning_a_long_output_above_the_bottom_does_not_start_following() {
+    let mut c = notebook();
+    // The last cell already has a long output; the user reads its top.
+    key(&mut c, KeyCode::Char('G'));
+    key(&mut c, KeyCode::Enter);
+    let long: String = (0..30).map(|n| format!("old {n}\n")).collect();
+    print_to(&mut c, 3, &long);
+    wheel(&mut c, MouseEventKind::ScrollUp);
+    wheel(&mut c, MouseEventKind::ScrollUp);
+    let parked = c.scroll_row;
+    assert!(parked < max_scroll(&c));
+    // Rerun: the old output is cleared (the notebook shrinks, pulling the
+    // view up), then new output arrives. That is not the user going to the
+    // bottom, so the view must not chase the new output.
+    key(&mut c, KeyCode::Enter);
+    for n in 0..30 {
+        print_line(&mut c, n);
+    }
+    assert!(c.scroll_row < max_scroll(&c), "did not jump to the end");
+}
+
+#[test]
+fn a_notebook_that_fits_on_screen_does_not_follow() {
+    let mut registry = ExtensionRegistry::default();
+    registry.install(BuiltinsPlugin);
+    let (kernel, _handle) = FakeKernel::pair();
+    let mut cell = Cell::new_code();
+    cell.buffer.replace_all("run()".to_string());
+    let mut c = Coordinator::headless(
+        Document::from_cells(vec![cell], FormatBacking::PercentPy { header: None }),
+        registry,
+        Box::new(kernel),
+    );
+    draw(&mut c);
+    key(&mut c, KeyCode::Enter);
+    for n in 0..40 {
+        print_line(&mut c, n);
+    }
+    assert_eq!(c.scroll_row, 0, "nothing was scrolled, so nothing follows");
+}

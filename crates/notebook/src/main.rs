@@ -1,15 +1,16 @@
 //! CLI entrypoint, plugin wiring list, panic-safe terminal guard, and `tokio::select!` loop.
 
 mod editor;
+mod input;
 mod runtime;
 mod terminal;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind};
 use crossterm::queue;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -170,7 +171,7 @@ async fn run_loop(
     coordinator: &mut Coordinator,
     mouse_capture: bool,
 ) -> Result<()> {
-    let mut term_events = EventStream::new();
+    let mut input = input::InputReader::spawn();
     let mut fast_tick = tokio::time::interval(Duration::from_millis(50));
     fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let autosave_secs = coordinator.settings.snapshot().core.autosave_secs.max(1);
@@ -197,13 +198,14 @@ async fn run_loop(
             _ = sigint.recv() => {
                 coordinator.on_signal("SIGINT");
             }
-            maybe_event = term_events.next() => {
+            maybe_event = input.events.recv() => {
                 let Some(event_result) = maybe_event else { break };
                 let event = event_result?;
-                handle_terminal_event(
+                handle_terminal_events(
                     terminal,
                     coordinator,
                     mouse_capture,
+                    &mut input,
                     event,
                 )?;
                 redraw = !coordinator.should_quit;
@@ -238,34 +240,29 @@ async fn run_loop(
     Ok(())
 }
 
-fn handle_terminal_event(
+/// Handle `first` and everything else already queued, then draw once: a
+/// burst of trackpad scroll events costs one frame, not one per event.
+fn handle_terminal_events(
     terminal: &mut ratatui::DefaultTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
-    event: Event,
+    input: &mut input::InputReader,
+    first: Event,
 ) -> Result<()> {
-    let first_is_coalescable = is_coalescable(&event);
-    let mut effect = dispatch_event(coordinator, event);
-    let mut stop_batch = !first_is_coalescable;
-    if handle_effect(terminal, coordinator, mouse_capture, effect)? {
-        stop_batch = true;
-    }
-
-    if !stop_batch && !coordinator.should_quit {
-        for _ in 1..16 {
-            if !crossterm::event::poll(Duration::ZERO)? {
-                break;
-            }
-            let next = crossterm::event::read()?;
-            let next_is_coalescable = is_coalescable(&next);
-            effect = dispatch_event(coordinator, next);
-            if handle_effect(terminal, coordinator, mouse_capture, effect)? {
-                break;
-            }
-            if !next_is_coalescable || coordinator.should_quit {
-                break;
-            }
+    let mut next = Some(first);
+    for _ in 0..512 {
+        let Some(event) = next.take() else { break };
+        let effect = dispatch_event(coordinator, event);
+        if handle_effect(terminal, coordinator, mouse_capture, input, effect)? {
+            break;
         }
+        if coordinator.should_quit {
+            break;
+        }
+        next = match input.events.try_recv() {
+            Ok(event) => Some(event?),
+            Err(_) => None,
+        };
     }
     Ok(())
 }
@@ -295,17 +292,11 @@ fn dispatch_event(coordinator: &mut Coordinator, event: Event) -> Effect {
     }
 }
 
-fn is_coalescable(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-    ) || matches!(event, Event::Paste(_))
-}
-
 fn handle_effect(
     terminal: &mut ratatui::DefaultTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
+    input: &input::InputReader,
     effect: Effect,
 ) -> Result<bool> {
     match effect {
@@ -315,7 +306,11 @@ fn handle_effect(
             Ok(true)
         }
         Effect::OpenExternalEditor(cell_id) => {
-            external_edit(terminal, coordinator, mouse_capture, cell_id)?;
+            // The editor reads the terminal itself: stop our reader meanwhile.
+            input.pause();
+            let edited = external_edit(terminal, coordinator, mouse_capture, cell_id);
+            input.resume();
+            edited?;
             Ok(true)
         }
     }
