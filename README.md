@@ -4,38 +4,30 @@ Jupyter notebooks in the terminal, with vim keys.
 
 ## Install
 
+You need a Rust toolchain, version 1.90 or newer (`rustup update`).
+
 ```sh
-cargo install --path crates/notebook --locked   # puts `nb` in ~/.cargo/bin
+git clone <this repo> notebook && cd notebook
+cargo install --path crates/notebook --locked
 ```
 
-## Use it in a project
+This puts `nb` in `~/.cargo/bin`. Run the same command again to update.
 
-The kernel runs in your project's environment, which needs `ipykernel`
-(it brings IPython, jupyter_client and pyzmq, and registers the `python3`
-kernel):
+## Use
+
+Each project's environment needs `ipykernel`, which provides the Python
+kernel:
 
 ```sh
 pixi add ipykernel
 pixi shell
 nb analysis.ipynb      # open or create a notebook
-nb quick_test.py       # a percent-format script: cells start with `# %%`
-nb                     # a scratch notebook
+nb quick_test.py       # percent-format script: cells start with `# %%`
 ```
 
-`pixi run nb file.py` works too. `nb` finds the kernel through the active
-environment (`$CONDA_PREFIX`, `$VIRTUAL_ENV`), then a `.venv/` or `venv/`
-next to the file, then the standard Jupyter paths.
+`pixi run nb analysis.ipynb` also works, as does any conda or venv
+environment with `ipykernel` installed.
 
-## Options
-
-| Option | Meaning |
-|---|---|
-| `--kernel NAME` | Use a different kernelspec (default: the notebook's, then `python3`) |
-| `--existing FILE` | Attach to a running kernel's connection file; quitting leaves it running |
-| `--config FILE` | Use this config file |
-
-Settings live in `~/.config/notebook/config.toml` (or `$NB_CONFIG`), and
-are easiest to change from the app: `Ctrl+/` searches commands and
-settings, `Ctrl+,` opens the settings screen, `?` lists keys.
-
-Quit with `:q`, `:wq` or `:q!`, as in vim.
+Inside: `?` lists keys, `Ctrl+/` searches commands and settings, and
+`:w`, `:wq`, `:q!` work as in vim. `nb --help` lists the command-line
+options.
