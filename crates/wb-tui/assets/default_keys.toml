@@ -43,7 +43,7 @@
 "cell.run_all" = ["X"]
 "cell.toggle_kind" = ["t"]
 "cell.toggle_collapse" = ["z a"]
-"cell.focus_output" = ["enter_output", "z o"]
+"cell.focus_output" = ["z o"]
 "cell.edit_external" = ["ctrl+g"]
 "cell.clear_outputs" = ["c"]
 "cell.format" = ["f"]
