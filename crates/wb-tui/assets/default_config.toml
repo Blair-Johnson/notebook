@@ -2,13 +2,13 @@
 # Comments and formatting in your user config file are preserved when saving from `/config`.
 
 [display]
-theme = "terminal"
+theme = "midnight"
 syntect_theme = "base16-ocean.dark"
 max_output_rows = 18
 wheel_scroll_lines = 3
 
 [editor]
-insert_escape_chord_ms = 350
+insert_escape_chord_ms = 500
 composer_expanded_ratio_pct = 50
 mouse_capture = true
 formatter = "ruff format -"

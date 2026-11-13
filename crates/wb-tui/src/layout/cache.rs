@@ -21,6 +21,8 @@ pub struct CellLayoutKey {
     pub output_views_rev: u64,
     pub width: u16,
     pub theme_rev: u64,
+    /// Markdown shown as raw source (while it is being edited).
+    pub raw_source: bool,
 }
 
 #[derive(Debug)]
@@ -159,14 +161,17 @@ impl LayoutCache {
         width: u16,
         max_output_rows: u16,
         theme: &Theme,
+        editing: Option<&CellId>,
     ) -> Option<u32> {
         let cell = doc.cell(cell_id)?;
         let output_views_rev = Self::output_revision(cell, output_views);
+        let raw_source = cell.kind == CellKind::Markdown && editing == Some(cell_id);
         let key = CellLayoutKey {
             revs: cell.revs,
             output_views_rev,
             width,
             theme_rev: theme.revision,
+            raw_source,
         };
         if let Some(cached) = self.cells.get_mut(cell_id) {
             if cached.key == key {
@@ -175,7 +180,7 @@ impl LayoutCache {
             }
         }
 
-        let (wrapped_source, source_line_map) = self.render_source(cell, width, theme);
+        let (wrapped_source, source_line_map) = self.render_source(cell, width, theme, raw_source);
         let mut total_rows = 1u32;
         if cell.collapsed {
             total_rows = total_rows.saturating_add(1);
@@ -183,12 +188,7 @@ impl LayoutCache {
             total_rows = total_rows.saturating_add(wrapped_source.len() as u32);
             for output in &cell.outputs {
                 if let Some(view) = output_views.get_mut(&output.id) {
-                    let metrics = view.measure(
-                        output,
-                        width.saturating_sub(4).max(1),
-                        theme,
-                        Some(max_output_rows),
-                    );
+                    let metrics = view.measure(output, width, theme, Some(max_output_rows));
                     total_rows = total_rows.saturating_add(metrics.shown_rows.max(1));
                 } else {
                     total_rows = total_rows.saturating_add(1);
@@ -220,19 +220,25 @@ impl LayoutCache {
         cell: &Cell,
         width: u16,
         theme: &Theme,
+        raw_source: bool,
     ) -> (Vec<Line<'static>>, Vec<usize>) {
-        if cell.kind == CellKind::Markdown {
+        if cell.kind == CellKind::Markdown && !raw_source {
             let rendered = render_markdown_cell(cell.buffer.as_str(), width, theme);
             return (rendered.lines, rendered.source_line_map);
         }
         let mut lines = Vec::new();
         let mut source_map = Vec::new();
-        let source_lines: Vec<&str> = cell.buffer.as_str().lines().collect();
+        // `split('\n')`, not `lines()`: a trailing empty line is a real row the
+        // cursor can sit on.
+        let source_lines: Vec<&str> = cell.buffer.as_str().split('\n').collect();
         for (index, source_line) in source_lines.iter().enumerate() {
-            let rendered = if cell.kind == CellKind::Code {
-                self.highlight_code_line(cell, index, source_line, theme)
-            } else {
-                Line::from((*source_line).to_string())
+            let rendered = match cell.kind {
+                CellKind::Code => self.highlight_code_line(cell, index, source_line, theme),
+                CellKind::Markdown => raw_markdown_line(source_line, theme),
+                CellKind::Raw => Line::from(Span::styled(
+                    (*source_line).to_string(),
+                    Style::default().fg(theme.palette.fg),
+                )),
             };
             for line in wrap_line(rendered, width.max(1)) {
                 lines.push(line);
@@ -307,6 +313,7 @@ impl LayoutCache {
         viewport_height: u16,
         max_output_rows: u16,
         theme: &Theme,
+        editing: Option<&CellId>,
     ) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         self.ensure_tree(doc, max_output_rows);
@@ -315,9 +322,15 @@ impl LayoutCache {
         let visible = self.visible_indices(doc, scroll_row, viewport_height);
         for index in &visible {
             if let Some(cell_id) = doc.order().get(*index) {
-                if let Some(height) =
-                    self.measure_cell(doc, cell_id, output_views, width, max_output_rows, theme)
-                {
+                if let Some(height) = self.measure_cell(
+                    doc,
+                    cell_id,
+                    output_views,
+                    width,
+                    max_output_rows,
+                    theme,
+                    editing,
+                ) {
                     self.heights.set(*index, height);
                 }
             }
@@ -369,9 +382,15 @@ impl LayoutCache {
                 break;
             };
             if let Some(index) = doc.position_of(&cell_id) {
-                if let Some(height) =
-                    self.measure_cell(doc, &cell_id, output_views, width, max_output_rows, theme)
-                {
+                if let Some(height) = self.measure_cell(
+                    doc,
+                    &cell_id,
+                    output_views,
+                    width,
+                    max_output_rows,
+                    theme,
+                    None,
+                ) {
                     self.heights.set(index, height);
                 }
             }
@@ -382,7 +401,24 @@ impl LayoutCache {
     }
 }
 
-fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+/// Markdown source shown verbatim while editing, with headings and fences tinted.
+fn raw_markdown_line(source: &str, theme: &Theme) -> Line<'static> {
+    let trimmed = source.trim_start();
+    let style = if trimmed.starts_with('#') {
+        Style::default()
+            .fg(theme.palette.accent_markdown)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    } else if trimmed.starts_with("```") {
+        Style::default().fg(theme.palette.accent_code)
+    } else {
+        Style::default().fg(theme.palette.fg)
+    };
+    Line::from(Span::styled(source.to_string(), style))
+}
+
+/// Character-wrap a styled line to `width` columns. Exposed so the renderer
+/// can map a cursor column onto the same rows.
+pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut output = Vec::new();
     let mut current = Vec::new();

@@ -121,14 +121,20 @@ pub fn format_key(key: Key) -> String {
     }
 }
 
-/// Format a sequence with a single space between keys.
+/// Format a sequence the way vim users write it: runs of plain characters
+/// are joined (`jj`, `gg`), anything else is separated by a space.
 pub fn format_key_sequence(sequence: &[Key]) -> String {
-    sequence
+    let parts = sequence
         .iter()
         .copied()
         .map(format_key)
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect::<Vec<_>>();
+    let separator = if parts.iter().all(|part| part.chars().count() == 1) {
+        ""
+    } else {
+        " "
+    };
+    parts.join(separator)
 }
 
 /// Compatibility alias for callers that prefer an explicit string suffix.
@@ -539,6 +545,35 @@ impl Keymap {
             self.tables.get(ctx).map_or(0, HashMap::len),
             self.prefixes.get(ctx).map_or(0, HashSet::len),
         )
+    }
+
+    /// Key sequences bound to `action_id` in `ctx` (inherited bindings
+    /// included), shortest first, formatted for display.
+    pub fn keys_for(&self, ctx: &KeyContextId, action_id: &str) -> Vec<String> {
+        let mut keys: Vec<&KeySeq> = self
+            .tables
+            .get(ctx)
+            .into_iter()
+            .flat_map(|table| table.iter())
+            .filter(|(_, action)| action.as_str() == action_id)
+            .map(|(sequence, _)| sequence)
+            .collect();
+        keys.sort_by_key(|sequence| (sequence.len(), format_key_sequence(sequence)));
+        keys.into_iter().map(|sequence| format_key_sequence(sequence)).collect()
+    }
+
+    /// Every distinct key sequence bound to `action_id` in any context.
+    pub fn bindings_for(&self, action_id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .tables
+            .values()
+            .flat_map(|table| table.iter())
+            .filter(|(_, action)| action.as_str() == action_id)
+            .map(|(sequence, _)| format_key_sequence(sequence))
+            .collect();
+        keys.sort_by_key(|key| (key.len(), key.clone()));
+        keys.dedup();
+        keys
     }
 
     pub fn lookup(&self, ctx: &KeyContextId, operator_pending: bool, seq: &[Key]) -> LookupResult {

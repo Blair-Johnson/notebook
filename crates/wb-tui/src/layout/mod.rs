@@ -11,6 +11,20 @@ use wb_core::CellId;
 
 pub const MIN_HISTORY_ROWS: u16 = 3;
 
+/// Columns left of cell text: the selection bar and one space.
+pub const GUTTER_COLS: u16 = 2;
+/// Columns reserved on the right edge for the scrollbar.
+pub const SCROLLBAR_COLS: u16 = 1;
+
+/// Width available to cell text (source and outputs) in a notebook area
+/// `notebook_width` columns wide. The layout cache wraps to this width and
+/// the renderer draws at it, so measured and drawn rows always agree.
+pub fn text_width(notebook_width: u16) -> u16 {
+    notebook_width
+        .saturating_sub(GUTTER_COLS + SCROLLBAR_COLS)
+        .max(1)
+}
+
 /// Preserves the exact reading position across terminal resizes, cell folds, and dock toggles.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ScrollAnchor {

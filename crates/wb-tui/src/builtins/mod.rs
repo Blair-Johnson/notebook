@@ -794,7 +794,7 @@ impl Plugin for BuiltinsPlugin {
             "Theme",
             "Color palette preset",
             SettingKind::Choice {
-                default: "terminal",
+                default: "midnight",
                 options: THEME_OPTIONS,
             },
         );
@@ -839,7 +839,7 @@ impl Plugin for BuiltinsPlugin {
             "Insert escape chord",
             "Timeout for a speculative insert-mode chord",
             SettingKind::Int {
-                default: 350,
+                default: 500,
                 min: 1,
                 max: 10_000,
             },

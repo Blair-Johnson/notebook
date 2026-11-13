@@ -168,12 +168,12 @@ fn insert_jj_rolls_back_only_when_completed_before_timeout() {
 
     let mut grammar = VimGrammar::default();
     grammar.feed(&keymap, &context("cell.insert"), Key::Char('j'), start);
-    assert!(grammar.expire_chord(start + Duration::from_millis(400)));
+    assert!(grammar.expire_chord(start + Duration::from_millis(550)));
     let typed = grammar.feed(
         &keymap,
         &context("cell.insert"),
         Key::Char('j'),
-        start + Duration::from_millis(401),
+        start + Duration::from_millis(551),
     );
     assert_eq!(
         typed,
@@ -277,7 +277,7 @@ fn settings_default_snapshot_is_lenient_and_has_builtin_theme() {
         "{:?}",
         store.snapshot().warnings
     );
-    assert_eq!(store.snapshot().theme.name, "terminal");
+    assert_eq!(store.snapshot().theme.name, "midnight");
     assert_eq!(store.snapshot().core.max_output_rows, 18);
     let _ = fs::remove_file(path);
 }

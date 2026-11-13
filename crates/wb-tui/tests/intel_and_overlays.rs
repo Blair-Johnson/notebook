@@ -225,7 +225,7 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
             .snapshot()
             .plugin_values
             .get(&SettingId(Cow::Borrowed("display.theme"))),
-        Some(&SettingValue::Text("midnight".into()))
+        Some(&SettingValue::Text("light".into()))
     );
 
     modal.active_tab = 4;

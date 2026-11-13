@@ -56,12 +56,21 @@ impl FocusLayer {
     pub fn badge(&self) -> &'static str {
         match self {
             Self::NotebookNormal => "NOTEBOOK",
-            Self::CellEdit { mode: CellMode::Normal, .. } => "CELL NORMAL",
+            Self::CellEdit { mode: CellMode::Normal, .. } => "NORMAL",
             Self::CellEdit { mode: CellMode::Insert, .. } => "INSERT",
             Self::CellEdit { mode: CellMode::Visual(_), .. } => "VISUAL",
             Self::OutputFocus { .. } => "OUTPUT",
-            Self::PdbInput => "PDB",
-            Self::Modal(_) => "MODAL",
+            Self::PdbInput => "DEBUGGER",
+            Self::Modal(kind) => match kind {
+                ModalKind::CommandPalette => "COMMANDS",
+                ModalKind::SearchPrompt => "SEARCH",
+                ModalKind::ExCommandBar => "COMMAND",
+                ModalKind::ConfirmBar => "CONFIRM",
+                ModalKind::Help => "HELP",
+                ModalKind::Settings => "SETTINGS",
+                ModalKind::Logs => "LOGS",
+                ModalKind::InspectPager => "DOCS",
+            },
         }
     }
 }
@@ -86,6 +95,19 @@ impl FocusStack {
 
     pub fn top_mut(&mut self) -> &mut FocusLayer {
         self.layers.last_mut().expect("FocusStack always retains NotebookNormal root")
+    }
+
+    /// The topmost non-modal layer: where keys go once modals close.
+    pub fn base(&self) -> &FocusLayer {
+        self.layers
+            .iter()
+            .rev()
+            .find(|layer| !matches!(layer, FocusLayer::Modal(_)))
+            .unwrap_or(&self.layers[0])
+    }
+
+    pub fn layers(&self) -> &[FocusLayer] {
+        &self.layers
     }
 
     pub fn push(&mut self, layer: FocusLayer) {

@@ -36,7 +36,7 @@ impl Default for VimGrammar {
             seq_started: None,
             speculative_chars: 0,
             pending_char_arg: None,
-            insert_escape_chord: Duration::from_millis(350),
+            insert_escape_chord: Duration::from_millis(500),
         }
     }
 }

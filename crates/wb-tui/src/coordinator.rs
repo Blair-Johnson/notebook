@@ -1,13 +1,13 @@
 //! Central `Coordinator` state machine and `Effect` chokepoint.
 
-use crate::config_store::SettingsStore;
+use crate::config_store::{ConfigSnapshot, SettingsStore};
 use crate::focus::{CellMode, FocusLayer, FocusStack, ModalKind};
 use crate::grammar::{GrammarStep, VimGrammar};
 use crate::intelligence::{
     CompletionPopup, InspectPager, SignaturePopup, scan_notebook_identifiers,
 };
 use crate::keymap::normalize_crossterm_key;
-use crate::layout::LayoutCache;
+use crate::layout::{LayoutCache, text_width};
 use crate::overlays::{
     CommandPaletteState, ConfirmAction, OverlayStates, PdbDockState, PromptBar, PromptKind,
     SettingsModalOutcome,
@@ -15,9 +15,12 @@ use crate::overlays::{
 use crate::platform::{
     ClipboardSink, CursorShape, MemoryClipboard, NoopTerminalEffects, TerminalEffects,
 };
-use crate::render::{AppView, FrameGeometry, HitTarget, render_app};
+use crate::render::{
+    AppView, FrameGeometry, HitTarget, KernelPhase, RunState, frame_layout, render_app,
+};
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -46,6 +49,7 @@ pub enum Effect {
 
 #[derive(Clone, Debug)]
 struct CompletionRequest {
+    cell_id: CellId,
     replace_start_char: usize,
     replace_end_char: usize,
     typed_prefix: String,
@@ -73,7 +77,13 @@ pub struct Coordinator {
     pub kernel_name: String,
     pub kernel_busy: bool,
     pub kernel_alive: bool,
-    pub running_cells: usize,
+    /// Per-cell execution state shown in cell headers.
+    pub run_states: HashMap<CellId, RunState>,
+    pub kernel_phase: KernelPhase,
+    spinner_tick: usize,
+    /// Scroll to keep the selection (or edit cursor) visible on the next
+    /// draw. Set by keyboard actions; cleared by mouse-wheel scrolling.
+    follow_focus: bool,
     pub notice: Option<String>,
     pub registry: ExtensionRegistry,
     pub settings: SettingsStore,
@@ -140,7 +150,10 @@ impl Coordinator {
             kernel_name: settings.snapshot().core.default_kernel.clone(),
             kernel_busy: false,
             kernel_alive: false,
-            running_cells: 0,
+            run_states: HashMap::new(),
+            kernel_phase: KernelPhase::Starting,
+            spinner_tick: 0,
+            follow_focus: true,
             notice: None,
             registry,
             settings,
@@ -194,6 +207,7 @@ impl Coordinator {
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let snap = self.settings.snapshot().clone();
+        self.keep_focus_visible(frame.area(), &snap);
         let view = AppView {
             path: self.path.as_deref(),
             document: &self.document,
@@ -203,14 +217,21 @@ impl Coordinator {
             kernel_name: &self.kernel_name,
             kernel_busy: self.kernel_busy,
             kernel_alive: self.kernel_alive,
-            running_cells: self.running_cells,
+            kernel_phase: self.kernel_phase,
+            running_cells: self.active_runs(),
+            run_states: &self.run_states,
+            spinner_tick: self.spinner_tick,
             notice: self.notice.as_deref(),
             settings: &snap.core,
+            setting_values: &snap.plugin_values,
+            registry: &self.registry,
             status_segments: &self.registry.status_segments,
             completion: self.completion.as_ref(),
             signature: self.signature.as_ref(),
             inspect_pager: self.inspect_pager.as_ref(),
             overlays: &self.overlays,
+            help_scroll: self.help_scroll,
+            logs: &self.logs,
         };
         self.last_geometry = render_app(
             frame,
@@ -220,9 +241,136 @@ impl Coordinator {
             &snap.keymap,
             &mut self.layout_cache,
         );
+        // One place decides the cursor shape: a bar wherever text is typed.
+        let shape = match self.focus.top() {
+            FocusLayer::CellEdit {
+                mode: CellMode::Insert,
+                ..
+            }
+            | FocusLayer::PdbInput
+            | FocusLayer::Modal(
+                ModalKind::SearchPrompt | ModalKind::ExCommandBar | ModalKind::CommandPalette,
+            ) => CursorShape::SteadyBar,
+            _ => CursorShape::SteadyBlock,
+        };
+        self.term_effects.set_cursor_shape(shape);
+    }
+
+    /// Scroll so the edit cursor (or the selected cell) is visible after a
+    /// keyboard action, and clamp scrolling to the content.
+    fn keep_focus_visible(&mut self, area: Rect, snap: &ConfigSnapshot) {
+        let layout = frame_layout(
+            area,
+            self.overlays.pdb_dock.is_some(),
+            &self.focus,
+            &snap.core,
+        );
+        let viewport = layout.notebook_area;
+        let text_w = text_width(viewport.width);
+        let editing = match self.focus.base() {
+            FocusLayer::CellEdit { cell_id, .. } => Some(cell_id.clone()),
+            _ => None,
+        };
+        self.layout_cache.sync_viewport(
+            &self.document,
+            &mut self.output_views,
+            text_w,
+            self.scroll_row,
+            viewport.height,
+            snap.core.max_output_rows,
+            &snap.theme,
+            editing.as_ref(),
+        );
+        let height = u32::from(viewport.height.max(1));
+        if self.follow_focus {
+            self.follow_focus = false;
+            if let Some(index) = self.document.position_of(&self.selected_cell) {
+                let heights = self.layout_cache.heights();
+                if index < heights.len() {
+                    let top = heights.prefix_sum(index);
+                    let cell_rows = heights.height(index);
+                    let (want_top, want_bottom) = match editing.as_ref() {
+                        Some(id) if id == &self.selected_cell => {
+                            let row = top + 1 + self.cursor_visual_row(id, text_w);
+                            (row, row + 1)
+                        }
+                        _ => (top, top + cell_rows.min(height)),
+                    };
+                    if want_top < self.scroll_row {
+                        self.scroll_row = want_top;
+                    } else if want_bottom > self.scroll_row + height {
+                        self.scroll_row = want_bottom - height;
+                    }
+                }
+            }
+        }
+        let total = self.layout_cache.heights().total_height();
+        self.scroll_row = self.scroll_row.min(total.saturating_sub(height));
+    }
+
+    /// Wrapped source row of the edit cursor within its cell (excluding the
+    /// header row), mirroring the layout cache's character wrapping.
+    fn cursor_visual_row(&self, cell_id: &CellId, text_w: u16) -> u32 {
+        let Some(cell) = self.document.cell(cell_id) else {
+            return 0;
+        };
+        let width = usize::from(text_w.max(1));
+        let cursor = cell.buffer.cursor();
+        let mut rows = 0u32;
+        for (row, line) in cell.buffer.as_str().split('\n').enumerate() {
+            let mut used = 0usize;
+            let mut wraps = 0u32;
+            for (index, ch) in line.chars().enumerate() {
+                if row == cursor.row && index >= cursor.col {
+                    break;
+                }
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cw > 0 && used > 0 && used + cw > width {
+                    wraps += 1;
+                    used = 0;
+                }
+                used += cw;
+            }
+            if row == cursor.row {
+                return rows + wraps;
+            }
+            rows += 1 + wraps;
+        }
+        rows
+    }
+
+    /// Popups belong to insert mode: drop them as soon as it is left, and
+    /// never keep an empty completion list on screen.
+    fn reconcile_popups(&mut self) {
+        let in_insert = matches!(
+            self.focus.top(),
+            FocusLayer::CellEdit {
+                mode: CellMode::Insert,
+                ..
+            }
+        );
+        if !in_insert {
+            self.completion = None;
+            self.signature = None;
+            self.pending_completions.clear();
+        }
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|popup| popup.filtered.is_empty())
+        {
+            self.completion = None;
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Effect {
+        self.follow_focus = true;
+        let effect = self.on_key_inner(key, now);
+        self.reconcile_popups();
+        effect
+    }
+
+    fn on_key_inner(&mut self, key: KeyEvent, now: Instant) -> Effect {
         if matches!(self.focus.top(), FocusLayer::Modal(ModalKind::Settings)) {
             return self.on_settings_key(key);
         }
@@ -290,10 +438,12 @@ impl Coordinator {
         let wheel_lines = u32::from(self.settings.snapshot().core.wheel_scroll_lines.max(1));
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                self.follow_focus = false;
                 self.scroll_row = self.scroll_row.saturating_sub(wheel_lines);
                 return;
             }
             MouseEventKind::ScrollDown => {
+                self.follow_focus = false;
                 self.scroll_row = self.scroll_row.saturating_add(wheel_lines);
                 return;
             }
@@ -348,6 +498,7 @@ impl Coordinator {
             KernelEvent::Ready { info } => {
                 self.kernel_alive = true;
                 self.kernel_busy = false;
+                self.kernel_phase = KernelPhase::Ready;
                 self.kernel_name = info.kernel_name;
                 self.notice = Some("kernel ready".into());
                 if !self.settings.snapshot().core.use_jedi {
@@ -375,6 +526,7 @@ impl Coordinator {
             KernelEvent::LaunchFailed { reason, .. } => {
                 self.kernel_alive = false;
                 self.kernel_busy = false;
+                self.kernel_phase = KernelPhase::Dead;
                 self.notice = Some(format!("kernel launch failed: {reason}"));
             }
             KernelEvent::ExecutionStarted {
@@ -383,9 +535,19 @@ impl Coordinator {
                 ..
             } => {
                 self.kernel_busy = true;
-                self.running_cells = self.running_cells.saturating_add(1);
                 if let TargetId::Cell(cell_id) = target {
-                    if let Some(cell) = self.document.cell_mut(&cell_id) {
+                    // The actor reports a start twice: on submission (no count
+                    // yet, so still queued behind earlier work) and on the
+                    // kernel's `execute_input` (count known, really running).
+                    let state = if execution_count.is_some() {
+                        RunState::Running
+                    } else {
+                        RunState::Queued
+                    };
+                    self.run_states.insert(cell_id.clone(), state);
+                    if let Some(cell) = self.document.cell_mut(&cell_id)
+                        && execution_count.is_some()
+                    {
                         cell.execution_count = execution_count;
                         cell.bump_chrome();
                     }
@@ -422,9 +584,11 @@ impl Coordinator {
                 elapsed,
                 ..
             } => {
-                self.running_cells = self.running_cells.saturating_sub(1);
-                self.kernel_busy = self.running_cells > 0;
                 if let TargetId::Cell(cell_id) = target {
+                    self.run_states.insert(
+                        cell_id.clone(),
+                        if ok { RunState::Done } else { RunState::Failed },
+                    );
                     if let Some(cell) = self.document.cell_mut(&cell_id) {
                         cell.last_elapsed = Some(elapsed);
                         cell.bump_chrome();
@@ -433,6 +597,7 @@ impl Coordinator {
                         self.notice = Some("execution failed".into());
                     }
                 }
+                self.kernel_busy = self.active_runs() > 0;
                 if matches!(self.focus.top(), FocusLayer::PdbInput) {
                     self.pop_pdb();
                 }
@@ -468,7 +633,12 @@ impl Coordinator {
             } => {
                 self.kernel_alive = false;
                 self.kernel_busy = false;
-                self.running_cells = 0;
+                self.kernel_phase = KernelPhase::Dead;
+                for state in self.run_states.values_mut() {
+                    if matches!(state, RunState::Running | RunState::Queued) {
+                        *state = RunState::Failed;
+                    }
+                }
                 self.notice = Some(format!("kernel died: {exit_status}"));
                 for line in stderr_tail {
                     self.push_log(format!("[kernel] {line}"));
@@ -491,6 +661,10 @@ impl Coordinator {
 
     pub fn on_tick(&mut self, now: Instant) -> bool {
         let mut changed = self.grammar.expire_chord(now);
+        if self.active_runs() > 0 {
+            self.spinner_tick = self.spinner_tick.wrapping_add(1);
+            changed = true;
+        }
         changed |= self.check_external_disk_change();
         if self.settings.save_if_due().is_err() {
             self.notice = Some("could not save settings".into());
@@ -1804,6 +1978,8 @@ impl Coordinator {
                 .map_or(0, |cell| cell.buffer.char_offset_of(cell.buffer.cursor()));
             if SignaturePopup::parse_enclosing_call(&source, cursor).is_some() {
                 self.request_inspect(cell_id, true);
+            } else {
+                self.signature = None;
             }
         }
     }
@@ -1849,6 +2025,7 @@ impl Coordinator {
         self.pending_completions.insert(
             req_id,
             CompletionRequest {
+                cell_id: cell_id.clone(),
                 replace_start_char: start,
                 replace_end_char: cursor_char,
                 typed_prefix,
@@ -1910,6 +2087,19 @@ impl Coordinator {
         let Some(request) = self.pending_completions.remove(&req_id) else {
             return;
         };
+        // The reply is only useful if its cell is still being typed in.
+        let still_typing = matches!(
+            self.focus.top(),
+            FocusLayer::CellEdit {
+                cell_id,
+                mode: CellMode::Insert,
+                ..
+            } if cell_id == &request.cell_id
+        );
+        if !still_typing {
+            return;
+        }
+        let from_kernel = !items.is_empty();
         if items.is_empty() {
             let sources = self
                 .document
@@ -1925,13 +2115,34 @@ impl Coordinator {
                 })
                 .collect();
         }
+        // The kernel owns the replacement range: IPython may start it before
+        // our identifier scan would (e.g. `jnp.li` -> start at `.`, match
+        // `.linalg`). Fall back to our own word start if the reply is bogus.
+        let (start, typed_prefix) = if from_kernel && start_char <= request.replace_end_char {
+            let typed = self
+                .document
+                .cell(&request.cell_id)
+                .map(|cell| {
+                    cell.buffer
+                        .as_str()
+                        .chars()
+                        .skip(start_char)
+                        .take(request.replace_end_char - start_char)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            (start_char, typed)
+        } else {
+            (request.replace_start_char, request.typed_prefix)
+        };
         self.completion = Some(CompletionPopup::new(
             req_id,
-            start_char.max(request.replace_start_char),
+            start,
             request.replace_end_char,
             items,
-            request.typed_prefix,
-        ));
+            typed_prefix,
+        ))
+        .filter(|popup| !popup.filtered.is_empty());
     }
 
     fn apply_inspect_reply(&mut self, req_id: u64, doc: Option<String>) {
@@ -2288,6 +2499,7 @@ impl Coordinator {
             self.send_cell_execute(cell_id);
         } else if !self.queued_runs.contains(cell_id) {
             self.queued_runs.push_back(cell_id.clone());
+            self.run_states.insert(cell_id.clone(), RunState::Queued);
             self.notice = Some("queued cell until kernel is ready".into());
         }
     }
@@ -2296,10 +2508,12 @@ impl Coordinator {
         let Some(cell) = self.document.cell(cell_id) else {
             return;
         };
+        let code = cell.buffer.as_str().to_string();
+        self.run_states.insert(cell_id.clone(), RunState::Queued);
         self.send_command(KernelCmd::Execute {
             target: TargetId::Cell(cell_id.clone()),
             lane: Lane::Main,
-            code: cell.buffer.as_str().to_string(),
+            code,
             silent: false,
             store_history: true,
             stop_on_error: false,
@@ -2318,6 +2532,8 @@ impl Coordinator {
 
     fn restart_kernel(&mut self, run_all_after: bool) {
         self.kernel_alive = false;
+        self.kernel_phase = KernelPhase::Starting;
+        self.run_states.clear();
         self.send_command(KernelCmd::Restart);
         if run_all_after {
             self.run_all_queued = true;
@@ -2366,20 +2582,18 @@ impl Coordinator {
     }
 
     fn ensure_selected_visible(&mut self) {
-        let Some(index) = self.document.position_of(&self.selected_cell) else {
-            return;
-        };
-        if index >= self.layout_cache.heights().len() {
-            return;
-        }
-        let top = self.layout_cache.heights().prefix_sum(index);
-        let height = self.layout_cache.heights().height(index);
-        let viewport = u32::from(self.last_geometry.viewport_rect.height.max(1));
-        if top < self.scroll_row {
-            self.scroll_row = top;
-        } else if top.saturating_add(height) > self.scroll_row.saturating_add(viewport) {
-            self.scroll_row = top;
-        }
+        // Applied on the next draw, against that frame's layout.
+        self.follow_focus = true;
+    }
+
+    /// Cells queued or executing. Derived from `run_states` rather than
+    /// counted from events, because silent executions (bootstraps, config)
+    /// also emit start events and an event counter drifts.
+    fn active_runs(&self) -> usize {
+        self.run_states
+            .values()
+            .filter(|state| matches!(state, RunState::Running | RunState::Queued))
+            .count()
     }
 
     fn cell_source(&self, cell_id: &CellId) -> String {

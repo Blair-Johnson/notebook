@@ -115,102 +115,153 @@ fn render_markdown_line(
     width: usize,
     theme: &Theme,
 ) -> Vec<(Line<'static>, usize)> {
+    let tag = |lines: Vec<Line<'static>>| -> Vec<(Line<'static>, usize)> {
+        lines.into_iter().map(|line| (line, source_line)).collect()
+    };
+    let indent = line.len() - line.trim_start().len();
     let trimmed = line.trim_start();
     if let Some(rest) = trimmed.strip_prefix('>') {
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        let mut spans = vec![Span::styled(
-            "│ ",
-            Style::default().fg(theme.palette.accent_markdown),
-        )];
-        spans.extend(parse_inline(rest, theme));
-        return wrap_styled(spans, width)
-            .into_iter()
-            .map(|line| (line, source_line))
-            .collect();
+        let bar = Span::styled("▎ ", Style::default().fg(theme.palette.accent_markdown));
+        let mut spans = vec![bar.clone()];
+        spans.extend(parse_inline(rest, theme).into_iter().map(|span| {
+            let style = span.style.add_modifier(Modifier::ITALIC);
+            span.style(style)
+        }));
+        let mut lines = wrap_words(spans, width, 2);
+        for line in lines.iter_mut().skip(1) {
+            line.spans[0] = bar.clone();
+        }
+        return tag(lines);
     }
     let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
     if (1..=6).contains(&heading_level) && trimmed.chars().nth(heading_level) == Some(' ') {
         let content = trimmed[heading_level + 1..].trim();
-        let spans = vec![Span::styled(
-            content.to_string(),
-            Style::default()
-                .fg(theme.palette.accent_markdown)
-                .add_modifier(Modifier::BOLD),
-        )];
-        return wrap_styled(spans, width)
+        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        style = match heading_level {
+            1 => style.fg(theme.palette.accent_markdown),
+            2 => style.fg(theme.palette.accent_code),
+            _ => style.fg(theme.palette.fg),
+        };
+        let spans = parse_inline(content, theme)
             .into_iter()
-            .map(|line| (line, source_line))
+            .map(|span| {
+                let merged = style.patch(span.style).add_modifier(Modifier::BOLD);
+                span.style(merged)
+            })
             .collect();
+        return tag(wrap_words(spans, width, 0));
     }
-    wrap_styled(parse_inline(line, theme), width)
-        .into_iter()
-        .map(|line| (line, source_line))
-        .collect()
+    if trimmed.trim() == "---" || trimmed.trim() == "***" {
+        return tag(vec![Line::from(Span::styled(
+            "─".repeat(width.min(80)),
+            Style::default().fg(theme.palette.border),
+        ))]);
+    }
+    let bullet = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|marker| trimmed.strip_prefix(marker));
+    if let Some(rest) = bullet {
+        let mut spans = vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled("• ", Style::default().fg(theme.palette.muted)),
+        ];
+        spans.extend(parse_inline(rest, theme));
+        return tag(wrap_words(spans, width, indent + 2));
+    }
+    let numbered = trimmed
+        .find(". ")
+        .filter(|end| *end > 0 && *end <= 3 && trimmed[..*end].chars().all(|c| c.is_ascii_digit()));
+    if let Some(end) = numbered {
+        let marker = &trimmed[..end + 2];
+        let mut spans = vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(marker.to_string(), Style::default().fg(theme.palette.muted)),
+        ];
+        spans.extend(parse_inline(&trimmed[end + 2..], theme));
+        return tag(wrap_words(spans, width, indent + marker.len()));
+    }
+    tag(wrap_words(parse_inline(line, theme), width, 0))
 }
 
+fn code_span_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.palette.accent_code)
+        .bg(theme.palette.surface)
+}
+
+/// Inline Markdown: `code`, **bold**, *italic*, _italic_, [links](url).
+/// Emphasis content is parsed recursively, so `**bold `code`**` keeps the
+/// code styling. `_` only opens emphasis at a word boundary, so identifiers
+/// like `mlp_step` in prose stay intact.
 fn parse_inline(text: &str, theme: &Theme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
+    let plain = Style::default().fg(theme.palette.fg);
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut rest = text;
+    let mut prev: Option<char> = None;
+    let push_plain = |spans: &mut Vec<Span<'static>>, text: &str| {
+        if let Some(last) = spans.last_mut()
+            && last.style == plain
+        {
+            last.content.to_mut().push_str(text);
+        } else {
+            spans.push(Span::styled(text.to_string(), plain));
+        }
+    };
     while !rest.is_empty() {
+        let at_boundary = prev.is_none_or(|c| !c.is_alphanumeric());
         if let Some(code) = rest
             .strip_prefix('`')
             .and_then(|value| value.find('`').map(|end| &value[..end]))
         {
-            spans.push(Span::styled(
-                code.to_string(),
-                Style::default()
-                    .fg(theme.palette.accent_code)
-                    .add_modifier(Modifier::REVERSED),
-            ));
+            spans.push(Span::styled(code.to_string(), code_span_style(theme)));
             rest = &rest[code.len() + 2..];
+            prev = Some('`');
             continue;
         }
-        if let Some((label, url, consumed)) = parse_link(rest) {
+        if let Some((label, _url, consumed)) = parse_link(rest) {
             spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(theme.palette.accent_markdown)
+                    .fg(theme.palette.accent_code)
                     .add_modifier(Modifier::UNDERLINED),
             ));
-            let _ = url; // The render geometry layer can attach URL hits when it owns the source row.
             rest = &rest[consumed..];
+            prev = Some(')');
             continue;
         }
-        if let Some((marker, style)) = [
-            ("**", Modifier::BOLD),
-            ("__", Modifier::BOLD),
-            ("*", Modifier::ITALIC),
-            ("_", Modifier::ITALIC),
+        let emphasis = [
+            ("**", Modifier::BOLD, false),
+            ("__", Modifier::BOLD, true),
+            ("*", Modifier::ITALIC, false),
+            ("_", Modifier::ITALIC, true),
         ]
-        .iter()
-        .find_map(|(marker, modifier)| {
-            rest.strip_prefix(marker).and_then(|value| {
-                value.find(marker).map(|_end| {
-                    (
-                        marker,
-                        Style::default()
-                            .add_modifier(*modifier)
-                            .fg(theme.palette.fg),
-                    )
-                })
-            })
-        }) {
-            let content_start = marker.len();
-            let content = &rest[content_start..];
-            if let Some(end) = content.find(marker) {
-                spans.push(Span::styled(content[..end].to_string(), style));
-                rest = &content[end + marker.len()..];
-                continue;
+        .into_iter()
+        .find_map(|(marker, modifier, needs_boundary)| {
+            if needs_boundary && !at_boundary {
+                return None;
             }
+            let content = rest.strip_prefix(marker)?;
+            let end = content.find(marker)?;
+            (end > 0).then_some((marker, modifier, &content[..end]))
+        });
+        if let Some((marker, modifier, content)) = emphasis {
+            for span in parse_inline(content, theme) {
+                let style = span.style.add_modifier(modifier);
+                spans.push(span.style(style));
+            }
+            rest = &rest[marker.len() * 2 + content.len()..];
+            prev = marker.chars().last();
+            continue;
         }
-        let next = ["`", "**", "__", "*", "_", "["]
-            .iter()
-            .filter_map(|marker| rest.find(marker))
-            .min()
-            .unwrap_or(rest.len());
-        let (plain, tail) = rest.split_at(next.max(1).min(rest.len()));
-        spans.push(Span::raw(plain.to_string()));
-        rest = tail;
+        let mut chars = rest.char_indices();
+        let (_, c) = chars.next().unwrap_or((0, ' '));
+        let next = chars
+            .find(|(_, c)| matches!(c, '`' | '*' | '_' | '['))
+            .map_or(rest.len(), |(index, _)| index);
+        push_plain(&mut spans, &rest[..next]);
+        prev = rest[..next].chars().last().or(Some(c));
+        rest = &rest[next..];
     }
     if spans.is_empty() {
         spans.push(Span::default());
@@ -404,6 +455,74 @@ fn shrink_widths(widths: &mut [usize], floors: &[usize], target: usize) {
         };
         widths[column] -= 1;
     }
+}
+
+/// Word-wrap styled spans to `width` columns. Breaks at spaces, hard-breaks
+/// only words longer than a line, drops the spaces at a break, and indents
+/// continuation lines by `hang` columns.
+fn wrap_words(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let hang = hang.min(width.saturating_sub(1));
+    let chars: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+        .collect();
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut current: Vec<(char, Style)> = Vec::new();
+    let mut used = 0usize;
+    let width_of = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    let break_line = |lines: &mut Vec<Vec<(char, Style)>>, current: &mut Vec<(char, Style)>, used: &mut usize| {
+        while current.last().is_some_and(|(c, _)| *c == ' ') {
+            current.pop();
+        }
+        lines.push(std::mem::take(current));
+        current.extend(std::iter::repeat_n((' ', Style::default()), hang));
+        *used = hang;
+    };
+    let mut index = 0;
+    while index < chars.len() {
+        let start = index;
+        let is_space = chars[index].0 == ' ';
+        while index < chars.len() && (chars[index].0 == ' ') == is_space {
+            index += 1;
+        }
+        let token = &chars[start..index];
+        let token_width: usize = token.iter().map(|(c, _)| width_of(*c)).sum();
+        if is_space {
+            if used + token_width <= width {
+                current.extend_from_slice(token);
+                used += token_width;
+            } else {
+                break_line(&mut lines, &mut current, &mut used);
+            }
+            continue;
+        }
+        if used + token_width > width && used > hang && token_width <= width - hang {
+            break_line(&mut lines, &mut current, &mut used);
+        }
+        for &(c, style) in token {
+            let cw = width_of(c);
+            if used + cw > width && used > hang {
+                break_line(&mut lines, &mut current, &mut used);
+            }
+            current.push((c, style));
+            used += cw;
+        }
+    }
+    lines.push(current);
+    lines
+        .into_iter()
+        .map(|chars| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (c, style) in chars {
+                match spans.last_mut() {
+                    Some(last) if last.style == style => last.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn wrap_styled(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {

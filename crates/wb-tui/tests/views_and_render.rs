@@ -24,7 +24,7 @@ use wb_tui::focus::FocusStack;
 use wb_tui::layout::{LayoutCache, MIN_HISTORY_ROWS, TailFollow, ViewportLayout};
 use wb_tui::overlays::OverlayStates;
 use wb_tui::platform::{ClipboardSink, TmuxPaneTitle};
-use wb_tui::render::{AppView, HitTarget, render_app};
+use wb_tui::render::{AppView, HitTarget, KernelPhase, render_app};
 
 fn line_text(line: &Line<'_>) -> String {
     line.spans
@@ -259,7 +259,7 @@ fn layout_cache_warms_offscreen_cells_and_evicts_over_budget() {
     let theme = Theme::default();
     let mut cache = LayoutCache::default();
     let mut output_views = HashMap::new();
-    cache.sync_viewport(&document, &mut output_views, 80, 0, 10, 4, &theme);
+    cache.sync_viewport(&document, &mut output_views, 80, 0, 10, 4, &theme, None);
     assert!(cache.idle_queue_len() > 0);
     assert!(cache.warm_idle_chunk(&document, &mut output_views, 700, 4, &theme) == false);
     assert!(cache.approx_bytes() <= wb_tui::layout::cache::RENDER_CACHE_BUDGET_BYTES);
@@ -293,6 +293,10 @@ fn renderer_populates_frame_geometry_on_test_backend_without_mutating_document()
     let overlays = OverlayStates::default();
     let settings = CoreSettings::default();
     let status_segments: Vec<Box<dyn wb_sdk::StatusSegment>> = Vec::new();
+    let run_states = HashMap::new();
+    let setting_values = HashMap::new();
+    let registry = wb_sdk::ExtensionRegistry::default();
+    let logs = std::collections::VecDeque::new();
     let view = AppView {
         path: None,
         document: &document,
@@ -302,14 +306,21 @@ fn renderer_populates_frame_geometry_on_test_backend_without_mutating_document()
         kernel_name: "python3",
         kernel_busy: false,
         kernel_alive: true,
+        kernel_phase: KernelPhase::Ready,
         running_cells: 0,
+        run_states: &run_states,
+        spinner_tick: 0,
         notice: Some("ready"),
         settings: &settings,
+        setting_values: &setting_values,
+        registry: &registry,
         status_segments: &status_segments,
         completion: None,
         signature: None,
         inspect_pager: None,
         overlays: &overlays,
+        help_scroll: 0,
+        logs: &logs,
     };
     let mut output_views = HashMap::new();
     let mut cache = LayoutCache::default();

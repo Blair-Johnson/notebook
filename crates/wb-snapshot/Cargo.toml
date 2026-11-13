@@ -1,0 +1,29 @@
+[package]
+name = "wb-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Render Workbench frames (headless Coordinator runs or live tmux panes) to PNG for visual review."
+
+[[bin]]
+name = "wb-snap"
+path = "src/main.rs"
+
+[dependencies]
+wb-core.workspace = true
+wb-kernel.workspace = true
+wb-sdk.workspace = true
+wb-tui.workspace = true
+
+ansi-to-tui.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+resvg.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

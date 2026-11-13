@@ -1154,6 +1154,7 @@ fn handle_iopub(
         }
         JupyterMessageContent::ExecuteInput(input) => {
             if let Some(exec_id) = parent {
+                router.mark_started(&exec_id);
                 let (target, _) = router.resolve_output_target(Some(&exec_id));
                 let _ = event_tx.send(KernelEvent::ExecutionStarted {
                     exec_id,

@@ -46,6 +46,8 @@ pub struct FrameGeometry {
     pub dock_rect: Option<Rect>,
     pub row_hits: Vec<RowHit>,
     pub scrollbar: Option<ScrollbarGeometry>,
+    /// Screen cell of the edit cursor, when a cell or input is being edited.
+    pub cursor: Option<(u16, u16)>,
 }
 
 impl FrameGeometry {

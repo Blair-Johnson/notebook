@@ -62,6 +62,14 @@ impl ExecRouter {
         self.active.get(id)
     }
 
+    /// The kernel began executing `id` (`execute_input`). Restart its clock so
+    /// elapsed time excludes the wait behind earlier requests.
+    pub fn mark_started(&mut self, id: &ExecId) {
+        if let Some(active) = self.active.get_mut(id) {
+            active.started_at = Instant::now();
+        }
+    }
+
     pub fn completed_capacity(&self) -> (usize, usize) {
         (self.completed_order.len(), self.completed_cap)
     }

@@ -41,7 +41,7 @@ impl Default for CoreSettings {
         Self {
             max_output_rows: 18,
             wheel_scroll_lines: 3,
-            insert_escape_chord_ms: 350,
+            insert_escape_chord_ms: 500,
             composer_expanded_ratio_pct: 50,
             mouse_capture: true,
             formatter: "ruff format -".into(),
@@ -324,7 +324,7 @@ fn build_snapshot(
     }
     warn_unknown_values(&parsed, &specs, &mut warnings);
 
-    let theme_name = setting_text(&values, "display.theme").unwrap_or_else(|| "terminal".into());
+    let theme_name = setting_text(&values, "display.theme").unwrap_or_else(|| "midnight".into());
     let mut theme = theme_preset(&theme_name).unwrap_or_else(|| Theme::default());
     if let Some(syntect) = setting_text(&values, "display.syntect_theme") {
         theme.syntect_theme = syntect;
@@ -334,7 +334,7 @@ fn build_snapshot(
             .clamp(0, u16::MAX as i64) as u16,
         wheel_scroll_lines: setting_int(&values, "display.wheel_scroll_lines", 3)
             .clamp(0, u16::MAX as i64) as u16,
-        insert_escape_chord_ms: setting_int(&values, "editor.insert_escape_chord_ms", 350).max(0)
+        insert_escape_chord_ms: setting_int(&values, "editor.insert_escape_chord_ms", 500).max(0)
             as u64,
         composer_expanded_ratio_pct: setting_int(&values, "editor.composer_expanded_ratio_pct", 50)
             .clamp(0, u16::MAX as i64) as u16,
@@ -529,16 +529,24 @@ fn theme_preset(name: &str) -> Option<Theme> {
         "terminal" => ("base16-ocean.dark", Theme::default().palette),
         "midnight" => (
             "base16-ocean.dark",
-            palette(
-                Color::Rgb(8, 12, 24),
-                Color::Rgb(18, 24, 42),
-                Color::Rgb(12, 18, 34),
-                Color::Rgb(32, 48, 82),
-                Color::Rgb(224, 232, 255),
-                Color::Rgb(132, 148, 184),
-                Color::Rgb(66, 86, 128),
-                Color::Rgb(96, 180, 255),
-            ),
+            // Transparent background so the terminal's own color shows
+            // through; RGB only for surfaces, selection, and accents.
+            wb_sdk::Palette {
+                bg: Color::Reset,
+                surface: Color::Rgb(26, 32, 50),
+                panel_bg: Color::Rgb(20, 26, 42),
+                panel_selection: Color::Rgb(44, 62, 104),
+                fg: Color::Rgb(214, 220, 236),
+                muted: Color::Rgb(116, 128, 158),
+                border: Color::Rgb(58, 70, 100),
+                border_focused: Color::Rgb(108, 168, 255),
+                accent_code: Color::Rgb(108, 168, 255),
+                accent_markdown: Color::Rgb(196, 146, 255),
+                accent_raw: Color::Rgb(232, 190, 108),
+                success: Color::Rgb(122, 214, 152),
+                warning: Color::Rgb(238, 196, 104),
+                error: Color::Rgb(242, 112, 124),
+            },
         ),
         "light" => (
             "InspiredGitHub",
@@ -633,7 +641,7 @@ mod tests {
             "{:?}",
             store.snapshot().warnings
         );
-        assert_eq!(store.snapshot().theme.name, "terminal");
+        assert_eq!(store.snapshot().theme.name, "midnight");
     }
 
     #[test]
