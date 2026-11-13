@@ -1,0 +1,30 @@
+[package]
+name = "nb-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "TUI coordinator, focus stack, shared VimGrammar, Fenwick layout cache, built-in plugins, and pure renderer."
+
+[dependencies]
+nb-core.workspace = true
+nb-kernel.workspace = true
+nb-sdk.workspace = true
+
+ansi-to-tui.workspace = true
+anyhow.workspace = true
+arboard.workspace = true
+base64.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syntect.workspace = true
+tokio.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

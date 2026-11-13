@@ -1327,6 +1327,82 @@ dependencies = [
 ]
 
 [[package]]
+name = "nb-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "nb-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jupyter-protocol",
+ "jupyter-zmq-client",
+ "libc",
+ "nb-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nb-sdk"
+version = "0.1.0"
+dependencies = [
+ "nb-core",
+ "ratatui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nb-snapshot"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "clap",
+ "crossterm",
+ "nb-core",
+ "nb-kernel",
+ "nb-sdk",
+ "nb-tui",
+ "ratatui",
+ "resvg",
+ "tokio",
+]
+
+[[package]]
+name = "nb-tui"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "arboard",
+ "base64 0.22.1",
+ "crossterm",
+ "nb-core",
+ "nb-kernel",
+ "nb-sdk",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "syntect",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "unicode-width",
+]
+
+[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,6 +1444,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "notebook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "futures",
+ "libc",
+ "nb-core",
+ "nb-kernel",
+ "nb-sdk",
+ "nb-tui",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]
@@ -2991,82 +3084,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wb-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
-name = "wb-kernel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "jupyter-protocol",
- "jupyter-zmq-client",
- "libc",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "uuid",
- "wb-core",
-]
-
-[[package]]
-name = "wb-sdk"
-version = "0.1.0"
-dependencies = [
- "ratatui",
- "serde",
- "serde_json",
- "wb-core",
-]
-
-[[package]]
-name = "wb-snapshot"
-version = "0.1.0"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "clap",
- "crossterm",
- "ratatui",
- "resvg",
- "tokio",
- "wb-core",
- "wb-kernel",
- "wb-sdk",
- "wb-tui",
-]
-
-[[package]]
-name = "wb-tui"
-version = "0.1.0"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "arboard",
- "base64 0.22.1",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "syntect",
- "tokio",
- "toml",
- "toml_edit",
- "unicode-width",
- "wb-core",
- "wb-kernel",
- "wb-sdk",
-]
-
-[[package]]
 name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3294,23 +3311,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "workbench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "futures",
- "libc",
- "ratatui",
- "tokio",
- "wb-core",
- "wb-kernel",
- "wb-sdk",
- "wb-tui",
-]
 
 [[package]]
 name = "x11rb"

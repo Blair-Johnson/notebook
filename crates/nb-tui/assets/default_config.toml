@@ -1,0 +1,27 @@
+# Default nb configuration (`$XDG_CONFIG_HOME/notebook/config.toml`).
+# Comments and formatting in your user config file are preserved when the settings screen saves.
+
+[display]
+theme = "midnight"
+syntect_theme = "auto"
+max_output_rows = 18
+output_default_view = "preview"
+notice_secs = 4
+follow_output = true
+wheel_scroll_lines = 3
+
+[editor]
+insert_escape_chord_ms = 500
+indent_width = 4
+composer_expanded_ratio_pct = 50
+mouse_capture = true
+formatter = "ruff format -"
+format_on_save = false
+
+[kernel]
+default_kernel = "python3"
+use_jedi = false
+complete_on_dot = true
+signature_help = true
+max_stream_lines = 10000
+autosave_secs = 30

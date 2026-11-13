@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/wb-core",
-    "crates/wb-kernel",
-    "crates/wb-sdk",
-    "crates/wb-tui",
-    "crates/wb-snapshot",
-    "crates/workbench",
+    "crates/nb-core",
+    "crates/nb-kernel",
+    "crates/nb-sdk",
+    "crates/nb-tui",
+    "crates/nb-snapshot",
+    "crates/notebook",
 ]
 
 [workspace.package]
@@ -17,10 +17,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-wb-core = { path = "crates/wb-core" }
-wb-kernel = { path = "crates/wb-kernel" }
-wb-sdk = { path = "crates/wb-sdk" }
-wb-tui = { path = "crates/wb-tui" }
+nb-core = { path = "crates/nb-core" }
+nb-kernel = { path = "crates/nb-kernel" }
+nb-sdk = { path = "crates/nb-sdk" }
+nb-tui = { path = "crates/nb-tui" }
 
 ansi-to-tui = "8.0"
 anyhow = "1.0"

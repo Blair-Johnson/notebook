@@ -1,0 +1,31 @@
+[package]
+name = "notebook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Terminal Jupyter notebook client tailored for interactive Python and JAX workflows."
+
+[[bin]]
+name = "nb"
+path = "src/main.rs"
+
+[dependencies]
+nb-core.workspace = true
+nb-kernel.workspace = true
+nb-sdk.workspace = true
+nb-tui.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
