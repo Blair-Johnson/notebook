@@ -253,22 +253,22 @@ fn space_cycles_preview_full_hidden_and_reading_unhides() {
 
     keys(&mut c, " ");
     assert_eq!(
-        c.document.cell(&id).unwrap().output_display(),
+        c.document.cell(&id).unwrap().output_display(wb_core::OutputDisplay::Preview),
         wb_core::OutputDisplay::Full
     );
     assert!(height(&c) > preview);
 
     keys(&mut c, " ");
     assert_eq!(
-        c.document.cell(&id).unwrap().output_display(),
+        c.document.cell(&id).unwrap().output_display(wb_core::OutputDisplay::Preview),
         wb_core::OutputDisplay::Hidden
     );
     assert!(height(&c) < preview);
-    assert!(screen(&mut c).contains("40 lines hidden"));
+    assert!(screen(&mut c).contains("40 lines"));
 
     keys(&mut c, "i");
     assert_eq!(
-        c.document.cell(&id).unwrap().output_display(),
+        c.document.cell(&id).unwrap().output_display(wb_core::OutputDisplay::Preview),
         wb_core::OutputDisplay::Preview
     );
     assert!(matches!(c.focus.top(), FocusLayer::OutputFocus { .. }));
@@ -277,4 +277,31 @@ fn space_cycles_preview_full_hidden_and_reading_unhides() {
     press(&mut c, KeyCode::Esc);
     keys(&mut c, "k ");
     assert!(c.run_states.contains_key(&id));
+}
+
+#[test]
+fn space_skips_preview_for_outputs_that_already_fit() {
+    let mut c = coordinator(&[("print(1)", "1\n")]);
+    let id = c.document.order()[0].clone();
+    keys(&mut c, "j");
+    let choice = |c: &Coordinator| c.document.cell(&id).unwrap().output_display_choice();
+    keys(&mut c, " ");
+    assert_eq!(choice(&c), Some(wb_core::OutputDisplay::Hidden));
+    keys(&mut c, " ");
+    assert_eq!(choice(&c), Some(wb_core::OutputDisplay::Full));
+    keys(&mut c, " ");
+    assert_eq!(choice(&c), Some(wb_core::OutputDisplay::Hidden));
+}
+
+#[test]
+fn default_output_view_comes_from_settings() {
+    let long: String = (0..40).map(|n| format!("line {n}\n")).collect();
+    let mut c = coordinator(&[("loop()", &long)]);
+    let preview = c.layout_cache.heights().height(0);
+    let id = wb_sdk::SettingId(std::borrow::Cow::Borrowed("display.output_default_view"));
+    c.settings
+        .set_value(&id, wb_sdk::SettingValue::Text("hidden".into()), &c.registry);
+    draw(&mut c);
+    assert!(c.layout_cache.heights().height(0) < preview);
+    assert!(screen(&mut c).contains("40 lines"));
 }

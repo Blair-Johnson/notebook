@@ -86,24 +86,30 @@ impl Cell {
     }
 
     /// How the cell's outputs are shown. Stored in the cell's nbformat
-    /// metadata with Jupyter's own keys (`jupyter.outputs_hidden`,
-    /// `scrolled`), so it survives a save and matches JupyterLab.
-    pub fn output_display(&self) -> OutputDisplay {
-        let Some(metadata) = self.extra.get("metadata").and_then(Value::as_object) else {
-            return OutputDisplay::Preview;
-        };
+    /// The view chosen for this cell, if any. Stored in the cell's nbformat
+    /// metadata with Jupyter's own keys, so it survives a save and matches
+    /// JupyterLab: `jupyter.outputs_hidden` (hidden), `scrolled: true`
+    /// (preview), `scrolled: false` (full). `None` means "use the default".
+    pub fn output_display_choice(&self) -> Option<OutputDisplay> {
+        let metadata = self.extra.get("metadata").and_then(Value::as_object)?;
         let hidden = metadata
             .get("jupyter")
             .and_then(|jupyter| jupyter.get("outputs_hidden"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if hidden {
-            OutputDisplay::Hidden
-        } else if metadata.get("scrolled") == Some(&Value::Bool(false)) {
-            OutputDisplay::Full
-        } else {
-            OutputDisplay::Preview
+            return Some(OutputDisplay::Hidden);
         }
+        match metadata.get("scrolled") {
+            Some(Value::Bool(false)) => Some(OutputDisplay::Full),
+            Some(Value::Bool(true)) => Some(OutputDisplay::Preview),
+            _ => None,
+        }
+    }
+
+    /// The view in effect: the cell's own choice, else `default`.
+    pub fn output_display(&self, default: OutputDisplay) -> OutputDisplay {
+        self.output_display_choice().unwrap_or(default)
     }
 
     pub fn set_output_display(&mut self, display: OutputDisplay) {
@@ -123,7 +129,9 @@ impl Cell {
             }
         }
         match display {
-            OutputDisplay::Preview => {}
+            OutputDisplay::Preview => {
+                metadata.insert("scrolled".into(), Value::Bool(true));
+            }
             OutputDisplay::Full => {
                 metadata.insert("scrolled".into(), Value::Bool(false));
             }
@@ -141,7 +149,7 @@ impl Cell {
 }
 
 /// How a cell's outputs are shown.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum OutputDisplay {
     /// Each output capped at the configured row count (scroll by entering).
     #[default]
@@ -153,12 +161,34 @@ pub enum OutputDisplay {
 }
 
 impl OutputDisplay {
-    /// Preview → full → hidden → preview.
-    pub fn next(self) -> Self {
+    pub const NAMES: &'static [&'static str] = &["preview", "full", "hidden"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "preview" => Some(Self::Preview),
+            "full" => Some(Self::Full),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+
+    /// What is actually shown: a preview of outputs that already fit within
+    /// the preview rows is the full output.
+    pub fn effective(self, clips: bool) -> Self {
         match self {
+            Self::Preview if !clips => Self::Full,
+            other => other,
+        }
+    }
+
+    /// Preview → full → hidden → preview, skipping preview when it would
+    /// look the same as full (`clips` is false).
+    pub fn next(self, clips: bool) -> Self {
+        match self.effective(clips) {
             Self::Preview => Self::Full,
             Self::Full => Self::Hidden,
-            Self::Hidden => Self::Preview,
+            Self::Hidden if clips => Self::Preview,
+            Self::Hidden => Self::Full,
         }
     }
 
@@ -178,17 +208,27 @@ mod tests {
     #[test]
     fn output_display_round_trips_through_jupyter_metadata() {
         let mut cell = Cell::new_code();
-        assert_eq!(cell.output_display(), OutputDisplay::Preview);
+        assert_eq!(cell.output_display_choice(), None);
+        assert_eq!(cell.output_display(OutputDisplay::Full), OutputDisplay::Full);
         for display in [OutputDisplay::Full, OutputDisplay::Hidden, OutputDisplay::Preview] {
             cell.set_output_display(display);
-            assert_eq!(cell.output_display(), display);
+            assert_eq!(cell.output_display(OutputDisplay::Hidden), display);
         }
         cell.set_output_display(OutputDisplay::Hidden);
         assert_eq!(
             cell.extra["metadata"]["jupyter"]["outputs_hidden"],
             Value::Bool(true)
         );
-        cell.set_output_display(OutputDisplay::Preview);
-        assert_eq!(cell.extra["metadata"], Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn cycling_skips_preview_when_nothing_is_clipped() {
+        use OutputDisplay::*;
+        assert_eq!(Preview.next(true), Full);
+        assert_eq!(Full.next(true), Hidden);
+        assert_eq!(Hidden.next(true), Preview);
+        assert_eq!(Preview.next(false), Hidden);
+        assert_eq!(Hidden.next(false), Full);
+        assert_eq!(Preview.effective(false), Full);
     }
 }

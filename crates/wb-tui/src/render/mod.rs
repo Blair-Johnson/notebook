@@ -136,6 +136,7 @@ pub fn render_app(
         FocusLayer::CellEdit { cell_id, .. } => Some(cell_id),
         _ => None,
     };
+    cache.default_output_view = view.settings.output_default_view;
     cache.sync_viewport(
         view.document,
         output_views,

@@ -103,7 +103,7 @@ fn hint_actions(
     match focus {
         FocusLayer::NotebookNormal if part == crate::focus::CellPart::Output => &[
             ("cell.enter_normal", "read"),
-            ("output.cycle_view", "preview/full/hide"),
+            ("output.cycle_view", "expand/collapse"),
             ("output.next_tab", "stdout/stderr"),
             ("op.yank", "copy"),
             ("op.delete", "clear"),

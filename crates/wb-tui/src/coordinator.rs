@@ -42,7 +42,9 @@ use wb_sdk::{
 };
 
 /// How long a status-bar notice stays before the key hints come back.
-const NOTICE_TTL: Duration = Duration::from_secs(4);
+fn notice_ttl(core: &crate::config_store::CoreSettings) -> Duration {
+    Duration::from_secs(core.notice_secs.max(1))
+}
 
 #[derive(Debug)]
 pub enum Effect {
@@ -94,7 +96,7 @@ pub struct Coordinator {
     follow_focus: bool,
     pub notice: Option<String>,
     /// The notice last seen by `on_tick` and when it appeared; notices
-    /// clear themselves after `NOTICE_TTL`.
+    /// clear themselves after `display.notice_secs`.
     notice_seen: Option<(String, Instant)>,
     pub registry: ExtensionRegistry,
     pub settings: SettingsStore,
@@ -296,6 +298,7 @@ impl Coordinator {
             FocusLayer::CellEdit { cell_id, .. } => Some(cell_id.clone()),
             _ => None,
         };
+        self.layout_cache.default_output_view = snap.core.output_default_view;
         self.layout_cache.sync_viewport(
             &self.document,
             &mut self.output_views,
@@ -835,9 +838,10 @@ impl Coordinator {
 
     pub fn on_tick(&mut self, now: Instant) -> bool {
         let mut changed = self.grammar.expire_chord(now);
+        let ttl = notice_ttl(&self.settings.snapshot().core);
         match (&self.notice, &self.notice_seen) {
             (Some(notice), Some((seen, at))) if notice == seen => {
-                if now.duration_since(*at) >= NOTICE_TTL {
+                if now.duration_since(*at) >= ttl {
                     self.notice = None;
                     self.notice_seen = None;
                     changed = true;
@@ -961,6 +965,7 @@ impl Coordinator {
         let snap = self.settings.snapshot().clone();
         self.grammar.insert_escape_chord = Duration::from_millis(snap.core.insert_escape_chord_ms);
         self.term_effects.set_mouse_capture(snap.core.mouse_capture);
+        self.vim.indent_width = usize::from(snap.core.indent_width).max(1);
     }
 
     fn dispatch_grammar_step(&mut self, step: GrammarStep) -> Option<Effect> {
@@ -1357,6 +1362,7 @@ impl Coordinator {
     }
 
     fn dispatch_pdb(&mut self, input: ResolvedInput) {
+        let indent = usize::from(self.settings.snapshot().core.indent_width);
         let Some(pdb) = self.overlays.pdb_dock.as_mut() else {
             return;
         };
@@ -1382,7 +1388,7 @@ impl Coordinator {
             }
             ResolvedInput::Command { id, .. } if is_text_edit_command(id.0.as_ref()) => {
                 pdb.composer.checkpoint();
-                apply_text_edit(&mut pdb.composer, id.0.as_ref());
+                apply_text_edit(&mut pdb.composer, id.0.as_ref(), indent);
             }
             ResolvedInput::Move { motion, .. } => {
                 apply_text_motion(&mut pdb.composer, motion.0.as_ref());
@@ -1508,8 +1514,12 @@ impl Coordinator {
             "output.cycle_view" => {
                 if self.selected_part == CellPart::Output {
                     let id = self.selected_cell.clone();
+                    let default = self.settings.snapshot().core.output_default_view;
+                    // Outputs that fit within the preview rows have no
+                    // separate preview: Space toggles full and hidden.
+                    let clips = self.layout_cache.cached(&id).is_none_or(|cached| cached.clips);
                     if let Some(cell) = self.document.cell_mut(&id) {
-                        let next = cell.output_display().next();
+                        let next = cell.output_display(default).next(clips);
                         cell.set_output_display(next);
                         self.document.dirty_source = true;
                     }
@@ -1668,7 +1678,8 @@ impl Coordinator {
             }
             ResolvedInput::Command { id, .. } if is_text_edit_command(id.0.as_ref()) => {
                 let id = id.0.to_string();
-                self.mutate_cell_buffer(cell_id, |buffer| apply_text_edit(buffer, &id));
+                let indent = usize::from(self.settings.snapshot().core.indent_width);
+                self.mutate_cell_buffer(cell_id, |buffer| apply_text_edit(buffer, &id, indent));
                 self.refilter_completion(cell_id);
             }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "edit.newline" => {
@@ -2628,8 +2639,9 @@ impl Coordinator {
         }
         let text = vim::OutputText::new(cell);
         // Reading a hidden output shows it first.
+        let default = self.settings.snapshot().core.output_default_view;
         if let Some(cell) = self.document.cell_mut(&cell_id) {
-            if cell.output_display() == wb_core::OutputDisplay::Hidden {
+            if cell.output_display(default) == wb_core::OutputDisplay::Hidden {
                 cell.set_output_display(wb_core::OutputDisplay::Preview);
                 self.document.dirty_source = true;
             }
@@ -3222,8 +3234,10 @@ fn is_text_edit_command(id: &str) -> bool {
     )
 }
 
-/// Apply one `text.insert` editing command at the cursor.
-fn apply_text_edit(buffer: &mut wb_core::TextBuffer, id: &str) {
+/// Apply one `text.insert` editing command at the cursor; `indent` is the
+/// indent width in spaces (`editor.indent_width`).
+fn apply_text_edit(buffer: &mut wb_core::TextBuffer, id: &str, indent: usize) {
+    let indent = indent.max(1);
     let cursor = buffer.cursor();
     match id {
         "edit.backspace" => buffer.delete_char_backward(),
@@ -3250,16 +3264,16 @@ fn apply_text_edit(buffer: &mut wb_core::TextBuffer, id: &str) {
                 buffer.delete_span(start, cursor);
             }
         }
-        // Tab: spaces up to the next 4-column stop (mixing literal tabs
-        // into space-indented Python raises TabError).
+        // Tab: spaces up to the next indent stop (mixing literal tabs into
+        // space-indented Python raises TabError).
         "edit.indent" => {
-            let width = 4 - cursor.col % 4;
+            let width = indent - cursor.col % indent;
             buffer.insert_str(&" ".repeat(width));
         }
         // Shift+Tab: remove up to one indent level from the line's start.
         "edit.dedent" => {
             let line = buffer.line(cursor.row).unwrap_or("");
-            let remove = line.chars().take(4).take_while(|c| *c == ' ').count();
+            let remove = line.chars().take(indent).take_while(|c| *c == ' ').count();
             let remove = if remove == 0 && line.starts_with('\t') { 1 } else { remove };
             if remove > 0 {
                 buffer.delete_span(

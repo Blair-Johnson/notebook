@@ -11,8 +11,6 @@ use wb_core::{
 };
 use wb_sdk::MotionOrObject;
 
-const INDENT: &str = "    ";
-
 /// The unnamed register: last yank or delete.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Register {
@@ -68,6 +66,8 @@ pub struct VimState {
     desired_col: Option<usize>,
     /// Rows moved by ctrl+d / ctrl+u.
     pub half_page: usize,
+    /// Spaces per `>` / `<` (`editor.indent_width`).
+    pub indent_width: usize,
 }
 
 impl Default for VimState {
@@ -77,6 +77,7 @@ impl Default for VimState {
             last_find: None,
             desired_col: None,
             half_page: 10,
+            indent_width: 4,
         }
     }
 }
@@ -278,7 +279,7 @@ impl VimState {
                     Range::Chars(a, b) => (a.row.min(b.row), a.row.max(b.row)),
                 };
                 for row in first..=last {
-                    shift_line(buf, row, op == "op.indent");
+                    shift_line(buf, row, op == "op.indent", self.indent_width);
                 }
                 buf.set_cursor(CursorPos {
                     row: first,
@@ -956,18 +957,18 @@ fn join_lines(buf: &mut TextBuffer, row: usize, joins: usize) {
     }
 }
 
-fn shift_line(buf: &mut TextBuffer, row: usize, indent: bool) {
+fn shift_line(buf: &mut TextBuffer, row: usize, indent: bool, width: usize) {
     if indent {
         if buf.line_char_len(row) > 0 {
             buf.set_cursor(CursorPos { row, col: 0 });
-            buf.insert_str(INDENT);
+            buf.insert_str(&" ".repeat(width));
         }
     } else {
         let ws = leading_ws(buf, row);
         let remove = if ws.starts_with('\t') {
             1
         } else {
-            ws.chars().take(INDENT.len()).take_while(|c| *c == ' ').count()
+            ws.chars().take(width).take_while(|c| *c == ' ').count()
         };
         if remove > 0 {
             buf.delete_span(CursorPos { row, col: 0 }, CursorPos { row, col: remove });

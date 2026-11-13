@@ -24,6 +24,8 @@ pub struct CellLayoutKey {
     pub theme_rev: u64,
     /// Markdown shown as raw source (while it is being edited).
     pub raw_source: bool,
+    pub default_view: OutputDisplay,
+    pub preview_rows: u16,
 }
 
 #[derive(Debug)]
@@ -34,6 +36,9 @@ pub struct CachedCellLayout {
     pub last_seen_frame: u64,
     pub approx_bytes: usize,
     pub source_line_map: Vec<usize>,
+    /// Some output is taller than the preview rows, so preview and full
+    /// differ.
+    pub clips: bool,
 }
 
 pub struct LayoutCache {
@@ -46,6 +51,8 @@ pub struct LayoutCache {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     line_highlights: HashMap<(CellId, u64, usize, u64), Line<'static>>,
+    /// `display.output_default_view`, set by the caller before syncing.
+    pub default_output_view: OutputDisplay,
 }
 
 impl Default for LayoutCache {
@@ -60,6 +67,7 @@ impl Default for LayoutCache {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             line_highlights: HashMap::new(),
+            default_output_view: OutputDisplay::Preview,
         }
     }
 }
@@ -101,11 +109,11 @@ impl LayoutCache {
         })
     }
 
-    fn estimate_height(cell: &Cell, max_output_rows: u16) -> u32 {
+    fn estimate_height(cell: &Cell, max_output_rows: u16, default: OutputDisplay) -> u32 {
         if cell.collapsed {
             return CardRows { source: 1, outputs: 0 }.total();
         }
-        let outputs = match (cell.outputs.len(), cell.output_display()) {
+        let outputs = match (cell.outputs.len(), cell.output_display(default)) {
             (0, _) => 0,
             (_, OutputDisplay::Hidden) => 1,
             _ => output_sections(cell)
@@ -126,11 +134,12 @@ impl LayoutCache {
         }
         self.order = doc.order().to_vec();
         self.heights = FenwickTree::with_len(doc.order().len());
+        let default = self.default_output_view;
         for (index, cell_id) in doc.order().iter().enumerate() {
             let height = self.cells.get(cell_id).map_or_else(
                 || {
                     doc.cell(cell_id)
-                        .map_or(1, |cell| Self::estimate_height(cell, max_output_rows))
+                        .map_or(1, |cell| Self::estimate_height(cell, max_output_rows, default))
                 },
                 |cell| cell.total_rows,
             );
@@ -179,6 +188,8 @@ impl LayoutCache {
             width,
             theme_rev: theme.revision,
             raw_source,
+            default_view: self.default_output_view,
+            preview_rows: max_output_rows,
         };
         if let Some(cached) = self.cells.get_mut(cell_id) {
             if cached.key == key {
@@ -188,16 +199,32 @@ impl LayoutCache {
         }
 
         let (wrapped_source, source_line_map) = self.render_source(cell, width, theme, raw_source);
+        let mut clips = false;
         let rows = if cell.collapsed {
             CardRows { source: 1, outputs: 0 }
         } else {
-            let display = cell.output_display();
+            let sections = output_sections(cell);
+            // Preview and full only differ when some output is taller than
+            // the preview rows.
+            let preview = Some(max_output_rows.max(1));
+            clips = sections
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .any(|output| {
+                    output_views.get_mut(&output.id).is_some_and(|view| {
+                        let metrics = view.measure(output, width, theme, preview);
+                        metrics.total_rows > metrics.shown_rows
+                    })
+                });
+            let display = cell
+                .output_display(self.default_output_view)
+                .effective(clips);
             let cap = output_cap(display, max_output_rows);
             let outputs = match (cell.outputs.len(), display) {
                 (0, _) => 0,
                 (_, OutputDisplay::Hidden) => 1,
                 // One divider per section, then its outputs' rows.
-                _ => output_sections(cell)
+                _ => sections
                     .iter()
                     .map(|section| {
                         1 + section
@@ -233,6 +260,7 @@ impl LayoutCache {
                 last_seen_frame: self.frame_counter,
                 approx_bytes,
                 source_line_map,
+                clips,
             },
         );
         Some(total_rows.max(1))

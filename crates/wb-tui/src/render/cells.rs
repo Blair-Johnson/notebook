@@ -8,7 +8,7 @@
 //! │ step 0: loss=0.71                               │   printed
 //! ├─ Out [3] ───────────────────────────────────────┤
 //! │ {'shape': [512, 512], 'dtype': 'float32'}       │   returned
-//! ╰──────────────────────────── preview · space: full ╯
+//! ╰─────────────────────────────────────────────────╯
 //! ```
 //!
 //! Type shows in the title color and the source background; the selected
@@ -197,28 +197,12 @@ impl CellCtx<'_> {
         }
 
         if let Some(y) = self.screen_y(rows.total() - 1) {
-            let p = &self.theme.palette;
             let color = if rows.outputs > 0 {
                 look.output_border
             } else {
                 look.source_border
             };
-            // On a selected output block, say how it is shown and how to change it.
-            let label = (rows.outputs > 0 && look.outputs_selected && look.output_mode.is_none())
-                .then(|| {
-                    let display = self.cell.output_display();
-                    vec![
-                        Span::styled(
-                            format!(" {} ", display.label()),
-                            Style::default().fg(look.accent).bg(p.bg),
-                        ),
-                        Span::styled(
-                            format!("· space: {} ", display.next().label()),
-                            Style::default().fg(p.muted).bg(p.bg),
-                        ),
-                    ]
-                });
-            self.hline(frame, y, ("╰", "╯"), color, &[], &label.unwrap_or_default());
+            self.hline(frame, y, ("╰", "╯"), color, &[], &[]);
             geometry.row_hits.push(RowHit {
                 screen_y: y,
                 target: HitTarget::CellHeader {
@@ -558,7 +542,10 @@ impl CellCtx<'_> {
         let sections = output_sections(self.cell);
         let first_id = sections.first()?.items.first()?.id;
         let muted = |text: String| Span::styled(text, Style::default().fg(p.muted).bg(p.bg));
-        let display = self.cell.output_display();
+        let display = self
+            .cell
+            .output_display(self.view.settings.output_default_view)
+            .effective(self.cached.clips);
 
         if display == OutputDisplay::Hidden {
             if let Some(y) = self.screen_y(top) {
@@ -568,7 +555,7 @@ impl CellCtx<'_> {
                     .iter()
                     .map(|output| output.plain_text().lines().count().max(1))
                     .sum();
-                let right = vec![muted(format!(" {lines} lines hidden "))];
+                let right = vec![muted(format!(" ▸ {lines} lines "))];
                 let labels = self.all_labels(&sections, look);
                 self.hline(frame, y, ("├", "┤"), look.output_border, &labels, &right);
                 self.output_hit(geometry, y, first_id, 0);
@@ -581,20 +568,8 @@ impl CellCtx<'_> {
             .zip(self.view.output_text.filter(|out| out.cell_id == self.cell.id));
         if let Some((mode, out)) = entered {
             if let Some(y) = self.screen_y(top) {
-                let state = if matches!(mode, CellMode::Visual(_)) {
-                    " visual "
-                } else {
-                    " reading "
-                };
-                let right = vec![Span::styled(
-                    state,
-                    Style::default()
-                        .fg(look.accent)
-                        .bg(p.bg)
-                        .add_modifier(Modifier::BOLD),
-                )];
                 let labels = self.all_labels(&sections, look);
-                self.hline(frame, y, ("├", "┤"), look.output_border, &labels, &right);
+                self.hline(frame, y, ("├", "┤"), look.output_border, &labels, &[]);
             }
             let region = rows.outputs.saturating_sub(1);
             return self.draw_output_text(frame, out, mode, top + 1, region, look, geometry);
@@ -624,17 +599,6 @@ impl CellCtx<'_> {
                 let mut right = Vec::new();
                 if clipped > 0 {
                     right.push(muted(format!(" +{clipped} lines ")));
-                }
-                let tabs = matches!(
-                    section.kind,
-                    SectionKind::Streams {
-                        stdout: true,
-                        stderr: true,
-                        ..
-                    }
-                );
-                if tabs && look.outputs_selected {
-                    right.push(muted("tab ".to_string()));
                 }
                 let label = self.section_label(section, look);
                 self.hline(frame, y, ("├", "┤"), look.output_border, &label, &right);

@@ -199,7 +199,7 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
     );
 
     modal.active_tab = 0;
-    modal.filter = "maximum output rows".into();
+    modal.filter = "preview rows".into();
     modal.selected_row = 0;
     assert_eq!(
         modal.handle_raw_key(key(KeyCode::Char('+')), &mut store, &registry),

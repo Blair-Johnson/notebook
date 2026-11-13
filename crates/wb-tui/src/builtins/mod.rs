@@ -936,12 +936,47 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "display.max_output_rows",
             "display",
-            "Maximum output rows",
-            "Maximum output rows rendered per cell",
+            "Preview rows",
+            "Rows each output shows in preview; outputs that fit have no separate preview",
             SettingKind::Int {
                 default: 18,
                 min: 1,
                 max: 100_000,
+            },
+        );
+        setting(
+            reg,
+            "display.output_default_view",
+            "display",
+            "Default output view",
+            "How outputs show until changed with space: preview, full or hidden",
+            SettingKind::Choice {
+                default: "preview",
+                options: wb_core::OutputDisplay::NAMES,
+            },
+        );
+        setting(
+            reg,
+            "display.notice_secs",
+            "display",
+            "Notice duration",
+            "Seconds a status-bar message stays before the key hints return",
+            SettingKind::Int {
+                default: 4,
+                min: 1,
+                max: 600,
+            },
+        );
+        setting(
+            reg,
+            "editor.indent_width",
+            "editor",
+            "Indent width",
+            "Spaces inserted by tab and >, removed by shift+tab and <",
+            SettingKind::Int {
+                default: 4,
+                min: 1,
+                max: 16,
             },
         );
         setting(

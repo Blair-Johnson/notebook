@@ -22,6 +22,10 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 #[derive(Clone, Debug)]
 pub struct CoreSettings {
     pub max_output_rows: u16,
+    /// View for outputs whose cell has no view of its own.
+    pub output_default_view: wb_core::OutputDisplay,
+    pub notice_secs: u64,
+    pub indent_width: u16,
     pub wheel_scroll_lines: u16,
     pub insert_escape_chord_ms: u64,
     pub composer_expanded_ratio_pct: u16,
@@ -40,6 +44,9 @@ impl Default for CoreSettings {
     fn default() -> Self {
         Self {
             max_output_rows: 18,
+            output_default_view: wb_core::OutputDisplay::Preview,
+            notice_secs: 4,
+            indent_width: 4,
             wheel_scroll_lines: 3,
             insert_escape_chord_ms: 500,
             composer_expanded_ratio_pct: 50,
@@ -335,6 +342,11 @@ fn build_snapshot(
     let core = CoreSettings {
         max_output_rows: setting_int(&values, "display.max_output_rows", 18)
             .clamp(0, u16::MAX as i64) as u16,
+        output_default_view: setting_text(&values, "display.output_default_view")
+            .and_then(|name| wb_core::OutputDisplay::from_name(&name))
+            .unwrap_or_default(),
+        notice_secs: setting_int(&values, "display.notice_secs", 4).max(1) as u64,
+        indent_width: setting_int(&values, "editor.indent_width", 4).clamp(1, 16) as u16,
         wheel_scroll_lines: setting_int(&values, "display.wheel_scroll_lines", 3)
             .clamp(0, u16::MAX as i64) as u16,
         insert_escape_chord_ms: setting_int(&values, "editor.insert_escape_chord_ms", 500).max(0)

@@ -5,10 +5,13 @@
 theme = "midnight"
 syntect_theme = "auto"
 max_output_rows = 18
+output_default_view = "preview"
+notice_secs = 4
 wheel_scroll_lines = 3
 
 [editor]
 insert_escape_chord_ms = 500
+indent_width = 4
 composer_expanded_ratio_pct = 50
 mouse_capture = true
 formatter = "ruff format -"
