@@ -472,19 +472,23 @@ fn draw_controls_tab(
             ),
         ])
     } else {
-        Line::from(Span::styled(
-            " Keys trigger actions; rules decide what an action does in this mode and on this target.",
-            muted,
-        ))
+        Line::from(vec![
+            Span::styled(" ◆", Style::default().fg(p.accent_markdown)),
+            Span::styled(" configured: your rules or macros decide", muted),
+            Span::styled("   primitive", muted.add_modifier(Modifier::BOLD)),
+            Span::styled(": runs as nb implements it", muted),
+        ])
     };
     frame.render_widget(Paragraph::new(status), Rect::new(inner.x, inner.y + 2, inner.width, 1));
 
+    // Rows: tabs, mode strip, status, header, the list, a rule, the
+    // detail, and the footer. The list must stop above the rule.
     let detail_h = 6u16;
     let list = Rect::new(
         inner.x,
         inner.y + 4,
         inner.width,
-        inner.height.saturating_sub(5 + detail_h),
+        inner.height.saturating_sub(6 + detail_h),
     );
     let visible = usize::from(list.height);
     let keys_w = 14usize;
@@ -567,7 +571,14 @@ fn draw_controls_tab(
                 .collect::<Vec<_>>()
                 .join("; ");
             let customized = keymap.controls.is_customized(&mode.id, &entry.action);
-            let what = if customized { what } else { "built-in".to_string() };
+            let what = if customized { what } else { "primitive".to_string() };
+            // Keys most terminals cannot send are marked, so a binding that
+            // silently never fires is visible here.
+            let keys = if entry.keys.iter().any(|keys| !crate::keymap::sequence_reaches_nb(keys)) {
+                format!("⚠ {keys}")
+            } else {
+                keys
+            };
             let line = Line::from(vec![
                 Span::styled(format!("  {}", fit(&keys, keys_w)), style.fg(p.accent_code)),
                 Span::styled(fit(&entry.title, title_w), style),
@@ -610,13 +621,28 @@ fn draw_controls_tab(
                 format!(" {} · {} · {}", row.title, row.category, row.action),
                 Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
             )));
-            for case in &row.cases {
-                let text = if case.when.is_empty() {
-                    format!("   {}", case.what)
-                } else {
-                    format!("   {}: {}", case.when, case.what)
-                };
-                detail.push(Line::from(Span::styled(text, muted)));
+            if keymap.controls.is_customized(&mode.id, &row.action) {
+                for case in &row.cases {
+                    let text = if case.when.is_empty() {
+                        format!("   {}", case.what)
+                    } else {
+                        format!("   {}: {}", case.when, case.what)
+                    };
+                    detail.push(Line::from(Span::styled(text, muted)));
+                }
+            } else {
+                detail.push(Line::from(Span::styled(
+                    "   primitive: no rule or macro applies here, so the action runs as nb implements it (r or e to add a rule)",
+                    muted,
+                )));
+            }
+            for keys in row.keys.iter().filter(|keys| !crate::keymap::sequence_reaches_nb(keys)) {
+                detail.push(Line::from(Span::styled(
+                    format!(
+                        "   ⚠ {keys}: most terminals (and tmux) cannot send this key; it only works where the terminal reports modified keys (kitty keyboard protocol). Bind another key with + ."
+                    ),
+                    Style::default().fg(p.warning),
+                )));
             }
         }
     }

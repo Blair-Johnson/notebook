@@ -1252,7 +1252,7 @@ impl Coordinator {
         }
     }
 
-    /// One resolved key: rules and macros first, then the built-in action.
+    /// One resolved key: rules and macros first, then the primitive.
     /// Everything the key changes in a cell undoes as one step.
     fn dispatch_input(&mut self, input: ResolvedInput) -> Effect {
         if self.focus.top().mode_id().is_none() {
@@ -1275,7 +1275,7 @@ impl Coordinator {
     }
 
     /// Run `input` as configured for the current mode: the first matching
-    /// rule's steps, else the action's macro, else the built-in action.
+    /// rule's steps, else the action's macro, else the primitive.
     fn run_action(&mut self, input: ResolvedInput, depth: usize) -> Effect {
         let Some(mode) = self.focus.top().mode_id().map(str::to_string) else {
             self.step_failed = true;
@@ -1477,7 +1477,8 @@ impl Coordinator {
         }
     }
 
-    /// The built-in action at the level of the current mode.
+    /// The primitive: the action as nb implements it, at the level of the
+    /// current mode.
     fn run_primitive(&mut self, input: ResolvedInput) -> Effect {
         // A `mode.<id>` action switches mode wherever it is bound.
         if let ResolvedInput::Command { id, .. } = &input {
@@ -3955,6 +3956,10 @@ impl Coordinator {
             self.explain_command(command["explain".len()..].trim());
             return Effect::None;
         }
+        // Works in every terminal, unlike ctrl+, (see `keymap::key_reaches_nb`).
+        if matches!(command, "settings" | "set" | "config") {
+            return self.dispatch_notebook_command("app.settings", 1, None);
+        }
         if let Ok(number) = command.parse::<usize>() {
             if let Some(id) = self.document.order().get(number.saturating_sub(1)).cloned() {
                 self.select_cell(id);
@@ -4087,13 +4092,15 @@ impl Coordinator {
                     controls.describe_steps(&action_macro.steps, &action)
                 ),
                 (None, None) if here => {
-                    "    → no rule matches here: the built-in action runs".to_string()
+                    "    → no rule matches here: the primitive runs, as nb implements it".to_string()
                 }
                 (None, Some(action_macro)) => format!(
                     "    → when no rule matches: macro {}",
                     controls.describe_steps(&action_macro.steps, &action)
                 ),
-                (None, None) => "    → when no rule matches: the built-in action runs".to_string(),
+                (None, None) => {
+                    "    → when no rule matches: the primitive runs, as nb implements it".to_string()
+                }
             };
             lines.push(result);
         }
@@ -4108,7 +4115,7 @@ impl Coordinator {
         let warnings = self.settings.snapshot().warnings.len();
         if warnings > 0 {
             self.notice = Some(format!(
-                "config: {warnings} warning(s); see the Controls tab in settings (ctrl+,)"
+                "config: {warnings} warning(s); see the Controls tab in :settings"
             ));
         }
     }

@@ -7,7 +7,7 @@
 # as a default (a mode, keyset, action, or a rule with the same id) changes
 # only the fields it sets, so `[[rules]] id = "..." enabled = false` turns a
 # default rule off. `:explain <keys>` shows what keys do where the cursor is,
-# and the Controls tab of the settings screen (ctrl+,) lists it all per mode.
+# and the Controls tab of the settings screen (:settings) lists it all per mode.
 
 # ---------------------------------------------------------------------------
 # Modes: the states. `level` is notebook, cell, or output; `kind` is normal,
@@ -295,7 +295,7 @@ line_end_motions = ["motion.line_end"]
 
 # ---------------------------------------------------------------------------
 # Macros: actions defined as steps. Steps run in order, each in whatever mode
-# is current when it is reached; "@action" runs the built-in action itself.
+# is current when it is reached; "@action" runs the primitive (the action as nb implements it).
 
 [actions."cell.run_and_advance"]
 do = ["cell.run", "motion.cell_next"]

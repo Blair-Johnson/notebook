@@ -315,3 +315,55 @@ do = ["mode.output.normal", "motion.down"]
     assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }));
     assert_eq!(c.selected_cell, c.document.order()[0], "motion.down did not run");
 }
+
+fn screen_text(c: &mut Coordinator, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal.draw(|frame| c.draw(frame)).expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+/// `:settings`, then Tab to Controls.
+fn open_controls(c: &mut Coordinator) {
+    keys(c, ":settings");
+    press(c, KeyCode::Enter);
+    assert!(matches!(c.focus.top(), FocusLayer::Modal(nb_tui::ModalKind::Settings)));
+    for _ in 0..4 {
+        press(c, KeyCode::Tab);
+    }
+}
+
+#[test]
+fn the_last_controls_row_stays_above_the_rule() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    open_controls(&mut c);
+    keys(&mut c, "G");
+    let rows = c.overlays.settings.control_rows(&c.settings.snapshot().keymap);
+    let last = rows.last().expect("rows").title.clone();
+    for height in [24, 30, 36, 41] {
+        let lines = screen_text(&mut c, 110, height);
+        // The detail below the rule repeats the title: look above it. The
+        // rule runs from the modal's left border.
+        let rule = lines
+            .iter()
+            .position(|line| line.contains("│────────────────────────────────────────"))
+            .expect("the rule above the detail");
+        assert!(
+            lines[..rule].iter().any(|line| line.contains(&last)),
+            "height {height}: the selected row {last:?} is hidden:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+#[test]
+fn primitive_rows_and_unsendable_keys_are_labelled() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    open_controls(&mut c);
+    let text = screen_text(&mut c, 120, 40).join("\n");
+    assert!(text.contains("primitive"), "{text}");
+    assert!(!text.contains("built-in"), "{text}");
+    assert!(text.contains("⚠ ctrl+,"), "ctrl+, is flagged:\n{text}");
+}

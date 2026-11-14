@@ -252,6 +252,16 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<Key> {
             if c == '\u{1f}' || (control && matches!(c, '7' | '_' | '/')) {
                 return Some(Key::Ctrl('/'));
             }
+            // The other legacy control bytes: crossterm reports 0x1c-0x1e
+            // as ctrl+4..6, which terminals send for ctrl+\ ctrl+] ctrl+^.
+            if control && !alt {
+                match c {
+                    '4' => return Some(Key::Ctrl('\\')),
+                    '5' => return Some(Key::Ctrl(']')),
+                    '6' => return Some(Key::Ctrl('^')),
+                    _ => {}
+                }
+            }
             // Many terminals send ctrl+space as NUL.
             if c == '\0' {
                 return Some(Key::Ctrl(' '));
@@ -306,6 +316,23 @@ fn modified_special(c: char, control: bool, alt: bool) -> Option<Key> {
         (false, true) => Some(Key::Alt(c)),
         _ => None,
     }
+}
+
+/// Whether a terminal without the kitty keyboard protocol (most of them,
+/// and tmux before 3.5) can send `key` to nb. Ctrl with anything but a
+/// letter or one of the legacy control punctuation keys either arrives as
+/// the plain key or not at all, and ctrl+enter, ctrl+tab, ctrl+backspace,
+/// and ctrl+delete are indistinguishable from the unmodified keys.
+pub fn key_reaches_nb(key: Key) -> bool {
+    match key {
+        Key::Ctrl(c) => c.is_ascii_lowercase() || matches!(c, ' ' | '\\' | ']' | '^' | '/'),
+        _ => true,
+    }
+}
+
+/// [`key_reaches_nb`] for a sequence in config spelling (`g g`, `ctrl+,`).
+pub fn sequence_reaches_nb(sequence: &str) -> bool {
+    parse_key_sequence(sequence).is_none_or(|keys| keys.into_iter().all(key_reaches_nb))
 }
 
 #[derive(Default, Debug)]
@@ -780,5 +807,20 @@ mod tests {
             normalize_crossterm_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
             Some(Key::BackTab)
         );
+        // Legacy terminals send ctrl+\ as 0x1c, which crossterm reports as ctrl+4.
+        assert_eq!(
+            normalize_crossterm_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            parse_key("ctrl+\\")
+        );
+    }
+
+    #[test]
+    fn keys_most_terminals_cannot_send_are_flagged() {
+        for reachable in ["ctrl+q", "ctrl+\\", "ctrl+/", "ctrl+space", "alt+enter", "g g", "f8", "esc"] {
+            assert!(sequence_reaches_nb(reachable), "{reachable}");
+        }
+        for unreachable in ["ctrl+,", "ctrl+enter", "ctrl+backspace", "ctrl+1", "ctrl+."] {
+            assert!(!sequence_reaches_nb(unreachable), "{unreachable}");
+        }
     }
 }
