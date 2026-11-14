@@ -13,6 +13,7 @@ pub mod controls;
 pub mod coordinator;
 pub mod focus;
 pub mod grammar;
+pub mod highlight;
 pub mod intelligence;
 pub mod keymap;
 pub mod layout;

@@ -4,12 +4,14 @@ use crate::builtins::markdown::render_markdown_cell;
 use crate::layout::{CardRows, output_cap, output_sections};
 use crate::layout::fenwick::FenwickTree;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
-use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{HighlightState, Highlighter, Theme as SyntectTheme, ThemeSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use unicode_width::UnicodeWidthChar;
 use nb_core::{Cell, CellId, CellKind, CellRevisions, Document, OutputDisplay, OutputId};
 use nb_sdk::{OutputView, Theme};
@@ -81,9 +83,11 @@ pub struct LayoutCache {
     last_width: u16,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    /// Highlighted code lines per cell, keyed by the line's text: an edit
-    /// re-highlights only the lines it changed. Each cell keeps just the
-    /// lines of its latest render, so memory follows the notebook size.
+    /// Highlighted code lines per cell, keyed by the line's text and the
+    /// parser state it starts in: an edit re-highlights from the changed
+    /// line until the state matches the last render again. Each cell keeps
+    /// just the lines of its latest render, so memory follows the notebook
+    /// size.
     line_highlights: HashMap<CellId, LineHighlights>,
     /// `display.output_default_view`, set by the caller before syncing.
     pub default_output_view: OutputDisplay,
@@ -91,7 +95,17 @@ pub struct LayoutCache {
 
 struct LineHighlights {
     theme_rev: u64,
-    lines: HashMap<String, Line<'static>>,
+    lines: HashMap<String, Vec<HighlightedLine>>,
+}
+
+/// Highlighter and parser state between two lines: a line's colors depend
+/// on everything before it (`print(` makes the next lines' `)` a match).
+type LineState = (HighlightState, ParseState);
+
+struct HighlightedLine {
+    before: LineState,
+    line: Line<'static>,
+    after: LineState,
 }
 
 impl Default for LayoutCache {
@@ -344,22 +358,25 @@ impl LayoutCache {
         // `split('\n')`, not `lines()`: a trailing empty line is a real row the
         // cursor can sit on.
         let source_lines: Vec<&str> = cell.buffer.as_str().split('\n').collect();
-        let mut previous = match self.line_highlights.remove(&cell.id) {
-            Some(cached) if cached.theme_rev == theme.revision => cached.lines,
-            _ => HashMap::new(),
-        };
-        let mut highlighted = HashMap::new();
+        let mut code_lines = Vec::new().into_iter();
+        if cell.kind == CellKind::Code {
+            let previous = match self.line_highlights.remove(&cell.id) {
+                Some(cached) if cached.theme_rev == theme.revision => cached.lines,
+                _ => HashMap::new(),
+            };
+            let (rendered, kept) = self.highlight_code(&source_lines, theme, previous);
+            self.line_highlights.insert(
+                cell.id.clone(),
+                LineHighlights {
+                    theme_rev: theme.revision,
+                    lines: kept,
+                },
+            );
+            code_lines = rendered.into_iter();
+        }
         for (index, source_line) in source_lines.iter().enumerate() {
             let rendered = match cell.kind {
-                CellKind::Code => {
-                    let line = highlighted
-                        .get(*source_line)
-                        .cloned()
-                        .or_else(|| previous.remove(*source_line))
-                        .unwrap_or_else(|| self.highlight_code_line(source_line, theme));
-                    highlighted.insert((*source_line).to_string(), line.clone());
-                    line
-                }
+                CellKind::Code => code_lines.next().unwrap_or_default(),
                 CellKind::Markdown => raw_markdown_line(source_line, theme),
                 CellKind::Raw => Line::from(Span::styled(
                     (*source_line).to_string(),
@@ -371,15 +388,6 @@ impl LayoutCache {
                 source_map.push(index);
             }
         }
-        if !highlighted.is_empty() {
-            self.line_highlights.insert(
-                cell.id.clone(),
-                LineHighlights {
-                    theme_rev: theme.revision,
-                    lines: highlighted,
-                },
-            );
-        }
         if lines.is_empty() {
             lines.push(Line::default());
             source_map.push(0);
@@ -388,42 +396,82 @@ impl LayoutCache {
     }
 
     /// Highlight one line on its own (no state carried between lines).
-    fn highlight_code_line(&self, source: &str, theme: &Theme) -> Line<'static> {
+    fn highlight_code(
+        &self,
+        source_lines: &[&str],
+        theme: &Theme,
+        mut previous: HashMap<String, Vec<HighlightedLine>>,
+    ) -> (Vec<Line<'static>>, HashMap<String, Vec<HighlightedLine>>) {
         let syntax = self
             .syntax_set
             .find_syntax_by_extension("py")
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-        let syntax_theme = self
-            .theme_set
+        let Some(syntax_theme) = self.syntax_theme(theme) else {
+            let lines = source_lines.iter().map(|line| Line::from(line.to_string())).collect();
+            return (lines, HashMap::new());
+        };
+        let mut state: LineState = (
+            HighlightState::new(&Highlighter::new(syntax_theme), ScopeStack::new()),
+            ParseState::new(syntax),
+        );
+        let mut kept: HashMap<String, Vec<HighlightedLine>> = HashMap::new();
+        let mut lines = Vec::with_capacity(source_lines.len());
+        for source in source_lines {
+            // The same text in the same state renders the same: from this
+            // render (repeated lines) or the last one (unchanged lines).
+            let reused = kept
+                .get(*source)
+                .and_then(|entries| entries.iter().find(|entry| entry.before == state))
+                .map(|entry| (entry.line.clone(), entry.after.clone()));
+            let (line, after) = match reused {
+                Some(found) => found,
+                None => {
+                    let entry = previous
+                        .get_mut(*source)
+                        .and_then(|entries| {
+                            let at = entries.iter().position(|entry| entry.before == state)?;
+                            Some(entries.swap_remove(at))
+                        })
+                        .unwrap_or_else(|| self.highlight_code_line(source, syntax_theme, state.clone()));
+                    let found = (entry.line.clone(), entry.after.clone());
+                    kept.entry((*source).to_string()).or_default().push(entry);
+                    found
+                }
+            };
+            lines.push(line);
+            state = after;
+        }
+        (lines, kept)
+    }
+
+    /// Highlight one line, starting in `before` (the state after the
+    /// previous line).
+    fn highlight_code_line(
+        &self,
+        source: &str,
+        syntax_theme: &SyntectTheme,
+        before: LineState,
+    ) -> HighlightedLine {
+        let mut highlighter =
+            HighlightLines::from_state(syntax_theme, before.0.clone(), before.1.clone());
+        let source_with_newline = format!("{source}\n");
+        let regions = highlighter
+            .highlight_line(&source_with_newline, &self.syntax_set)
+            .unwrap_or_default();
+        let line = Line::from(crate::highlight::spans(regions, syntax_theme));
+        HighlightedLine {
+            before,
+            line,
+            after: highlighter.state(),
+        }
+    }
+
+    fn syntax_theme(&self, theme: &Theme) -> Option<&SyntectTheme> {
+        self.theme_set
             .themes
             .get(&theme.syntect_theme)
             .or_else(|| self.theme_set.themes.get("base16-ocean.dark"))
-            .or_else(|| self.theme_set.themes.values().next());
-        if let Some(syntax_theme) = syntax_theme {
-            let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-            let source_with_newline = format!("{source}\n");
-            let regions = highlighter
-                .highlight_line(&source_with_newline, &self.syntax_set)
-                .unwrap_or_default();
-            Line::from(
-                regions
-                    .into_iter()
-                    .map(|(style, text)| {
-                        Span::styled(
-                            text.trim_end_matches(['\r', '\n']).to_string(),
-                            Style::default().fg(Color::Rgb(
-                                style.foreground.r,
-                                style.foreground.g,
-                                style.foreground.b,
-                            )),
-                        )
-                    })
-                    .filter(|span| !span.content.is_empty())
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            Line::from(source.to_string())
-        }
+            .or_else(|| self.theme_set.themes.values().next())
     }
 
     /// Measure the cell at `index` now (at the last viewport width), for
@@ -591,4 +639,62 @@ pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         output.push(Line::from(current));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(cache: &mut LayoutCache, cell: &Cell) -> Vec<Line<'static>> {
+        cache.render_source(cell, 80, &Theme::default(), false).0
+    }
+
+    fn code(source: &str) -> Cell {
+        let mut cell = Cell::new_code();
+        cell.buffer.replace_all(source.to_string());
+        cell
+    }
+
+    /// The style of the first `text` span on line `row`.
+    fn style_of(lines: &[Line<'static>], row: usize, text: &str) -> Style {
+        lines[row]
+            .spans
+            .iter()
+            .find(|span| span.content.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} not on line {row}: {:?}", lines[row]))
+            .style
+    }
+
+    #[test]
+    fn a_bracket_closed_on_a_later_line_is_not_invalid() {
+        let mut cache = LayoutCache::default();
+        let lines = render(&mut cache, &code("print(\n\n)"));
+        let close = style_of(&lines, 2, ")");
+        let open = style_of(&lines, 0, "(");
+        assert_eq!(close.fg, open.fg, "the closing bracket looks like the opening one");
+        assert_eq!(close.bg, None);
+    }
+
+    #[test]
+    fn an_unmatched_bracket_stays_visible() {
+        let mut cache = LayoutCache::default();
+        let lines = render(&mut cache, &code("x = 1)"));
+        // Themes draw invalid code in the background color on a red
+        // background: the background must survive, or it disappears.
+        assert!(style_of(&lines, 0, ")").bg.is_some());
+    }
+
+    #[test]
+    fn edits_re_highlight_the_lines_they_affect() {
+        let mut cache = LayoutCache::default();
+        let mut cell = code("a = [\n    1,\n]\nb = 2");
+        render(&mut cache, &cell);
+        // Closing the bracket on the first line makes the third line's `]`
+        // unmatched, though that line's text did not change.
+        cell.buffer.replace_all("a = []\n    1,\n]\nb = 2".to_string());
+        let incremental = render(&mut cache, &cell);
+        let fresh = render(&mut LayoutCache::default(), &cell);
+        assert_eq!(incremental, fresh);
+        assert!(style_of(&incremental, 2, "]").bg.is_some());
+    }
 }
