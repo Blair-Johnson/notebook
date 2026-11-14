@@ -16,6 +16,31 @@ pub fn editor_command(editor: &str, file: &Path) -> Command {
     command
 }
 
+/// Like [`editor_command`], opening at a 1-based `line` in editors known to
+/// take `+N` (vi, vim, nvim, nano, emacs, kak, micro).
+pub fn editor_command_at(editor: &str, file: &Path, line: usize) -> Command {
+    let program = editor
+        .split_whitespace()
+        .next()
+        .and_then(|word| Path::new(word).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !matches!(
+        program,
+        "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "kak" | "micro"
+    ) {
+        return editor_command(editor, file);
+    }
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg("nb")
+        .arg(format!("+{line}"))
+        .arg(file);
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::editor_command;

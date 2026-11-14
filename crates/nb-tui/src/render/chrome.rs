@@ -47,7 +47,7 @@ pub fn draw_top_bar(
         .unwrap_or("untitled");
     let mut left = vec![
         Span::styled(
-            format!(" {} ", focus.badge()),
+            format!(" {} ", ctx.focus_badge),
             Style::default()
                 .bg(accent)
                 .fg(ON_ACCENT)
@@ -101,7 +101,7 @@ fn hint_actions(
     part: crate::focus::CellPart,
 ) -> &'static [(&'static str, &'static str)] {
     match focus {
-        FocusLayer::NotebookNormal if part == crate::focus::CellPart::Output => &[
+        FocusLayer::Notebook { .. } if part == crate::focus::CellPart::Output => &[
             ("cell.enter_normal", "read"),
             ("output.cycle_view", "expand/collapse"),
             ("output.next_tab", "stdout/stderr"),
@@ -109,7 +109,7 @@ fn hint_actions(
             ("op.delete", "clear"),
             ("cell.run", "run"),
         ],
-        FocusLayer::NotebookNormal => &[
+        FocusLayer::Notebook { .. } => &[
             ("cell.enter_normal", "edit"),
             ("cell.run", "run"),
             ("cell.run_and_advance", "run+next"),

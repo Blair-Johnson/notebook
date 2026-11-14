@@ -136,7 +136,7 @@ impl CellCtx<'_> {
             _ => None,
         };
         let output_mode = match base {
-            FocusLayer::OutputFocus { cell_id, mode } if cell_id == &self.cell.id => Some(*mode),
+            FocusLayer::OutputFocus { cell_id, mode, .. } if cell_id == &self.cell.id => Some(*mode),
             _ => None,
         };
         let selected = view.selected_cell == &self.cell.id;

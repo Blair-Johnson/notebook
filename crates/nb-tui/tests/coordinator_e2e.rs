@@ -124,7 +124,7 @@ fn counted_navigation_cell_edit_and_run_are_headless() {
     coordinator.on_key(key(KeyCode::Esc), now);
     assert!(matches!(
         coordinator.focus.top(),
-        FocusLayer::NotebookNormal
+        FocusLayer::Notebook { .. }
     ));
     coordinator.apply_kernel_event(KernelEvent::Ready {
         info: KernelSessionInfo {
@@ -152,7 +152,7 @@ fn counted_navigation_cell_edit_and_run_are_headless() {
     coordinator.on_key(key(KeyCode::Esc), now);
     assert!(matches!(
         coordinator.focus.top(),
-        FocusLayer::NotebookNormal
+        FocusLayer::Notebook { .. }
     ));
 
     coordinator.on_key(key(KeyCode::Char('d')), now);

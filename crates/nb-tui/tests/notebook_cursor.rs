@@ -132,7 +132,7 @@ fn i_opens_the_cell_at_the_cursor_line_and_esc_returns_to_it() {
     ));
     keys(&mut c, "j");
     press(&mut c, KeyCode::Esc);
-    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }));
     keys(&mut c, "i");
     let cursor = c.document.cell(&id).unwrap().buffer.cursor();
     assert_eq!(cursor.row, 2, "the notebook cursor came back on line 3");

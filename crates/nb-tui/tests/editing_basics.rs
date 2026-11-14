@@ -61,7 +61,7 @@ fn source(coordinator: &Coordinator, index: usize) -> String {
 fn i_opens_the_cell_in_normal_mode_and_enter_runs_it() {
     let mut c = coordinator(&["abc"]);
     press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
-    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }));
     let id = c.document.order()[0].clone();
     assert!(c.run_states.contains_key(&id), "enter queued the cell to run");
 
@@ -163,7 +163,7 @@ fn clicking_another_cell_moves_focus_and_cursor_there() {
     assert_eq!((cursor.row, cursor.col), (1, 3));
     // Only one edit layer: leaving goes straight back to the notebook.
     press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
-    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }));
 }
 
 #[test]
@@ -274,7 +274,7 @@ fn quitting_with_unsaved_changes_complains_instead_of_prompting() {
     keys(&mut c, ":q");
     press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
     assert!(!c.should_quit);
-    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal), "no popup");
+    assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }), "no popup");
     assert!(c.notice.as_deref().is_some_and(|n| n.contains(":q!")));
     keys(&mut c, "q");
     assert!(!c.should_quit, "q complains too");

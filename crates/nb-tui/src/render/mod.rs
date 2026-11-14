@@ -115,13 +115,14 @@ pub fn render_app(
             .bg(theme.palette.bg)
             .fg(theme.palette.fg),
     );
+    let badge = view.focus.top().badge(&keymap.controls);
     let status_ctx = StatusCtx {
         path: view.path,
         dirty: view.document.dirty_source || view.document.dirty_outputs,
         kernel_name: view.kernel_name,
         kernel_busy: view.kernel_busy,
         kernel_alive: view.kernel_alive,
-        focus_badge: view.focus.top().badge(),
+        focus_badge: &badge,
         cell_position: (
             view.document
                 .position_of(view.selected_cell)

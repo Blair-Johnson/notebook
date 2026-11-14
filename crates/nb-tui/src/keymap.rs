@@ -1,6 +1,7 @@
 //! Compiled hierarchical `Keymap` with inheritance, conflict validation, and help generation.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crate::controls::Controls;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use toml::Value;
@@ -20,6 +21,7 @@ pub struct HelpRow {
     pub category: String,
     pub keys: String,
     pub title: String,
+    pub action: String,
 }
 
 /// A small, allocation-free-at-call-site error-free parser API is useful for
@@ -302,6 +304,8 @@ pub struct Keymap {
     actions: BTreeMap<String, ActionSpec>,
     tables: HashMap<KeyContextId, HashMap<KeySeq, String>>,
     prefixes: HashMap<KeyContextId, HashSet<KeySeq>>,
+    /// Modes, keysets, macros, and rules compiled from the same TOML.
+    pub controls: Controls,
     pub warnings: Vec<ConfigWarning>,
 }
 
@@ -312,27 +316,34 @@ struct RawContext {
 
 impl Keymap {
     /// Compile default plugin TOML fragments plus user `config.toml` overrides,
-    /// resolving parent inheritance (`vim.normal` -> `notebook.normal`, `cell.normal`, `output.*`)
+    /// resolving keyset inheritance (each mode reads its keysets in order)
     /// and enforcing `cannot_unbind` and `text_entry` safety guards.
     pub fn compile(reg: &ExtensionRegistry, user_toml: &str) -> Self {
+        let controls = Controls::compile(reg, user_toml);
+        // Modes and keysets from the controls replace registry contexts of
+        // the same id; mode switches and macros become bindable actions.
         let contexts = reg
             .contexts
             .iter()
             .cloned()
+            .chain(controls.contexts(reg))
             .map(|spec| (spec.id.clone(), spec))
             .collect::<HashMap<_, _>>();
         let actions = reg
             .actions
             .iter()
             .cloned()
+            .chain(controls.actions(reg))
             .map(|spec| (spec.id.clone(), spec))
             .collect::<BTreeMap<_, _>>();
+        let warnings = controls.warnings.clone();
         let mut keymap = Self {
             contexts,
             actions,
             tables: HashMap::new(),
             prefixes: HashMap::new(),
-            warnings: Vec::new(),
+            controls,
+            warnings,
         };
         let mut raw = BTreeMap::<KeyContextId, RawContext>::new();
 
@@ -478,7 +489,8 @@ impl Keymap {
                     table.extend(self.effective_table(&global, raw, memo, stack));
                 }
             }
-            for parent in spec.parents.iter().rev() {
+            // Keysets are read in the order listed: the first binding wins.
+            for parent in &spec.parents {
                 let parent_table = self.effective_table(parent, raw, memo, stack);
                 for (sequence, action) in parent_table {
                     table.entry(sequence).or_insert(action);
@@ -643,6 +655,7 @@ impl Keymap {
                     category,
                     keys: keys.join(", "),
                     title: spec.title.to_string(),
+                    action: action_id,
                 })
             })
             .collect::<Vec<_>>();

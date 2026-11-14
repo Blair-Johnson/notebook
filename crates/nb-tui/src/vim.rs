@@ -3,7 +3,8 @@
 //! motion behaves identically wherever the cursor is.
 //!
 //! The coordinator owns focus and modes; this module only edits text and
-//! reports what should happen next through [`Outcome`].
+//! reports what should happen next through [`Outcome`]. Which mode a key
+//! leads to (`i`, `A`, `o`, `v`) is configured as rules, not decided here.
 
 use nb_core::motion::{motion_target, text_object};
 use nb_core::{
@@ -36,8 +37,6 @@ pub struct Outcome {
     pub insert: bool,
     /// Return from visual to normal mode.
     pub normal: bool,
-    /// Enter (or switch to) visual mode of this kind.
-    pub visual: Option<VisualKind>,
     /// The register was written; mirror it to the system clipboard.
     pub yanked: bool,
 }
@@ -313,34 +312,14 @@ impl VimState {
             row: cursor.row,
             col: line_len,
         };
-        // Mode changes and yanks work on read-only buffers too.
+        // Selection moves and yanks work on read-only buffers too.
         match id {
-            "visual.char" | "visual.line" => {
-                let kind = if id == "visual.char" {
-                    VisualKind::Char
-                } else {
-                    VisualKind::Line
-                };
-                let mut outcome = Outcome::handled();
-                match (mode, buf.selection()) {
-                    (Mode::Visual(current), _) if current == kind => {
-                        buf.clear_selection();
-                        outcome.normal = true;
-                    }
-                    (Mode::Visual(_), Some(selection)) => {
-                        buf.set_selection(Selection { kind, ..selection });
-                        outcome.visual = Some(kind);
-                    }
-                    _ => {
-                        buf.set_selection(Selection {
-                            kind,
-                            anchor: cursor,
-                            head: cursor,
-                        });
-                        outcome.visual = Some(kind);
-                    }
+            "selection.start" | "selection.end" => {
+                if let Some(selection) = buf.selection() {
+                    let (start, end) = ordered(selection.anchor, selection.head);
+                    buf.set_cursor(if id == "selection.start" { start } else { end });
                 }
-                return outcome;
+                return Outcome::handled();
             }
             "visual.swap_ends" => {
                 if let Some(selection) = buf.selection() {
@@ -386,48 +365,26 @@ impl VimState {
                 clamp_normal(buf);
                 return outcome;
             }
-            // Insert entry points.
-            "cell.enter_insert" | "edit.insert_line_start" | "cell.append_char"
-            | "edit.append_line_end" | "edit.open_below" | "edit.open_above" => {
+            // A new line with the current line's indent, the cursor on it
+            // (`o` and `O` add insert mode by rule).
+            "edit.line_below" | "edit.line_above" => {
                 buf.checkpoint();
-                if let (true, Some(selection)) = (visual, buf.selection()) {
-                    // `I`/`A` in visual insert at the selection's edge.
-                    let (start, end) = ordered(selection.anchor, selection.head);
-                    buf.clear_selection();
-                    buf.set_cursor(if id == "edit.append_line_end" { end } else { start });
+                let indent = leading_ws(buf, cursor.row);
+                if id == "edit.line_below" {
+                    buf.set_cursor(line_end);
+                    buf.insert_str(&format!("\n{indent}"));
                 } else {
-                    match id {
-                        "edit.insert_line_start" => buf.set_cursor(CursorPos {
-                            row: cursor.row,
-                            col: buf.first_nonblank_col(cursor.row),
-                        }),
-                        "cell.append_char" => buf.set_cursor(CursorPos {
-                            row: cursor.row,
-                            col: (cursor.col + 1).min(line_len),
-                        }),
-                        "edit.append_line_end" => buf.set_cursor(line_end),
-                        "edit.open_below" | "edit.open_above" => {
-                            let indent = leading_ws(buf, cursor.row);
-                            if id == "edit.open_below" {
-                                buf.set_cursor(line_end);
-                                buf.insert_str(&format!("\n{indent}"));
-                            } else {
-                                buf.set_cursor(CursorPos {
-                                    row: cursor.row,
-                                    col: 0,
-                                });
-                                buf.insert_str(&format!("{indent}\n"));
-                                buf.set_cursor(CursorPos {
-                                    row: cursor.row,
-                                    col: indent.chars().count(),
-                                });
-                            }
-                            outcome.changed = true;
-                        }
-                        _ => {}
-                    }
+                    buf.set_cursor(CursorPos {
+                        row: cursor.row,
+                        col: 0,
+                    });
+                    buf.insert_str(&format!("{indent}\n"));
+                    buf.set_cursor(CursorPos {
+                        row: cursor.row,
+                        col: indent.chars().count(),
+                    });
                 }
-                outcome.insert = true;
+                outcome.changed = true;
                 return outcome;
             }
             _ => {}
@@ -721,7 +678,7 @@ pub fn segment_of(segments: &[(usize, usize, usize)], pos: CursorPos) -> usize {
 
 /// Ids `command` treats as text edits (ignored, not unknown, when read-only).
 fn is_edit_command(id: &str) -> bool {
-    id.starts_with("edit.") || matches!(id, "cell.enter_insert" | "cell.append_char")
+    id.starts_with("edit.")
 }
 
 /// In normal mode the cursor rests on a character, never past the line end.
@@ -1102,14 +1059,19 @@ mod tests {
     #[test]
     fn visual_selection_is_inclusive_and_linewise_visual_deletes_lines() {
         let mut vim = VimState::default();
+        // Entering visual mode (a mode switch) anchors the selection.
+        let select = |b: &mut TextBuffer, kind| {
+            let at = b.cursor();
+            b.set_selection(Selection { kind, anchor: at, head: at });
+        };
         let mut b = buf("abcdef\nxyz", 0, 1);
-        vim.command(&mut b, Mode::Normal, "visual.char", 1, None, false);
+        select(&mut b, VisualKind::Char);
         vim.move_cursor(&mut b, Mode::Visual(VisualKind::Char), "motion.right", None, 2);
         let out = vim.operate(&mut b, Mode::Visual(VisualKind::Char), "op.delete", None, 1, false);
         assert!(out.normal);
         assert_eq!(b.as_str(), "aef\nxyz");
         let mut b = buf("one\ntwo\nthree", 0, 0);
-        vim.command(&mut b, Mode::Normal, "visual.line", 1, None, false);
+        select(&mut b, VisualKind::Line);
         vim.move_cursor(&mut b, Mode::Visual(VisualKind::Line), "motion.down", None, 1);
         vim.operate(&mut b, Mode::Visual(VisualKind::Line), "op.delete", None, 1, false);
         assert_eq!(b.as_str(), "three");
@@ -1133,9 +1095,13 @@ mod tests {
         assert_eq!(b.as_str(), "    x");
         vim.operate(&mut b, Mode::Normal, "op.dedent", None, 1, false);
         assert_eq!(b.as_str(), "x");
-        let out = vim.command(&mut b, Mode::Normal, "edit.append_line_end", 1, None, false);
-        assert!(out.insert);
-        assert_eq!(b.cursor().col, 1);
+        let mut b = buf("    if x:", 0, 6);
+        vim.command(&mut b, Mode::Normal, "edit.line_below", 1, None, false);
+        assert_eq!(b.as_str(), "    if x:\n    ");
+        assert_eq!(b.cursor(), CursorPos { row: 1, col: 4 });
+        vim.command(&mut b, Mode::Normal, "edit.line_above", 1, None, false);
+        assert_eq!(b.as_str(), "    if x:\n    \n    ");
+        assert_eq!(b.cursor(), CursorPos { row: 1, col: 4 });
     }
 
     #[test]
@@ -1147,7 +1113,8 @@ mod tests {
         let out = vim.operate(&mut b, Mode::Normal, "op.yank", Some(&motion("motion.word_end")), 1, true);
         assert!(out.yanked);
         assert_eq!(vim.register.text, "out");
-        let out = vim.command(&mut b, Mode::Normal, "cell.enter_insert", 1, None, true);
-        assert!(!out.insert);
+        let out = vim.command(&mut b, Mode::Normal, "edit.line_below", 1, None, true);
+        assert!(out.handled && !out.changed);
+        assert_eq!(b.as_str(), "out line one\nout two");
     }
 }

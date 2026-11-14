@@ -106,7 +106,7 @@ fn entering_an_output_gives_read_only_vim_navigation_and_yank() {
     keys(&mut c, "vey");
     assert_eq!(c.vim_register_text(), "delta");
     press(&mut c, KeyCode::Esc);
-    assert!(matches!(c.focus.top(), FocusLayer::NotebookNormal));
+    assert!(matches!(c.focus.top(), FocusLayer::Notebook { .. }));
     assert_eq!(c.selected_part, CellPart::Output);
 }
 

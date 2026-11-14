@@ -108,6 +108,19 @@ impl TextBuffer {
         self.redo_stack.clear();
     }
 
+    /// Number of undo steps recorded so far.
+    pub fn undo_depth(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    /// Merge every undo step recorded after `depth` into the first of them,
+    /// so one key's several edits undo together.
+    pub fn merge_undo_since(&mut self, depth: usize) {
+        if self.undo_stack.len() > depth + 1 {
+            self.undo_stack.truncate(depth + 1);
+        }
+    }
+
     /// Set the cursor, clamping it to an existing row and that row's character
     /// length. A cursor at the end of a line is valid for insertion.
     pub fn set_cursor(&mut self, pos: CursorPos) {

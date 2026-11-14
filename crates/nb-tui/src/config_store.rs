@@ -226,6 +226,103 @@ impl SettingsStore {
         self.save_deadline = Some(Instant::now() + SAVE_DEBOUNCE);
     }
 
+    /// Drop the user's binding for `action` in `ctx`, so the defaults apply.
+    pub fn remove_keybinding(&mut self, ctx: &KeyContextId, action: &str, reg: &ExtensionRegistry) {
+        if let Some(table) = self
+            .doc
+            .get_mut("keys")
+            .and_then(|keys| keys.get_mut(ctx.as_str()))
+            .and_then(Item::as_table_like_mut)
+        {
+            table.remove(action);
+        }
+        self.rebuild(reg, Vec::new());
+        self.save_deadline = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
+    /// The user's `[[rules]]` table with `id`, added (as `id = ...` alone,
+    /// or as a copy of `source`) when the file has none.
+    fn user_rule(&mut self, id: &str, source: Option<&toml::Table>) -> &mut toml_edit::Table {
+        if !self.doc.contains_key("rules") {
+            self.doc["rules"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        let rules = self.doc["rules"]
+            .as_array_of_tables_mut()
+            .expect("rules is an array of tables");
+        let index = rules
+            .iter()
+            .position(|table| table.get("id").and_then(Item::as_str) == Some(id));
+        let index = match index {
+            Some(index) => index,
+            None => {
+                let mut table = toml_edit::Table::new();
+                table["id"] = toml_value(id);
+                // Fields in the order people read them.
+                for key in ["title", "mode", "on", "with", "when", "do", "enabled"] {
+                    let parsed = source
+                        .and_then(|source| source.get(key))
+                        .and_then(|value| value.to_string().parse::<Value>().ok());
+                    if let Some(parsed) = parsed {
+                        table[key] = Item::Value(parsed);
+                    }
+                }
+                rules.push(table);
+                rules.len() - 1
+            }
+        };
+        rules.get_mut(index).expect("just found or pushed")
+    }
+
+    /// Turn a rule on or off in the user file.
+    pub fn set_rule_enabled(&mut self, id: &str, enabled: bool, reg: &ExtensionRegistry) {
+        self.user_rule(id, None)["enabled"] = toml_value(enabled);
+        self.rebuild(reg, Vec::new());
+        self.save_deadline = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
+    /// Make sure the user file has its own copy of the rule `id`, so it can
+    /// be edited; `source` is the rule as currently merged.
+    pub fn ensure_rule(&mut self, id: &str, source: &toml::Table, reg: &ExtensionRegistry) {
+        self.user_rule(id, Some(source));
+        self.rebuild(reg, Vec::new());
+    }
+
+    /// Make sure the user file has `[actions."<id>"]` with these steps.
+    pub fn ensure_macro(&mut self, id: &str, steps: &[String], reg: &ExtensionRegistry) {
+        let present = self
+            .doc
+            .get("actions")
+            .and_then(|actions| actions.get(id))
+            .is_some_and(|action| action.get("do").is_some());
+        if !present {
+            let mut array = Array::new();
+            for step in steps {
+                array.push(step.as_str());
+            }
+            if !self.doc.contains_key("actions") {
+                let mut actions = toml_edit::Table::new();
+                actions.set_implicit(true);
+                self.doc["actions"] = Item::Table(actions);
+            }
+            self.doc["actions"][id]["do"] = Item::Value(Value::Array(array));
+        }
+        self.rebuild(reg, Vec::new());
+    }
+
+    /// Make sure `[keys."<ctx>"]` lists `action` (with `keys`), so the
+    /// binding can be edited there.
+    pub fn ensure_keybinding(&mut self, ctx: &KeyContextId, action: &str, keys: &[String], reg: &ExtensionRegistry) {
+        let present = self
+            .doc
+            .get("keys")
+            .and_then(|table| table.get(ctx.as_str()))
+            .and_then(|table| table.get(action))
+            .is_some();
+        if !present {
+            self.set_keybinding(ctx, action, keys, reg);
+        }
+    }
+
     /// Flush a pending edit once the debounce interval has elapsed.
     pub fn flush_if_due(&mut self) -> io::Result<bool> {
         if self
@@ -514,7 +611,11 @@ fn warn_unknown_values(
         return;
     };
     for (section, item) in table {
-        if section == "keys" {
+        // Controls tables are validated by `controls::Controls::compile`.
+        if matches!(
+            section.as_str(),
+            "keys" | "modes" | "keysets" | "groups" | "actions" | "rules"
+        ) {
             continue;
         }
         let Some(section_table) = item.as_table() else {

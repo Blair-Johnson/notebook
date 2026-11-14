@@ -15,7 +15,7 @@ use nb_sdk::Theme;
 pub fn mode_color(focus: &FocusLayer, theme: &Theme) -> ratatui::style::Color {
     let p = &theme.palette;
     match focus {
-        FocusLayer::NotebookNormal => p.accent_code,
+        FocusLayer::Notebook { .. } => p.accent_code,
         FocusLayer::CellEdit {
             mode: CellMode::Normal,
             ..

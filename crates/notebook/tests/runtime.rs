@@ -1,6 +1,7 @@
 //! Runtime helper coverage for editor handoff and kernel batching.
 
 #[path = "../src/editor.rs"]
+#[allow(dead_code)]
 mod editor;
 #[path = "../src/runtime.rs"]
 mod runtime;

@@ -14,7 +14,7 @@ use nb_sdk::{
     SettingKind, SettingSpec,
 };
 
-pub const DEFAULT_KEYS_TOML: &str = include_str!("../../assets/default_keys.toml");
+pub const DEFAULT_CONTROLS_TOML: &str = include_str!("../../assets/default_controls.toml");
 
 const THEME_OPTIONS: &[&str] = &["terminal", "midnight", "light", "gruvbox", "solarized-dark"];
 
@@ -482,8 +482,18 @@ impl Plugin for BuiltinsPlugin {
             (98, "output.jump", "Go to traceback line"),
             (99, "output.cycle_view", "Expand / collapse output"),
             (100, "output.next_tab", "Switch stdout / stderr"),
+            (101, "output.goto_traceback", "Go to the cell and line a traceback names"),
         ] {
             action(reg, id, ActionKind::Command, "Outputs", order, title, false);
+        }
+        // Building blocks for rules and macros (see default_controls.toml).
+        for (order, id, title) in [
+            (120, "edit.line_below", "Add an indented line below"),
+            (121, "edit.line_above", "Add an indented line above"),
+            (122, "selection.start", "Go to the selection start"),
+            (123, "selection.end", "Go to the selection end"),
+        ] {
+            action(reg, id, ActionKind::Command, "Editing", order, title, false);
         }
         for (order, id, title) in [
             (55, "motion.fast_down", "Scroll down fast"),
@@ -1122,7 +1132,7 @@ impl Plugin for BuiltinsPlugin {
             },
         );
 
-        reg.add_default_keys_toml("core.builtins", DEFAULT_KEYS_TOML)
+        reg.add_default_keys_toml("core.builtins", DEFAULT_CONTROLS_TOML)
             .add_renderer(stream::StreamRenderer)
             .add_renderer(plain::PlainTextRenderer)
             .add_renderer(traceback::TracebackRenderer);

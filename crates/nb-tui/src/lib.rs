@@ -9,6 +9,7 @@
 pub mod ansi;
 pub mod builtins;
 pub mod config_store;
+pub mod controls;
 pub mod coordinator;
 pub mod focus;
 pub mod grammar;

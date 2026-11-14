@@ -1,6 +1,7 @@
 //! Central `Coordinator` state machine and `Effect` chokepoint.
 
 use crate::config_store::{ConfigSnapshot, SettingsStore};
+use crate::controls::{Condition, CursorStyle, Level, LinePos, MAX_DEPTH, ModeKind, Step};
 use crate::focus::{CellMode, CellPart, FocusLayer, FocusStack, ModalKind};
 use crate::grammar::{GrammarStep, VimGrammar};
 use crate::intelligence::{
@@ -38,9 +39,10 @@ use nb_core::{
 };
 use nb_kernel::{CompletionCandidate, KernelClient, KernelCmd, KernelEvent, Lane, WireOutput};
 use nb_sdk::{
-    ExtensionRegistry, InputOutcome, Key, KeyContextId, MotionOrObject, MountCtx, OutputHost,
-    OutputView, ResolvedInput,
+    ActionKind, CommandId, ExtensionRegistry, InputOutcome, Key, KeyContextId, MotionId,
+    MotionOrObject, MountCtx, OperatorId, OutputHost, OutputView, ResolvedInput,
 };
+use std::borrow::Cow;
 
 /// A formatter that has not finished by then is killed: formatting runs on
 /// the UI thread.
@@ -55,7 +57,17 @@ fn notice_ttl(core: &crate::config_store::CoreSettings) -> Duration {
 pub enum Effect {
     None,
     OpenExternalEditor(CellId),
+    /// Open the config file in `$VISUAL`/`$EDITOR` at a 1-based line, then
+    /// call `Coordinator::after_config_edit`.
+    EditConfig { path: PathBuf, line: usize },
     Quit,
+}
+
+/// Rule conditions that are costly to compute, computed once per key.
+#[derive(Default)]
+struct FactCache {
+    /// Whether the cursor's line is the first and the last of its text.
+    line: Option<Option<(bool, bool)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +175,11 @@ pub struct Coordinator {
     /// The periodic autosave's write and fsync, off the UI thread.
     autosave_write: Option<std::thread::JoinHandle<bool>>,
     disk_watch: MtimeWatch,
+    /// A step of the current key failed: the rest of its steps are skipped.
+    step_failed: bool,
+    /// While a key runs: each cell buffer it touched and its undo depth
+    /// before, so the whole key undoes as one step.
+    undo_marks: Option<Vec<(CellId, usize)>>,
 }
 
 impl Coordinator {
@@ -253,6 +270,8 @@ impl Coordinator {
             autosaved_stamp: None,
             autosave_write: None,
             disk_watch,
+            step_failed: false,
+            undo_marks: None,
         };
         coordinator.sync_settings();
         coordinator.observed_file_mtime = coordinator.path.as_deref().and_then(file_mtime);
@@ -285,7 +304,7 @@ impl Coordinator {
         let snap = self.settings.snapshot().clone();
         self.reconcile_outputs();
         self.keep_focus_visible(frame.area(), &snap);
-        let notebook_row = matches!(self.focus.base(), FocusLayer::NotebookNormal)
+        let notebook_row = matches!(self.focus.base(), FocusLayer::Notebook { .. })
             .then(|| self.nb_cursor().map(|(_, row)| row))
             .flatten();
         let view = AppView {
@@ -324,17 +343,22 @@ impl Coordinator {
             &snap.keymap,
             &mut self.layout_cache,
         );
-        // One place decides the cursor shape: a bar wherever text is typed.
+        // One place decides the cursor shape: the mode's `cursor`, and a
+        // bar in every prompt.
         let shape = match self.focus.top() {
-            FocusLayer::CellEdit {
-                mode: CellMode::Insert,
-                ..
-            }
-            | FocusLayer::PdbInput
+            FocusLayer::PdbInput
             | FocusLayer::Modal(
                 ModalKind::SearchPrompt | ModalKind::ExCommandBar | ModalKind::CommandPalette,
             ) => CursorShape::SteadyBar,
-            _ => CursorShape::SteadyBlock,
+            layer => match layer
+                .mode_id()
+                .and_then(|mode| snap.keymap.controls.mode(mode))
+                .map(|mode| mode.cursor)
+            {
+                Some(CursorStyle::Bar) => CursorShape::SteadyBar,
+                Some(CursorStyle::Underline) => CursorShape::SteadyUnderline,
+                _ => CursorShape::SteadyBlock,
+            },
         };
         self.term_effects.set_cursor_shape(shape);
     }
@@ -384,7 +408,7 @@ impl Coordinator {
         // Keeps an entered output's cursor inside its region.
         self.output_region_rows(text_w);
         let followed = self.follow_focus;
-        let notebook_level = matches!(self.focus.base(), FocusLayer::NotebookNormal);
+        let notebook_level = matches!(self.focus.base(), FocusLayer::Notebook { .. });
         let scrolloff = u32::from(snap.core.scrolloff).min(height.saturating_sub(1) / 2);
         if notebook_level {
             // Keeps the notebook cursor on a valid row of its cell.
@@ -759,13 +783,13 @@ impl Coordinator {
                 if !editing_here {
                     self.leave_cell_layers();
                     self.select_cell(cell_id.clone());
-                    self.begin_cell_edit(CellMode::Normal);
+                    self.begin_cell_edit("cell.normal", CellMode::Normal);
                 } else if let FocusLayer::CellEdit {
                     mode: CellMode::Visual(_),
                     ..
                 } = self.focus.top()
                 {
-                    self.set_cell_mode(CellMode::Normal);
+                    self.switch_kind(ModeKind::Normal);
                 }
                 if let Some(cell) = self.document.cell_mut(&cell_id) {
                     // `char_col` is where this wrapped row starts; walk the
@@ -802,7 +826,7 @@ impl Coordinator {
                     FocusLayer::OutputFocus { cell_id: current, .. } if current == &cell_id
                 );
                 if !inside {
-                    self.enter_output(cell_id);
+                    self.enter_output(cell_id, "output.normal");
                 }
                 // `local_row` counts wrapped text rows of the output block.
                 let width = self.layout_cache.last_width();
@@ -828,10 +852,8 @@ impl Coordinator {
                         out.buffer.set_cursor(CursorPos { row, col });
                         vim::clamp_normal(&mut out.buffer);
                     }
-                    if let FocusLayer::OutputFocus { mode, .. } = self.focus.top_mut() {
-                        *mode = CellMode::Normal;
-                    }
                 }
+                self.switch_kind(ModeKind::Normal);
             }
             HitTarget::FoldToggle { cell_id } => {
                 if let Some(cell) = self.document.cell_mut(&cell_id) {
@@ -1219,7 +1241,245 @@ impl Coordinator {
         }
     }
 
+    /// One resolved key: rules and macros first, then the built-in action.
+    /// Everything the key changes in a cell undoes as one step.
     fn dispatch_input(&mut self, input: ResolvedInput) -> Effect {
+        if self.focus.top().mode_id().is_none() {
+            return self.run_primitive(input);
+        }
+        let outer = self.undo_marks.is_none();
+        if outer {
+            self.undo_marks = Some(Vec::new());
+        }
+        self.step_failed = false;
+        let effect = self.run_action(input, 0);
+        if outer {
+            for (cell_id, depth) in self.undo_marks.take().unwrap_or_default() {
+                if let Some(cell) = self.document.cell_mut(&cell_id) {
+                    cell.buffer.merge_undo_since(depth);
+                }
+            }
+        }
+        effect
+    }
+
+    /// Run `input` as configured for the current mode: the first matching
+    /// rule's steps, else the action's macro, else the built-in action.
+    fn run_action(&mut self, input: ResolvedInput, depth: usize) -> Effect {
+        let Some(mode) = self.focus.top().mode_id().map(str::to_string) else {
+            self.step_failed = true;
+            return Effect::None;
+        };
+        let Some((action, target)) = action_of(&input) else {
+            self.note_undo_mark();
+            return self.run_primitive(input);
+        };
+        let snap = self.settings.snapshot().clone();
+        let controls = &snap.keymap.controls;
+        let mut facts = FactCache::default();
+        let steps = controls
+            .find_rule(&mode, &action, target.as_deref(), |condition| {
+                self.condition_holds(condition, &input, &mut facts)
+            })
+            .map(|rule| rule.steps.clone())
+            .or_else(|| controls.macro_for(&action).map(|action| action.steps.clone()));
+        match steps {
+            Some(steps) => self.run_steps(&steps, &input, depth),
+            None => {
+                self.note_undo_mark();
+                self.run_primitive(input)
+            }
+        }
+    }
+
+    /// Steps run in order, each in the mode current when it is reached. A
+    /// failed step (or one that opened a prompt) stops the rest.
+    fn run_steps(&mut self, steps: &[Step], trigger: &ResolvedInput, depth: usize) -> Effect {
+        let mut effect = Effect::None;
+        for step in steps {
+            if self.step_failed || self.focus.top().mode_id().is_none() {
+                self.step_failed = true;
+                break;
+            }
+            self.note_undo_mark();
+            let next = match step {
+                Step::Trigger => self.run_primitive(trigger.clone()),
+                Step::Mode(mode) => {
+                    if !self.switch_mode(mode) {
+                        self.step_failed = true;
+                    }
+                    Effect::None
+                }
+                Step::Action { id, arg } => {
+                    if depth + 1 >= MAX_DEPTH {
+                        self.notice = Some(format!(
+                            "{id}: steps nest more than {MAX_DEPTH} deep; stopped"
+                        ));
+                        self.step_failed = true;
+                        Effect::None
+                    } else {
+                        match self.input_for(id, *arg) {
+                            Some(input) => self.run_action(input, depth + 1),
+                            None => {
+                                self.step_failed = true;
+                                Effect::None
+                            }
+                        }
+                    }
+                }
+            };
+            if !matches!(next, Effect::None) {
+                effect = next;
+            }
+        }
+        effect
+    }
+
+    /// The resolved input for a named step, with no count.
+    fn input_for(&self, id: &str, arg: Option<char>) -> Option<ResolvedInput> {
+        let kind = self.settings.snapshot().keymap.action_spec(id)?.kind;
+        let id = id.to_string();
+        Some(match kind {
+            ActionKind::Motion | ActionKind::CharArgMotion => ResolvedInput::Move {
+                motion: MotionId(Cow::Owned(id)),
+                count: 1,
+                arg,
+            },
+            ActionKind::Command | ActionKind::CharArgCommand => ResolvedInput::Command {
+                id: CommandId(Cow::Owned(id)),
+                count: None,
+                arg,
+            },
+            ActionKind::Operator => ResolvedInput::OperateSelf {
+                op: OperatorId(Cow::Owned(id)),
+                count: 1,
+            },
+            ActionKind::TextObject => return None,
+        })
+    }
+
+    /// Answer one `when` condition for where the cursor is now.
+    fn condition_holds(
+        &mut self,
+        condition: &Condition,
+        input: &ResolvedInput,
+        facts: &mut FactCache,
+    ) -> bool {
+        match condition {
+            Condition::Count(want) => (input_count(input) > 1) == *want,
+            Condition::Part(part) => self.target_part() == Some(*part),
+            Condition::Cell(kind) => self.target_cell().is_some_and(|cell| {
+                let name = match cell.kind {
+                    CellKind::Code => "code",
+                    CellKind::Markdown => "markdown",
+                    CellKind::Raw => "raw",
+                };
+                name == kind
+            }),
+            Condition::Empty(want) => self
+                .target_cell()
+                .is_some_and(|cell| cell.buffer.as_str().trim().is_empty() == *want),
+            Condition::Outputs(want) => self
+                .target_cell()
+                .is_some_and(|cell| cell.outputs.is_empty() != *want),
+            Condition::Line(pos) => {
+                let line = match facts.line {
+                    Some(line) => line,
+                    None => {
+                        let line = self.target_line();
+                        facts.line = Some(line);
+                        line
+                    }
+                };
+                line.is_some_and(|(first, last)| match pos {
+                    LinePos::First => first,
+                    LinePos::Last => last,
+                    LinePos::Only => first && last,
+                })
+            }
+        }
+    }
+
+    /// The part the cursor is on: the selected one at the notebook level.
+    fn target_part(&mut self) -> Option<CellPart> {
+        match self.focus.base() {
+            FocusLayer::Notebook { .. } => {
+                self.nb_cursor();
+                Some(self.selected_part)
+            }
+            FocusLayer::CellEdit { .. } => Some(CellPart::Source),
+            FocusLayer::OutputFocus { .. } => Some(CellPart::Output),
+            _ => None,
+        }
+    }
+
+    fn target_cell(&self) -> Option<&Cell> {
+        match self.focus.base() {
+            FocusLayer::Notebook { .. } => self.document.cell(&self.selected_cell),
+            FocusLayer::CellEdit { cell_id, .. } | FocusLayer::OutputFocus { cell_id, .. } => {
+                self.document.cell(cell_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the cursor's line is the first and the last of its text (at
+    /// the notebook level, the line under the notebook cursor).
+    fn target_line(&mut self) -> Option<(bool, bool)> {
+        let ends = |line: usize, count: usize| Some((line == 0, line + 1 >= count));
+        match self.focus.base().clone() {
+            FocusLayer::Notebook { .. } => {
+                let (_, row) = self.nb_cursor()?;
+                let id = self.selected_cell.clone();
+                if self.selected_part == CellPart::Source {
+                    let (line, _) = self.source_pos_for_row(&id, row)?;
+                    ends(line, self.document.cell(&id)?.buffer.line_count())
+                } else {
+                    let (line, _) = self.output_pos_for_row(&id, row)?;
+                    let count = vim::outputs_text(self.document.cell(&id)?).split('\n').count();
+                    ends(line, count)
+                }
+            }
+            FocusLayer::CellEdit { cell_id, .. } => {
+                let buffer = &self.document.cell(&cell_id)?.buffer;
+                ends(buffer.cursor().row, buffer.line_count())
+            }
+            FocusLayer::OutputFocus { .. } => {
+                let buffer = &self.output_text.as_ref()?.buffer;
+                ends(buffer.cursor().row, buffer.line_count())
+            }
+            _ => None,
+        }
+    }
+
+    /// Remember the undo depth of the cell being edited, once per key.
+    fn note_undo_mark(&mut self) {
+        let Some(marks) = self.undo_marks.as_mut() else {
+            return;
+        };
+        if let FocusLayer::CellEdit { cell_id, .. } = self.focus.top() {
+            if !marks.iter().any(|(id, _)| id == cell_id) {
+                if let Some(cell) = self.document.cell(cell_id) {
+                    marks.push((cell_id.clone(), cell.buffer.undo_depth()));
+                }
+            }
+        }
+    }
+
+    /// The built-in action at the level of the current mode.
+    fn run_primitive(&mut self, input: ResolvedInput) -> Effect {
+        // A `mode.<id>` action switches mode wherever it is bound.
+        if let ResolvedInput::Command { id, .. } = &input {
+            if let Some(mode) = id.0.strip_prefix("mode.") {
+                if self.settings.snapshot().keymap.controls.mode(mode).is_some() {
+                    let mode = mode.to_string();
+                    if !self.switch_mode(&mode) {
+                        self.step_failed = true;
+                    }
+                    return Effect::None;
+                }
+            }
+        }
         // Application-wide commands behave the same at every level.
         if let ResolvedInput::Command { id, count, arg } = &input {
             let id = id.0.as_ref();
@@ -1233,7 +1493,7 @@ impl Coordinator {
             }
         }
         match self.focus.top().clone() {
-            FocusLayer::NotebookNormal => self.dispatch_notebook(input),
+            FocusLayer::Notebook { .. } => self.dispatch_notebook(input),
             FocusLayer::CellEdit { cell_id, mode, .. } => {
                 self.dispatch_cell_edit(&cell_id, mode, input)
             }
@@ -1693,49 +1953,8 @@ impl Coordinator {
                 }
                 Effect::None
             }
-            "cell.enter_normal" => {
-                let row = self.nb_cursor().map(|(_, row)| row);
-                if self.selected_part == CellPart::Output {
-                    let id = self.selected_cell.clone();
-                    let target = row.and_then(|row| self.output_pos_for_row(&id, row));
-                    self.enter_output(id);
-                    if let (Some((line, col)), Some(out)) = (target, self.output_text.as_mut()) {
-                        out.buffer.set_cursor(CursorPos { row: line, col });
-                        vim::clamp_normal(&mut out.buffer);
-                    }
-                } else if self
-                    .document
-                    .cell(&self.selected_cell)
-                    .is_some_and(|cell| cell.buffer.as_str().trim().is_empty())
-                {
-                    // Nothing to navigate in an empty cell: start typing.
-                    self.begin_cell_edit(CellMode::Insert);
-                } else {
-                    let id = self.selected_cell.clone();
-                    let target = row.and_then(|row| self.source_pos_for_row(&id, row));
-                    self.begin_cell_edit(CellMode::Normal);
-                    if let (Some((line, col)), Some(cell)) = (target, self.document.cell_mut(&id)) {
-                        cell.buffer.set_cursor(CursorPos { row: line, col });
-                        vim::clamp_normal(&mut cell.buffer);
-                    }
-                }
-                Effect::None
-            }
-            "cell.enter_insert" => {
-                self.selected_part = CellPart::Source;
-                self.begin_cell_edit(CellMode::Insert);
-                Effect::None
-            }
-            "cell.append_end" => {
-                self.begin_cell_edit(CellMode::Insert);
-                if let Some(cell) = self.document.cell_mut(&self.selected_cell) {
-                    let row = cell.buffer.line_count().saturating_sub(1);
-                    let col = cell.buffer.line_char_len(row);
-                    cell.buffer.set_cursor(CursorPos { row, col });
-                }
-                self.term_effects.set_cursor_shape(CursorShape::SteadyBar);
-                Effect::None
-            }
+            // Opening cells and outputs (`i`, `A`, `z o`, ...) is configured
+            // as rules in default_controls.toml.
             "cell.insert_below" => {
                 self.insert_cell_at(self.selected_index().saturating_add(1));
                 Effect::None
@@ -1780,11 +1999,6 @@ impl Coordinator {
                 }
                 Effect::None
             }
-            "cell.run_and_advance" => {
-                self.run_selected();
-                self.move_selected("motion.cell_next", 1);
-                Effect::None
-            }
             "cell.run_all" => {
                 self.run_all();
                 Effect::None
@@ -1799,10 +2013,6 @@ impl Coordinator {
                     cell.bump_chrome();
                     self.document.dirty_source = true;
                 }
-                Effect::None
-            }
-            "cell.focus_output" => {
-                self.enter_output(self.selected_cell.clone());
                 Effect::None
             }
             "cell.edit_external" => Effect::OpenExternalEditor(self.selected_cell.clone()),
@@ -1939,9 +2149,6 @@ impl Coordinator {
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "intel.complete" => {
                 self.request_completion(cell_id);
             }
-            ResolvedInput::Command { id, .. } if id.0.as_ref() == "focus.up" => {
-                self.leave_insert(cell_id);
-            }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "cell.toggle_expand_split" => {
                 self.toggle_split();
             }
@@ -1982,7 +2189,7 @@ impl Coordinator {
                     vim.command(buf, vim_mode, &id, count.unwrap_or(1), arg, false)
                 });
                 if !outcome.handled {
-                    self.dispatch_cell_command(cell_id, mode, &id);
+                    self.dispatch_cell_command(cell_id, &id);
                 }
             }
             ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => {}
@@ -2012,35 +2219,23 @@ impl Coordinator {
             self.yank_text = self.vim.register.text.clone();
             let _ = self.clipboard.copy(&self.vim.register.text);
         }
+        // `cw` ends in insert and visual operators end in normal: move to
+        // the mode of that kind in the current mode's family.
         if outcome.insert {
-            self.set_cell_mode(CellMode::Insert);
-        } else if let Some(kind) = outcome.visual {
-            self.set_cell_mode(CellMode::Visual(kind));
+            self.switch_kind(ModeKind::Insert);
         } else if outcome.normal {
-            self.set_cell_mode(CellMode::Normal);
+            self.switch_kind(ModeKind::Normal);
         }
     }
 
     /// Cell commands that are not text edits.
-    fn dispatch_cell_command(&mut self, cell_id: &CellId, mode: CellMode, id: &str) {
+    fn dispatch_cell_command(&mut self, cell_id: &CellId, id: &str) {
         match id {
             "cell.run" => {
                 self.commit_cell(cell_id);
                 self.run_cell(cell_id);
                 self.cell_baselines
                     .insert(cell_id.clone(), self.cell_source(cell_id));
-            }
-            "focus.up" => {
-                if matches!(mode, CellMode::Visual(_)) {
-                    if let Some(cell) = self.document.cell_mut(cell_id) {
-                        cell.buffer.clear_selection();
-                    }
-                    self.set_cell_mode(CellMode::Normal);
-                } else {
-                    self.remember_source_cursor(cell_id);
-                    self.commit_cell(cell_id);
-                    self.focus.pop();
-                }
             }
             "cell.toggle_expand_split" => self.toggle_split(),
             "cell.split_at_cursor" => self.split_cell(cell_id),
@@ -2083,17 +2278,11 @@ impl Coordinator {
                 });
             }
             ResolvedInput::Command { id, count, arg } => match id.0.as_ref() {
-                "focus.up" => {
-                    if matches!(mode, CellMode::Visual(_)) {
-                        if let Some(out) = self.output_text.as_mut() {
-                            out.buffer.clear_selection();
-                        }
-                        self.set_output_mode(CellMode::Normal);
-                    } else {
-                        self.leave_cell_layers();
+                "output.goto_traceback" => {
+                    if !self.goto_traceback() {
+                        self.step_failed = true;
                     }
                 }
-                "output.jump" => self.jump_from_output(),
                 "output.next_tab" => {
                     if let Some(cell_id) = self.output_text.as_ref().map(|out| out.cell_id.clone()) {
                         self.next_stream_tab(&cell_id);
@@ -2138,7 +2327,7 @@ impl Coordinator {
         if let Some((cell, line)) = jumped {
             self.leave_cell_layers();
             self.select_cell(cell.clone());
-            self.begin_cell_edit(CellMode::Normal);
+            self.begin_cell_edit("cell.normal", CellMode::Normal);
             if let Some(cell) = self.document.cell_mut(&cell) {
                 cell.buffer.set_cursor(CursorPos {
                     row: line.unwrap_or(0),
@@ -2161,10 +2350,8 @@ impl Coordinator {
             self.yank_text = self.vim.register.text.clone();
             let _ = self.clipboard.copy(&self.vim.register.text);
         }
-        if let Some(kind) = outcome.visual {
-            self.set_output_mode(CellMode::Visual(kind));
-        } else if outcome.normal {
-            self.set_output_mode(CellMode::Normal);
+        if outcome.normal {
+            self.switch_kind(ModeKind::Normal);
         }
         outcome
     }
@@ -2554,20 +2741,6 @@ impl Coordinator {
         self.vim.reset_column();
     }
 
-    /// Esc from insert: back to normal mode one character left, like vim.
-    fn leave_insert(&mut self, cell_id: &CellId) {
-        if let Some(cell) = self.document.cell_mut(cell_id) {
-            let cursor = cell.buffer.cursor();
-            cell.buffer.set_cursor(CursorPos {
-                row: cursor.row,
-                col: cursor.col.saturating_sub(1),
-            });
-            vim::clamp_normal(&mut cell.buffer);
-        }
-        self.vim.reset_column();
-        self.set_cell_mode(CellMode::Normal);
-    }
-
     fn apply_notebook_operator(&mut self, op: &str, target: Option<MotionOrObject>, count: u32) {
         // On an output, `yy` copies it and `dd` clears it.
         if self.selected_part == CellPart::Output && target.is_none() {
@@ -2652,30 +2825,182 @@ impl Coordinator {
         }
     }
 
-    fn begin_cell_edit(&mut self, mode: CellMode) {
+    /// Open the selected cell in `mode_id` (of kind `mode`), with its cursor
+    /// where it was.
+    fn begin_cell_edit(&mut self, mode_id: &str, mode: CellMode) {
         let id = self.selected_cell.clone();
         self.cell_baselines
             .insert(id.clone(), self.cell_source(&id));
-        if let Some(cell) = self.document.cell_mut(&id) {
-            match mode {
-                // One undo step per insert session.
-                CellMode::Insert => cell.buffer.checkpoint(),
+        self.focus.push(FocusLayer::CellEdit {
+            cell_id: id.clone(),
+            mode: CellMode::Normal,
+            mode_id: mode_id.to_string(),
+            expanded_split: false,
+        });
+        self.note_undo_mark();
+        if mode != CellMode::Insert {
+            if let Some(cell) = self.document.cell_mut(&id) {
                 // Vim normal mode never rests past the last character.
-                _ => vim::clamp_normal(&mut cell.buffer),
+                vim::clamp_normal(&mut cell.buffer);
             }
         }
         self.vim.reset_column();
-        self.focus.push(FocusLayer::CellEdit {
-            cell_id: id,
-            mode,
-            expanded_split: false,
-        });
-        self.term_effects
-            .set_cursor_shape(if matches!(mode, CellMode::Insert) {
-                CursorShape::SteadyBar
-            } else {
-                CursorShape::SteadyBlock
-            });
+        if mode != CellMode::Normal {
+            self.set_kind(mode_id, mode);
+        }
+    }
+
+    /// `mode.<id>`: switch to a configured mode. Crossing levels goes up to
+    /// the notebook and back down, placing the cursor as `controls-design.md`
+    /// (section 4) describes. Returns false when the switch cannot happen,
+    /// such as entering an output on a cell without one.
+    fn switch_mode(&mut self, target: &str) -> bool {
+        let Some(spec) = self.settings.snapshot().keymap.controls.mode(target).cloned() else {
+            return false;
+        };
+        let kind = CellMode::from(spec.kind);
+        match (spec.level, self.focus.top()) {
+            (_, FocusLayer::PdbInput | FocusLayer::Modal(_)) => false,
+            (Level::Notebook, _) => {
+                self.leave_cell_layers();
+                if let FocusLayer::Notebook { mode_id } = self.focus.root_mut() {
+                    *mode_id = target.to_string();
+                }
+                self.vim.reset_column();
+                true
+            }
+            (Level::Cell, FocusLayer::CellEdit { .. })
+            | (Level::Output, FocusLayer::OutputFocus { .. }) => {
+                self.set_kind(target, kind);
+                true
+            }
+            (Level::Cell, _) => {
+                self.leave_cell_layers();
+                self.open_cell_from_notebook(target, kind);
+                true
+            }
+            (Level::Output, _) => {
+                self.leave_cell_layers();
+                self.open_output_from_notebook(target, kind)
+            }
+        }
+    }
+
+    /// Switch to the mode of `kind` in the current mode's family (at the
+    /// same level), as a primitive that ends in that kind asks.
+    fn switch_kind(&mut self, kind: ModeKind) {
+        let snap = self.settings.snapshot().clone();
+        let controls = &snap.keymap.controls;
+        let Some(current) = self.focus.top().mode_id().and_then(|mode| controls.mode(mode)) else {
+            return;
+        };
+        let target = current.family(kind);
+        if controls.mode(&target).is_some_and(|mode| mode.level == current.level) {
+            self.set_kind(&target, kind.into());
+        }
+    }
+
+    /// From the notebook: the cursor goes to the line under the notebook
+    /// cursor, at its first non-blank character; from an output row or a
+    /// collapsed cell, to the cell's last editing position.
+    fn open_cell_from_notebook(&mut self, mode_id: &str, kind: CellMode) {
+        let id = self.selected_cell.clone();
+        let row = self.nb_cursor().map(|(_, row)| row);
+        let collapsed = self.document.cell(&id).is_some_and(|cell| cell.collapsed);
+        let target = if self.selected_part == CellPart::Source && !collapsed {
+            row.and_then(|row| self.source_pos_for_row(&id, row))
+        } else {
+            None
+        };
+        self.selected_part = CellPart::Source;
+        self.begin_cell_edit(mode_id, CellMode::Normal);
+        if let (Some((line, col)), Some(cell)) = (target, self.document.cell_mut(&id)) {
+            cell.buffer.set_cursor(CursorPos { row: line, col });
+            vim::clamp_normal(&mut cell.buffer);
+        }
+        if kind != CellMode::Normal {
+            self.set_kind(mode_id, kind);
+        }
+    }
+
+    /// From the notebook: an output row opens the output on that line; a
+    /// source row opens it at the start.
+    fn open_output_from_notebook(&mut self, mode_id: &str, kind: CellMode) -> bool {
+        let id = self.selected_cell.clone();
+        if self.document.cell(&id).is_none_or(|cell| cell.outputs.is_empty()) {
+            return false;
+        }
+        let row = self.nb_cursor().map(|(_, row)| row);
+        let target = if self.selected_part == CellPart::Output {
+            row.and_then(|row| self.output_pos_for_row(&id, row))
+        } else {
+            None
+        };
+        self.enter_output(id, mode_id);
+        if let (Some((line, col)), Some(out)) = (target, self.output_text.as_mut()) {
+            out.buffer.set_cursor(CursorPos { row: line, col });
+            vim::clamp_normal(&mut out.buffer);
+        }
+        if kind != CellMode::Normal {
+            self.set_kind(mode_id, kind);
+        }
+        true
+    }
+
+    /// Change the kind of the current cell or output layer. Entering insert
+    /// starts an undo step; entering visual anchors a selection at the
+    /// cursor (or keeps it between visual kinds); leaving visual clears it;
+    /// entering normal moves a cursor past the line end onto the last
+    /// character.
+    fn set_kind(&mut self, mode_id: &str, new: CellMode) {
+        let (old, cell_id) = match self.focus.top_mut() {
+            FocusLayer::CellEdit {
+                cell_id,
+                mode,
+                mode_id: id,
+                ..
+            } => {
+                let old = *mode;
+                *mode = new;
+                *id = mode_id.to_string();
+                (old, Some(cell_id.clone()))
+            }
+            FocusLayer::OutputFocus {
+                mode, mode_id: id, ..
+            } => {
+                let old = *mode;
+                *mode = new;
+                *id = mode_id.to_string();
+                (old, None)
+            }
+            _ => return,
+        };
+        let buffer = match &cell_id {
+            Some(id) => self.document.cell_mut(id).map(|cell| &mut cell.buffer),
+            None => self.output_text.as_mut().map(|out| &mut out.buffer),
+        };
+        let Some(buffer) = buffer else { return };
+        if new == CellMode::Insert && old != CellMode::Insert {
+            buffer.checkpoint();
+        }
+        match new {
+            CellMode::Visual(kind) => {
+                let selection = buffer.selection().unwrap_or(nb_core::Selection {
+                    kind,
+                    anchor: buffer.cursor(),
+                    head: buffer.cursor(),
+                });
+                buffer.set_selection(nb_core::Selection { kind, ..selection });
+            }
+            _ if matches!(old, CellMode::Visual(_)) => buffer.clear_selection(),
+            _ => {}
+        }
+        if new != CellMode::Insert {
+            vim::clamp_normal(buffer);
+        }
+        if old == CellMode::Insert && new != CellMode::Insert {
+            self.vim.reset_column();
+        }
     }
 
     /// Commit and close any cell edit or output focus, returning to the
@@ -2708,17 +3033,6 @@ impl Coordinator {
         }
         self.completion = None;
         self.signature = None;
-    }
-    fn set_cell_mode(&mut self, mode: CellMode) {
-        if let FocusLayer::CellEdit { mode: current, .. } = self.focus.top_mut() {
-            *current = mode;
-            self.term_effects
-                .set_cursor_shape(if matches!(mode, CellMode::Insert) {
-                    CursorShape::SteadyBar
-                } else {
-                    CursorShape::SteadyBlock
-                });
-        }
     }
 
     fn toggle_split(&mut self) {
@@ -3194,7 +3508,7 @@ impl Coordinator {
     }
 
     /// Enter a cell's outputs as read-only text in normal mode.
-    fn enter_output(&mut self, cell_id: CellId) {
+    fn enter_output(&mut self, cell_id: CellId, mode_id: &str) {
         let Some(cell) = self.document.cell(&cell_id) else {
             return;
         };
@@ -3217,22 +3531,18 @@ impl Coordinator {
         self.focus.push(FocusLayer::OutputFocus {
             cell_id,
             mode: CellMode::Normal,
+            mode_id: mode_id.to_string(),
         });
         self.vim.reset_column();
         self.follow_focus = true;
     }
 
-    fn set_output_mode(&mut self, mode: CellMode) {
-        if let FocusLayer::OutputFocus { mode: current, .. } = self.focus.top_mut() {
-            *current = mode;
-        }
-    }
-
-    /// `Enter` on a traceback line such as `Cell In[3], line 7` (or the
-    /// older `<ipython-input-3-…>`, line 7) jumps to that cell and line.
-    fn jump_from_output(&mut self) {
+    /// `output.goto_traceback`: on a traceback line such as `Cell In[3],
+    /// line 7` (or the older `<ipython-input-3-…>`, line 7), go up to the
+    /// notebook with that cell and line selected. Fails on any other line.
+    fn goto_traceback(&mut self) -> bool {
         let Some(out) = self.output_text.as_ref() else {
-            return;
+            return false;
         };
         let line = out.buffer.line(out.buffer.cursor().row).unwrap_or("").to_string();
         let digits = |text: &str| -> Option<usize> {
@@ -3255,22 +3565,22 @@ impl Coordinator {
         });
         let Some(target) = target else {
             self.notice = Some("no notebook cell on this line".into());
-            return;
+            return false;
         };
         self.leave_cell_layers();
         self.select_cell(target.clone());
-        self.begin_cell_edit(CellMode::Normal);
         if let Some(cell) = self.document.cell_mut(&target) {
             cell.buffer.set_cursor(CursorPos {
                 row: row.unwrap_or(0),
                 col: 0,
             });
-            let col = cell.buffer.first_nonblank_col(cell.buffer.cursor().row);
-            cell.buffer.set_cursor(CursorPos {
-                row: cell.buffer.cursor().row,
-                col,
-            });
+            let cursor = cell.buffer.cursor();
+            let col = cell.buffer.first_nonblank_col(cursor.row);
+            cell.buffer.set_cursor(CursorPos { row: cursor.row, col });
+            // The notebook cursor follows, so opening the cell lands here.
+            self.nb_pending = Some((target, cursor.row, col));
         }
+        true
     }
 
     fn split_cell(&mut self, cell_id: &CellId) {
@@ -3557,12 +3867,166 @@ impl Coordinator {
             self.save_document(command.ends_with('!'));
             return Effect::None;
         }
+        if command == "explain" || command.starts_with("explain ") {
+            self.explain_command(command["explain".len()..].trim());
+            return Effect::None;
+        }
         if let Ok(number) = command.parse::<usize>() {
             if let Some(id) = self.document.order().get(number.saturating_sub(1)).cloned() {
                 self.select_cell(id);
             }
         }
         Effect::None
+    }
+
+    /// `:explain [mode] <keys>`: show what the keys do in the current mode
+    /// (or the named one) and on the current target, without running them.
+    fn explain_command(&mut self, rest: &str) {
+        let mut words = rest.split_whitespace().peekable();
+        let named = words
+            .peek()
+            .filter(|word| self.settings.snapshot().keymap.controls.mode(word).is_some())
+            .map(|word| word.to_string());
+        if named.is_some() {
+            words.next();
+        }
+        let keys = parse_explain_keys(&words.collect::<Vec<_>>().join(" "));
+        let Some(mode) = named.or_else(|| self.focus.base().mode_id().map(str::to_string)) else {
+            return;
+        };
+        if keys.is_empty() {
+            self.notice = Some("usage: :explain [mode] keys, such as :explain $ or :explain cell.normal d i w".into());
+            return;
+        }
+        let text = self.explain_keys(&mode, &keys).join("\n");
+        self.inspect_pager = Some(InspectPager {
+            title: format!("Explain · {}", crate::keymap::format_key_sequence(&keys)),
+            ansi_text: text,
+            scroll_top: 0,
+        });
+        self.focus.push(FocusLayer::Modal(ModalKind::InspectPager));
+    }
+
+    /// What `keys` do in `mode`: the actions they resolve to, the rules
+    /// checked in order (with the one that matches here marked), and the
+    /// steps that would run. Conditions are only evaluated when `mode` is the
+    /// mode below any modal; otherwise every rule is listed with its
+    /// conditions.
+    pub fn explain_keys(&mut self, mode: &str, keys: &[Key]) -> Vec<String> {
+        let snap = self.settings.snapshot().clone();
+        let keymap = &snap.keymap;
+        let controls = &keymap.controls;
+        let Some(spec) = controls.mode(mode) else {
+            return vec![format!("unknown mode {mode:?}")];
+        };
+        let here = self.focus.base().mode_id() == Some(mode);
+        let mut lines = vec![format!(
+            "In {} ({}){}:",
+            spec.title,
+            spec.badge,
+            if here { ", where the cursor is now" } else { "" }
+        )];
+        let context = KeyContextId(Cow::Owned(mode.to_string()));
+        let mut grammar = VimGrammar::default();
+        let now = Instant::now();
+        let mut inputs = Vec::new();
+        for key in keys {
+            for step in grammar.feed(keymap, &context, *key, now) {
+                match step {
+                    GrammarStep::Resolved(input) => inputs.push(input),
+                    GrammarStep::Unhandled(key) => lines.push(format!(
+                        "  {} is not bound in this mode",
+                        crate::keymap::format_key(key)
+                    )),
+                    GrammarStep::Pending | GrammarStep::Cancelled => {}
+                }
+            }
+        }
+        if grammar.is_pending() {
+            lines.push("  … these keys wait for more (a count, motion, or character)".into());
+        }
+        for input in inputs {
+            lines.push(String::new());
+            let Some((action, target)) = action_of(&input) else {
+                if let ResolvedInput::InsertText(text) = &input {
+                    lines.push(format!("  types {text:?}"));
+                }
+                continue;
+            };
+            let count = input_count(&input);
+            let mut heading = format!("  {} ({action})", controls.title(&action));
+            if let Some(target) = target.as_ref().filter(|target| **target != action) {
+                heading.push_str(&format!(" on {} ({target})", controls.title(target)));
+            }
+            if count > 1 {
+                heading.push_str(&format!(", count {count}"));
+            }
+            lines.push(heading);
+            let mut facts = FactCache::default();
+            let mut chosen = None;
+            for rule in controls.rules_for(mode, &action) {
+                let target_ok = rule.with.as_ref().is_none_or(|with| {
+                    target.as_ref().is_some_and(|target| with.contains(target))
+                });
+                let matches = here
+                    && rule.enabled
+                    && target_ok
+                    && rule
+                        .when
+                        .iter()
+                        .all(|condition| self.condition_holds(condition, &input, &mut facts));
+                let mark = if chosen.is_none() && matches { "▶" } else { " " };
+                if matches && chosen.is_none() {
+                    chosen = Some(rule.clone());
+                }
+                let when = crate::controls::describe_conditions(&rule.when);
+                lines.push(format!(
+                    "    {mark} rule {}{}{}{}",
+                    rule.id,
+                    if when.is_empty() { String::new() } else { format!(" when {when}") },
+                    if rule.from_user { " (yours)" } else { "" },
+                    if rule.enabled { "" } else { " (off)" },
+                ));
+                lines.push(format!(
+                    "        {}",
+                    controls.describe_steps(&rule.steps, &action)
+                ));
+            }
+            let result = match (&chosen, controls.macro_for(&action)) {
+                (Some(rule), _) => format!(
+                    "    → runs rule {}: {}",
+                    rule.id,
+                    controls.describe_steps(&rule.steps, &action)
+                ),
+                (None, Some(action_macro)) if here => format!(
+                    "    → no rule matches here: macro {}",
+                    controls.describe_steps(&action_macro.steps, &action)
+                ),
+                (None, None) if here => {
+                    "    → no rule matches here: the built-in action runs".to_string()
+                }
+                (None, Some(action_macro)) => format!(
+                    "    → when no rule matches: macro {}",
+                    controls.describe_steps(&action_macro.steps, &action)
+                ),
+                (None, None) => "    → when no rule matches: the built-in action runs".to_string(),
+            };
+            lines.push(result);
+        }
+        lines
+    }
+
+    /// The config file was edited outside nb: reload it now.
+    pub fn after_config_edit(&mut self) {
+        if self.settings.poll_external_reload(&self.registry) {
+            self.sync_settings();
+        }
+        let warnings = self.settings.snapshot().warnings.len();
+        if warnings > 0 {
+            self.notice = Some(format!(
+                "config: {warnings} warning(s); see the Controls tab in settings (ctrl+,)"
+            ));
+        }
     }
 
     fn resolve_save_path(&self, raw: &str) -> PathBuf {
@@ -3803,6 +4267,47 @@ fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
 }
 
 /// Commands that mean the same thing whichever layer has focus.
+/// Keys typed for `:explain`: space-separated key names (`ctrl+d`, `esc`),
+/// and any other word taken as one key per character (`gg`, `diw`).
+pub fn parse_explain_keys(text: &str) -> Vec<Key> {
+    let mut keys = Vec::new();
+    for word in text.split_whitespace() {
+        match crate::keymap::parse_key(word) {
+            Some(key) => keys.push(key),
+            None => keys.extend(word.chars().map(Key::Char)),
+        }
+    }
+    keys
+}
+
+/// The action a resolved input triggers and, for operators, its target
+/// (`dd` targets the operator itself).
+fn action_of(input: &ResolvedInput) -> Option<(String, Option<String>)> {
+    Some(match input {
+        ResolvedInput::Command { id, .. } => (id.0.to_string(), None),
+        ResolvedInput::Move { motion, .. } => (motion.0.to_string(), None),
+        ResolvedInput::OperateSelf { op, .. } => (op.0.to_string(), Some(op.0.to_string())),
+        ResolvedInput::Operate { op, target, .. } => {
+            let target = match target {
+                MotionOrObject::Motion(id) | MotionOrObject::MotionWithArg(id, _) => id.0.to_string(),
+                MotionOrObject::TextObject(id) => id.0.to_string(),
+            };
+            (op.0.to_string(), Some(target))
+        }
+        ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => return None,
+    })
+}
+
+fn input_count(input: &ResolvedInput) -> u32 {
+    match input {
+        ResolvedInput::Command { count, .. } => count.unwrap_or(1),
+        ResolvedInput::Move { count, .. }
+        | ResolvedInput::OperateSelf { count, .. }
+        | ResolvedInput::Operate { count, .. } => *count,
+        ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => 1,
+    }
+}
+
 fn is_global_command(id: &str) -> bool {
     id.starts_with("app.")
         || id.starts_with("doc.")

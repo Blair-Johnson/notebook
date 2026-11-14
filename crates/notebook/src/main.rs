@@ -415,7 +415,55 @@ fn handle_effect(
             edited?;
             Ok(true)
         }
+        Effect::EditConfig { path, line } => {
+            input.pause();
+            let edited = edit_config(terminal, coordinator, mouse_capture, &path, line);
+            input.resume();
+            edited?;
+            Ok(true)
+        }
     }
+}
+
+fn editor_name() -> String {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+/// Open the config file itself at `line`; saving it reloads the controls.
+fn edit_config(
+    terminal: &mut ratatui::DefaultTerminal,
+    coordinator: &mut Coordinator,
+    mouse_capture: bool,
+    path: &std::path::Path,
+    line: usize,
+) -> Result<()> {
+    let editor = editor_name();
+    terminal::leave_extras();
+    ratatui::restore();
+    let status = editor::editor_command_at(&editor, path, line).status();
+    *terminal = ratatui::init();
+    terminal::clear_screen();
+    terminal::enter_extras(mouse_capture);
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) if status.code() == Some(127) => {
+            coordinator.notice = Some(format!(
+                "{editor}: command not found (check $VISUAL/$EDITOR)"
+            ));
+        }
+        Ok(status) => coordinator.notice = Some(format!("{editor} exited with {status}")),
+        Err(error) => coordinator.notice = Some(format!("{editor} failed: {error}")),
+    }
+    coordinator.after_config_edit();
+    Ok(())
 }
 
 fn draw_frame(
@@ -449,15 +497,7 @@ fn external_edit(
     };
     let source = cell.buffer.as_str().to_owned();
     let temp_path = temporary_cell_path(extension)?;
-    let editor = std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "vi".to_string());
+    let editor = editor_name();
 
     if let Err(error) = fs::write(&temp_path, source) {
         let _ = fs::remove_file(&temp_path);

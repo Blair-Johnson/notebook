@@ -1,0 +1,534 @@
+# Default nb controls.
+#
+# Keys trigger actions; rules decide what an action does in a given mode and on
+# a given target; a rule's steps can switch modes.
+#
+# Your config.toml uses exactly these tables. An entry there with the same name
+# as a default (a mode, keyset, action, or a rule with the same id) changes
+# only the fields it sets, so `[[rules]] id = "..." enabled = false` turns a
+# default rule off. `:explain <keys>` shows what keys do where the cursor is,
+# and the Controls tab of the settings screen (ctrl+,) lists it all per mode.
+
+# ---------------------------------------------------------------------------
+# Modes: the states. `level` is notebook, cell, or output; `kind` is normal,
+# visual, visual_line, or insert. A mode reads its own [keys."<mode>"] table
+# first, then each keyset in `keysets`, in order; the first binding wins.
+# `pending` is the keyset read first while an operator waits (`d i w`).
+
+[modes."notebook.normal"]
+title = "Notebook"
+level = "notebook"
+kind = "normal"
+badge = "NOTEBOOK"
+keysets = ["vim.normal", "line.motions"]
+
+[modes."cell.normal"]
+title = "Cell normal"
+level = "cell"
+kind = "normal"
+badge = "NORMAL"
+keysets = ["text.motions", "vim.normal"]
+pending = "text.pending"
+
+[modes."cell.insert"]
+title = "Cell insert"
+level = "cell"
+kind = "insert"
+badge = "INSERT"
+cursor = "bar"
+keysets = ["text.insert"]
+
+[modes."cell.visual"]
+title = "Cell visual"
+level = "cell"
+kind = "visual"
+badge = "VISUAL"
+keysets = ["text.motions", "vim.normal"]
+pending = "text.pending"
+
+[modes."cell.visual_line"]
+title = "Cell visual line"
+level = "cell"
+kind = "visual_line"
+badge = "VISUAL LINE"
+keysets = ["cell.visual"]
+pending = "text.pending"
+
+[modes."output.normal"]
+title = "Output"
+level = "output"
+kind = "normal"
+badge = "OUTPUT"
+keysets = ["text.motions", "vim.normal"]
+pending = "text.pending"
+
+[modes."output.visual"]
+title = "Output visual"
+level = "output"
+kind = "visual"
+badge = "VISUAL"
+keysets = ["text.motions", "vim.normal"]
+pending = "text.pending"
+
+[modes."output.visual_line"]
+title = "Output visual line"
+level = "output"
+kind = "visual_line"
+badge = "VISUAL LINE"
+keysets = ["output.visual"]
+pending = "text.pending"
+
+# ---------------------------------------------------------------------------
+# Keysets: shared binding tables that modes (and other keysets) include.
+
+[keysets."line.motions"]
+title = "Line motions"
+
+[keysets."text.motions"]
+title = "In-text motions (cells and outputs)"
+includes = ["line.motions"]
+
+# ---------------------------------------------------------------------------
+# Groups: named lists of actions that rules refer to as "@name".
+
+[groups]
+# Motions within one line that start typing at that point when used from the
+# notebook. Add "motion.word_end" and others here if you rebind them.
+line_motions = ["motion.line_start", "motion.line_first_nonblank", "motion.current_line"]
+# Line motions that land on the last character, so typing starts after it.
+line_end_motions = ["motion.line_end"]
+
+# ---------------------------------------------------------------------------
+# Keys.
+
+[keys.global]
+"app.quit" = ["ctrl+q"]
+"app.palette" = ["ctrl+/"]
+"app.settings" = ["ctrl+,"]
+"kernel.interrupt" = ["ctrl+c"]
+"ui.toggle_mouse_capture" = ["alt+m"]
+
+[keys."vim.normal"]
+"motion.down" = ["j", "down"]
+"motion.up" = ["k", "up"]
+"motion.top" = ["g g", "home"]
+"motion.bottom" = ["G", "end"]
+"motion.half_page_down" = ["ctrl+d", "pagedown"]
+"motion.half_page_up" = ["ctrl+u", "pageup"]
+"op.delete" = ["d"]
+"op.yank" = ["y"]
+"edit.paste_after" = ["p"]
+"edit.paste_before" = ["P"]
+"edit.undo" = ["u"]
+"edit.redo" = ["ctrl+r"]
+"search.open" = ["/"]
+"search.next" = ["n"]
+"search.prev" = ["N"]
+"focus.up" = ["esc"]
+"app.help" = ["?"]
+"app.command_bar" = [":"]
+
+[keys."notebook.normal"]
+# j/k move one row through sources and outputs; J/K move several. ]] and [[
+# jump between cells; } and { also stop at each cell's outputs.
+"motion.fast_down" = ["J"]
+"motion.fast_up" = ["K"]
+"motion.cell_next" = ["] ]"]
+"motion.cell_prev" = ["[ ["]
+"motion.item_next" = ["}"]
+"motion.item_prev" = ["{"]
+"app.quit" = ["q"]
+"doc.save" = ["w"]
+"doc.save_force" = ["W"]
+"cell.enter_normal" = ["i", "l"]
+"cell.append_end" = ["A"]
+"cell.insert_below" = ["a", "o"]
+"cell.insert_above" = ["b", "O"]
+"cell.run" = ["enter"]
+# On a selected output: cycle preview / full / hidden. On a source: run.
+"output.cycle_view" = ["space"]
+"output.next_tab" = ["tab"]
+"cell.run_and_advance" = ["r"]
+"cell.run_all" = ["X"]
+"cell.toggle_kind" = ["t"]
+"cell.toggle_collapse" = ["z a"]
+"cell.focus_output" = ["z o"]
+"cell.edit_external" = ["ctrl+g"]
+"cell.clear_outputs" = ["c"]
+"cell.format" = ["f"]
+"kernel.restart" = ["R"]
+"mark.set" = ["m"]
+"mark.jump" = ["'"]
+
+[keys."line.motions"]
+"motion.line_start" = ["0", "home"]
+"motion.line_first_nonblank" = ["^"]
+"motion.current_line" = ["_"]
+"motion.line_end" = ["$", "end"]
+
+# Motions inside a block of text: a cell's source or an output.
+[keys."text.motions"]
+"motion.left" = ["h", "left", "backspace"]
+"motion.right" = ["l", "right", "space"]
+"motion.word_next" = ["w"]
+"motion.word_back" = ["b"]
+"motion.word_end" = ["e"]
+"motion.bigword_next" = ["W"]
+"motion.bigword_back" = ["B"]
+"motion.bigword_end" = ["E"]
+"motion.paragraph_next" = ["}"]
+"motion.paragraph_prev" = ["{"]
+"motion.match_pair" = ["%"]
+"motion.find_forward" = ["f"]
+"motion.find_backward" = ["F"]
+"motion.till_forward" = ["t"]
+"motion.till_backward" = ["T"]
+"motion.repeat_find" = [";"]
+"motion.repeat_find_reverse" = [","]
+"edit.yank_line" = ["Y"]
+"visual.char" = ["v"]
+"visual.line" = ["V"]
+
+[keys."cell.normal"]
+"cell.run" = ["enter"]
+"cell.enter_insert" = ["i"]
+"cell.append_char" = ["a"]
+"edit.insert_line_start" = ["I"]
+"edit.append_line_end" = ["A"]
+"edit.open_below" = ["o"]
+"edit.open_above" = ["O"]
+"cell.toggle_expand_split" = ["ctrl+o"]
+"cell.split_at_cursor" = ["ctrl+\\"]
+"cell.edit_external" = ["ctrl+g"]
+"op.change" = ["c"]
+"op.indent" = [">"]
+"op.dedent" = ["<"]
+"edit.delete_char" = ["x", "delete"]
+"edit.delete_char_back" = ["X"]
+"edit.substitute" = ["s"]
+"edit.substitute_line" = ["S"]
+"edit.delete_to_eol" = ["D"]
+"edit.change_to_eol" = ["C"]
+"edit.replace_char" = ["r"]
+"edit.toggle_case" = ["~"]
+"edit.join_lines" = ["J"]
+"intel.inspect_doc" = ["K"]
+
+# Operators act on the selection immediately in visual mode.
+[keys."cell.visual"]
+"visual.swap_ends" = ["o"]
+"op.change" = ["c"]
+"op.indent" = [">"]
+"op.dedent" = ["<"]
+"edit.delete_char" = ["x", "delete"]
+"edit.substitute" = ["s"]
+"edit.substitute_line" = ["S"]
+"edit.delete_to_eol" = ["D", "X"]
+"edit.change_to_eol" = ["C"]
+"edit.replace_char" = ["r"]
+"edit.toggle_case" = ["~"]
+"edit.join_lines" = ["J"]
+"edit.insert_line_start" = ["I"]
+"edit.append_line_end" = ["A"]
+
+# Outputs are read-only text: every motion, visual mode, and yank.
+[keys."output.normal"]
+"output.jump" = ["enter"]
+"output.next_tab" = ["tab"]
+
+[keys."output.visual"]
+"visual.swap_ends" = ["o"]
+
+[keys."text.pending"]
+"textobj.inner_word" = ["i w"]
+"textobj.around_word" = ["a w"]
+"textobj.inner_bigword" = ["i W"]
+"textobj.around_bigword" = ["a W"]
+"textobj.inner_dquote" = ["i \""]
+"textobj.around_dquote" = ["a \""]
+"textobj.inner_squote" = ["i '"]
+"textobj.around_squote" = ["a '"]
+"textobj.inner_backtick" = ["i `"]
+"textobj.around_backtick" = ["a `"]
+"textobj.inner_paren" = ["i (", "i )", "i b"]
+"textobj.around_paren" = ["a (", "a )", "a b"]
+"textobj.inner_bracket" = ["i [", "i ]"]
+"textobj.around_bracket" = ["a [", "a ]"]
+"textobj.inner_brace" = ["i {", "i }", "i B"]
+"textobj.around_brace" = ["a {", "a }", "a B"]
+"textobj.inner_angle" = ["i <", "i >"]
+"textobj.around_angle" = ["a <", "a >"]
+"textobj.inner_paragraph" = ["i p"]
+"textobj.around_paragraph" = ["a p"]
+
+# Editing keys shared by every multi-line text entry (cell insert, pdb input).
+# Alt/Option+arrows arrive as alt+b / alt+f, like readline.
+[keys."text.insert"]
+"edit.backspace" = ["backspace", "ctrl+h"]
+"edit.delete_char" = ["delete"]
+"edit.delete_word_back" = ["ctrl+w", "alt+backspace", "ctrl+backspace"]
+"edit.delete_to_line_start" = ["ctrl+u"]
+"edit.delete_to_line_end" = ["ctrl+k"]
+"motion.left" = ["left"]
+"motion.right" = ["right"]
+"motion.up" = ["up"]
+"motion.down" = ["down"]
+"motion.line_start" = ["home", "ctrl+a"]
+"motion.line_end" = ["end", "ctrl+e"]
+"motion.word_back" = ["alt+b"]
+"motion.word_next" = ["alt+f"]
+
+[keys."cell.insert"]
+"focus.up" = ["esc", "j j"]
+"edit.newline" = ["enter", "ctrl+j", "alt+enter"]
+"edit.indent" = ["tab"]
+"edit.dedent" = ["backtab"]
+"intel.complete" = ["ctrl+space"]
+"cell.toggle_expand_split" = ["ctrl+o"]
+
+[keys."pdb.input"]
+"pdb.submit" = ["enter"]
+"pdb.newline" = ["ctrl+j", "alt+enter"]
+"pdb.history_prev" = ["up"]
+"pdb.history_next" = ["down"]
+"kernel.interrupt" = ["ctrl+c"]
+
+# ---------------------------------------------------------------------------
+# Macros: actions defined as steps. Steps run in order, each in whatever mode
+# is current when it is reached; "@action" runs the built-in action itself.
+
+[actions."cell.run_and_advance"]
+do = ["cell.run", "motion.cell_next"]
+
+# ---------------------------------------------------------------------------
+# Rules: "in mode M, when action A is triggered and the target matches
+# `when`, run these steps instead". The first matching rule wins; your rules
+# with new ids are checked before these. Conditions: part (source|output),
+# cell (code|markdown|raw), empty, outputs, count (true|false), line
+# (first|last|only). `with` filters an operator's target (`dd` targets the
+# operator itself). A step that fails, such as entering an output on a cell
+# without one, stops the rest.
+
+# Notebook: open a cell or an output.
+
+[[rules]]
+id = "notebook.open_output"
+title = "Reads the output from this line"
+mode = "notebook.normal"
+on = ["cell.enter_normal"]
+when = { part = "output" }
+do = ["mode.output.normal"]
+
+[[rules]]
+id = "notebook.open_empty_cell"
+title = "Starts typing in the empty cell"
+mode = "notebook.normal"
+on = ["cell.enter_normal"]
+when = { part = "source", empty = true }
+do = ["mode.cell.insert"]
+
+[[rules]]
+id = "notebook.open_cell"
+title = "Opens the cell on this line"
+mode = "notebook.normal"
+on = ["cell.enter_normal"]
+do = ["mode.cell.normal"]
+
+[[rules]]
+id = "notebook.insert"
+title = "Starts typing on this line"
+mode = "notebook.normal"
+on = ["cell.enter_insert"]
+do = ["mode.cell.insert"]
+
+[[rules]]
+id = "notebook.append_end"
+title = "Starts typing at the end of the cell"
+mode = "notebook.normal"
+on = ["cell.append_end"]
+do = ["mode.cell.normal", "motion.bottom", "motion.line_end", "mode.cell.insert", "motion.right"]
+
+[[rules]]
+id = "notebook.focus_output"
+title = "Reads the cell's output"
+mode = "notebook.normal"
+on = ["cell.focus_output"]
+do = ["mode.output.normal"]
+
+# Notebook: a line motion opens the selected line for typing.
+
+[[rules]]
+id = "notebook.line_motion_types"
+title = "Starts typing at that point on this line"
+mode = "notebook.normal"
+on = ["@line_motions"]
+when = { part = "source" }
+do = ["mode.cell.normal", "@action", "mode.cell.insert"]
+
+[[rules]]
+id = "notebook.line_end_motion_appends"
+title = "Starts typing after the last character on this line"
+mode = "notebook.normal"
+on = ["@line_end_motions"]
+when = { part = "source" }
+do = ["mode.cell.normal", "@action", "mode.cell.insert", "motion.right"]
+
+[[rules]]
+id = "notebook.line_motion_reads_output"
+title = "Reads the output, moved to that point on this line"
+mode = "notebook.normal"
+on = ["@line_motions", "@line_end_motions"]
+when = { part = "output" }
+do = ["mode.output.normal", "@action"]
+
+# Cell normal: the ways into insert mode.
+
+[[rules]]
+id = "cell.insert"
+title = "Types before the cursor"
+mode = "cell.normal"
+on = ["cell.enter_insert"]
+do = ["mode.cell.insert"]
+
+[[rules]]
+id = "cell.append"
+title = "Types after the cursor"
+mode = "cell.normal"
+on = ["cell.append_char"]
+do = ["mode.cell.insert", "motion.right"]
+
+[[rules]]
+id = "cell.insert_line_start"
+title = "Types at the first non-blank character"
+mode = "cell.normal"
+on = ["edit.insert_line_start"]
+do = ["motion.line_first_nonblank", "mode.cell.insert"]
+
+[[rules]]
+id = "cell.append_line_end"
+title = "Types at the end of the line"
+mode = "cell.normal"
+on = ["edit.append_line_end"]
+do = ["motion.line_end", "mode.cell.insert", "motion.right"]
+
+[[rules]]
+id = "cell.open_below"
+title = "Types on a new line below"
+mode = "cell.normal"
+on = ["edit.open_below"]
+do = ["edit.line_below", "mode.cell.insert"]
+
+[[rules]]
+id = "cell.open_above"
+title = "Types on a new line above"
+mode = "cell.normal"
+on = ["edit.open_above"]
+do = ["edit.line_above", "mode.cell.insert"]
+
+# Cells: visual mode, and back out.
+
+[[rules]]
+id = "cell.visual_char"
+mode = ["cell.normal", "cell.visual_line"]
+on = ["visual.char"]
+do = ["mode.cell.visual"]
+
+[[rules]]
+id = "cell.visual_line"
+mode = ["cell.normal", "cell.visual"]
+on = ["visual.line"]
+do = ["mode.cell.visual_line"]
+
+[[rules]]
+id = "cell.visual_char_off"
+mode = "cell.visual"
+on = ["visual.char"]
+do = ["mode.cell.normal"]
+
+[[rules]]
+id = "cell.visual_line_off"
+mode = "cell.visual_line"
+on = ["visual.line"]
+do = ["mode.cell.normal"]
+
+[[rules]]
+id = "cell.visual_insert_start"
+title = "Types at the start of the selection"
+mode = ["cell.visual", "cell.visual_line"]
+on = ["edit.insert_line_start"]
+do = ["selection.start", "mode.cell.insert"]
+
+[[rules]]
+id = "cell.visual_insert_end"
+title = "Types at the end of the selection"
+mode = ["cell.visual", "cell.visual_line"]
+on = ["edit.append_line_end"]
+do = ["selection.end", "mode.cell.insert"]
+
+[[rules]]
+id = "cell.back_to_notebook"
+title = "Back to the notebook, on the cursor's line"
+mode = "cell.normal"
+on = ["focus.up"]
+do = ["mode.notebook.normal"]
+
+[[rules]]
+id = "cell.visual_cancel"
+title = "Cancels the selection"
+mode = ["cell.visual", "cell.visual_line"]
+on = ["focus.up"]
+do = ["mode.cell.normal"]
+
+[[rules]]
+id = "cell.insert_done"
+title = "Back to normal mode, one character left, like vim"
+mode = "cell.insert"
+on = ["focus.up"]
+do = ["motion.left", "mode.cell.normal"]
+
+# Outputs.
+
+[[rules]]
+id = "output.visual_char"
+mode = ["output.normal", "output.visual_line"]
+on = ["visual.char"]
+do = ["mode.output.visual"]
+
+[[rules]]
+id = "output.visual_line"
+mode = ["output.normal", "output.visual"]
+on = ["visual.line"]
+do = ["mode.output.visual_line"]
+
+[[rules]]
+id = "output.visual_char_off"
+mode = "output.visual"
+on = ["visual.char"]
+do = ["mode.output.normal"]
+
+[[rules]]
+id = "output.visual_line_off"
+mode = "output.visual_line"
+on = ["visual.line"]
+do = ["mode.output.normal"]
+
+[[rules]]
+id = "output.back_to_notebook"
+title = "Back to the notebook, on the cursor's line"
+mode = "output.normal"
+on = ["focus.up"]
+do = ["mode.notebook.normal"]
+
+[[rules]]
+id = "output.visual_cancel"
+title = "Cancels the selection"
+mode = ["output.visual", "output.visual_line"]
+on = ["focus.up"]
+do = ["mode.output.normal"]
+
+[[rules]]
+id = "output.goto_traceback"
+title = "Opens the cell and line this traceback line names"
+mode = "output.normal"
+on = ["output.jump"]
+do = ["output.goto_traceback", "mode.cell.normal"]
