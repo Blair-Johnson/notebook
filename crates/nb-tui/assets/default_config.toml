@@ -9,6 +9,8 @@ output_default_view = "preview"
 notice_secs = 4
 follow_output = true
 scrolloff = 2
+scrolloff_pct = 10
+menu_scrolloff_pct = 10
 fast_scroll_rows = 5
 wheel_scroll_lines = 3
 

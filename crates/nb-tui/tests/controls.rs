@@ -367,3 +367,80 @@ fn primitive_rows_and_unsendable_keys_are_labelled() {
     assert!(!text.contains("built-in"), "{text}");
     assert!(text.contains("⚠ ctrl+,"), "ctrl+, is flagged:\n{text}");
 }
+
+/// The row on screen showing the selected Controls entry, and the rows of
+/// the list area (from the header to the rule above the detail).
+fn controls_selection(c: &mut Coordinator, height: u16) -> (usize, usize, usize) {
+    let snap = c.settings.snapshot().clone();
+    let rows = c.overlays.settings.control_rows(&snap.keymap);
+    let title = rows[c.overlays.settings.selected_row].title.clone();
+    let lines = screen_text(c, 110, height);
+    let header = lines.iter().position(|line| line.contains("What happens in")).expect("header");
+    let rule = lines
+        .iter()
+        .position(|line| line.contains("│────────────────────────────────────────"))
+        .expect("rule");
+    let at = (header + 1..rule)
+        .find(|&y| lines[y].contains(&format!(" {title} ")))
+        .unwrap_or_else(|| panic!("{title:?} is not on screen:\n{}", lines.join("\n")));
+    (header + 1, at, rule)
+}
+
+#[test]
+fn menus_keep_rows_of_context_around_the_selection() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    open_controls(&mut c);
+    // 41 rows tall: the list has 24 rows, so 10% keeps 2 below and above.
+    for step in 0..30 {
+        let (first, at, end) = controls_selection(&mut c, 41);
+        assert!(at >= first, "step {step}");
+        let below = end - 1 - at;
+        let total = c.overlays.settings.control_rows(&c.settings.snapshot().keymap).len();
+        if c.overlays.settings.selected_row + 2 < total {
+            assert!(below >= 2, "step {step}: only {below} rows below the selection");
+        }
+        c.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), Instant::now());
+    }
+    // Moving back up inside the view does not scroll it (drawn at one height).
+    controls_selection(&mut c, 41);
+    let top = c.overlays.settings.list_top.get();
+    for _ in 0..3 {
+        c.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), Instant::now());
+        controls_selection(&mut c, 41);
+        assert_eq!(c.overlays.settings.list_top.get(), top);
+    }
+}
+
+#[test]
+fn the_notebook_keeps_a_margin_around_the_edit_cursor() {
+    let source: String = (0..60).map(|n| format!("line_{n} = {n}\n")).collect();
+    let mut c = coordinator(&[(source.trim_end(), "")]);
+    keys(&mut c, "i");
+    let height = c.last_geometry.viewport_rect.height as u32;
+    for _ in 0..30 {
+        keys(&mut c, "j");
+        let cursor = cursor(&c, 0).0 as u32;
+        // Row 0 of the cell is its border; source line n is on row n + 1.
+        let row = c.layout_cache.heights().prefix_sum(0) + 1 + cursor;
+        assert!(
+            row + 2 < c.scroll_row + height,
+            "line {cursor}: fewer than 2 rows below the cursor (scroll {})",
+            c.scroll_row
+        );
+    }
+}
+
+#[test]
+fn the_scroll_margin_percentage_is_a_setting() {
+    let source: String = (0..60).map(|n| format!("line_{n} = {n}\n")).collect();
+    let mut c = configured(&[(source.trim_end(), "")], "[display]\nscrolloff = 0\nscrolloff_pct = 40\n");
+    keys(&mut c, "i");
+    let height = c.last_geometry.viewport_rect.height as u32;
+    let margin = (height * 40 + 50) / 100;
+    let margin = margin.min((height - 1) / 2);
+    for _ in 0..20 {
+        keys(&mut c, "j");
+    }
+    let row = 1 + cursor(&c, 0).0 as u32;
+    assert_eq!(c.scroll_row + height - 1 - row, margin, "the cursor sits {margin} rows above the bottom");
+}

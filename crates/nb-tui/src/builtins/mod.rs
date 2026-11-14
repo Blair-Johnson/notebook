@@ -981,12 +981,36 @@ impl Plugin for BuiltinsPlugin {
             reg,
             "display.scrolloff",
             "display",
-            "Scroll margin",
-            "Rows kept between the cursor and the top or bottom edge while moving",
+            "Scroll margin (rows)",
+            "Fewest rows kept between the notebook cursor and the top or bottom edge; the larger of this and the percentage applies",
             SettingKind::Int {
                 default: 2,
                 min: 0,
                 max: 100,
+            },
+        );
+        setting(
+            reg,
+            "display.scrolloff_pct",
+            "display",
+            "Scroll margin (%)",
+            "Part of the notebook view kept between the cursor and the top or bottom edge, like vim's scrolloff: 10 keeps the cursor in the middle 80% until the start or end",
+            SettingKind::Int {
+                default: 10,
+                min: 0,
+                max: 50,
+            },
+        );
+        setting(
+            reg,
+            "display.menu_scrolloff_pct",
+            "display",
+            "Menu scroll margin (%)",
+            "Part of a menu or list (settings, controls, command palette) kept between the selection and the top or bottom edge",
+            SettingKind::Int {
+                default: 10,
+                min: 0,
+                max: 50,
             },
         );
         setting(

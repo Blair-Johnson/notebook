@@ -409,7 +409,11 @@ impl Coordinator {
         self.output_region_rows(text_w);
         let followed = self.follow_focus;
         let notebook_level = matches!(self.focus.base(), FocusLayer::Notebook { .. });
-        let scrolloff = u32::from(snap.core.scrolloff).min(height.saturating_sub(1) / 2);
+        let scrolloff = crate::scroll::margin(
+            height as usize,
+            snap.core.scrolloff,
+            snap.core.scrolloff_pct,
+        ) as u32;
         if notebook_level {
             // Keeps the notebook cursor on a valid row of its cell.
             self.nb_cursor();
@@ -500,22 +504,24 @@ impl Coordinator {
         let entered = matches!(self.focus.base(), FocusLayer::OutputFocus { .. });
         let off_screen =
             |row: u32, scroll: u32| row < scroll || row >= scroll + height;
+        // Every cursor keeps `scrolloff` rows of context on both sides.
         let (want_top, want_bottom) = match editing {
             Some(id) if id == &self.selected_cell => {
                 let row = top + 1 + self.cursor_visual_row(id, text_w);
-                (row, row + 1)
+                (row.saturating_sub(scrolloff), row + 1 + scrolloff)
             }
             _ if entered => {
                 let row = output_region
                     .map_or(0, |(cursor_row, scroll, _)| cursor_row.saturating_sub(scroll));
                 // The text starts below the block's header divider.
-                (outputs_top + 1 + row, outputs_top + row + 2)
+                let row = outputs_top + 1 + row;
+                (row.saturating_sub(scrolloff), row + 1 + scrolloff)
             }
             // A cell jump to an off-screen target: its top (the border or
-            // divider above the cursor row) at the top.
+            // divider above the cursor row) at the top, below the margin.
             _ if nb_global.is_some_and(|row| self.align_jump && off_screen(row, self.scroll_row)) => {
                 let row = nb_global.unwrap_or(top).saturating_sub(1);
-                (row, row + 1)
+                (row.saturating_sub(scrolloff), row + 1)
             }
             // The notebook cursor row, with a margin.
             _ if nb_global.is_some() => {

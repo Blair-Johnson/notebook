@@ -289,7 +289,9 @@ fn draw_palette(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, them
     }
     let rows = usize::from(list.height);
     let selected = palette.selected.min(entries.len() - 1);
-    let top = selected.saturating_sub(rows.saturating_sub(1));
+    let margin = crate::scroll::margin(rows, 0, view.settings.menu_scrolloff_pct);
+    let top = crate::scroll::follow(palette.top.get(), selected, entries.len(), rows, margin);
+    palette.top.set(top);
     for (offset, entry) in entries.iter().skip(top).take(rows).enumerate() {
         let is_selected = top + offset == selected;
         let base = if is_selected {
@@ -348,7 +350,7 @@ fn draw_settings(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, the
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), Rect::new(inner.x, inner.y, inner.width, 1));
     if state.active_tab == CONTROLS_TAB {
-        return draw_controls_tab(frame, state, keymap, theme, inner);
+        return draw_controls_tab(frame, state, keymap, theme, inner, view.settings.menu_scrolloff_pct);
     }
     let filter = if state.filter.is_empty() {
         Span::styled(" type to filter", Style::default().fg(p.muted))
@@ -379,7 +381,9 @@ fn draw_settings(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, the
     };
     {
         let settings = state.filtered_settings(view.registry);
-        let top = state.selected_row.saturating_sub(rows.saturating_sub(1));
+        let margin = crate::scroll::margin(rows, 0, view.settings.menu_scrolloff_pct);
+        let top = crate::scroll::follow(state.list_top.get(), state.selected_row, settings.len(), rows, margin);
+        state.list_top.set(top);
         for (offset, spec) in settings.iter().skip(top).take(rows).enumerate() {
             let selected = top + offset == state.selected_row;
             let value = setting_value_text(&spec.kind, view.setting_values.get(&spec.id));
@@ -415,6 +419,7 @@ fn draw_controls_tab(
     keymap: &Keymap,
     theme: &Theme,
     inner: Rect,
+    menu_scrolloff_pct: u16,
 ) {
     let p = &theme.palette;
     let muted = Style::default().fg(p.muted);
@@ -508,7 +513,9 @@ fn draw_controls_tab(
             Rect::new(inner.x, inner.y + 3, inner.width, 1),
         );
         let rules = keymap.controls.rules_for(&mode.id, &row.action);
-        let top = rule_index.saturating_sub(visible.saturating_sub(1));
+        let margin = crate::scroll::margin(visible, 0, menu_scrolloff_pct);
+        let top = crate::scroll::follow(state.rules_top.get(), rule_index, rules.len(), visible, margin);
+        state.rules_top.set(top);
         for (offset, rule) in rules.iter().skip(top).take(visible).enumerate() {
             let selected = top + offset == rule_index;
             let style = base_style(selected);
@@ -547,7 +554,9 @@ fn draw_controls_tab(
                 list,
             );
         }
-        let top = state.selected_row.saturating_sub(visible.saturating_sub(1));
+        let margin = crate::scroll::margin(visible, 0, menu_scrolloff_pct);
+        let top = crate::scroll::follow(state.list_top.get(), state.selected_row, rows.len(), visible, margin);
+        state.list_top.set(top);
         for (offset, entry) in rows.iter().skip(top).take(visible).enumerate() {
             let selected = top + offset == state.selected_row;
             let style = base_style(selected);

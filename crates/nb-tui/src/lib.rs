@@ -19,6 +19,7 @@ pub mod layout;
 pub mod overlays;
 pub mod platform;
 pub mod render;
+pub mod scroll;
 pub mod vim;
 
 pub use builtins::BuiltinsPlugin;

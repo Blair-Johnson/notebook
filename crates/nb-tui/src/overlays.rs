@@ -1,6 +1,7 @@
 //! State models for modals, prompts, logs, settings menu, and the docked `pdb` input bar.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
@@ -135,6 +136,8 @@ pub enum ConfirmAction {
 pub struct CommandPaletteState {
     pub query: String,
     pub selected: usize,
+    /// First visible entry, moved by drawing (see `scroll::follow`).
+    pub top: Cell<usize>,
 }
 
 /// What choosing a palette entry does.
@@ -163,6 +166,7 @@ impl CommandPaletteState {
         Self {
             query: String::new(),
             selected: 0,
+            top: Cell::new(0),
         }
     }
 
@@ -370,6 +374,12 @@ pub struct SettingsModalState {
     pub rules_view: Option<usize>,
     /// The last "try keys" trace.
     pub explain: Vec<String>,
+    /// First visible row of the settings or Controls list, and of the rules
+    /// panel. Drawing moves them so the selection keeps a margin of context
+    /// (`display.menu_scrolloff_pct`); they are remembered view positions,
+    /// like the notebook's scroll row.
+    pub list_top: Cell<usize>,
+    pub rules_top: Cell<usize>,
 }
 
 impl SettingsModalState {
