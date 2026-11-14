@@ -140,6 +140,7 @@ pub fn render_app(
         _ => None,
     };
     cache.default_output_view = view.settings.output_default_view;
+    cache.preview_end = view.settings.output_preview_end;
     cache.sync_viewport(
         view.document,
         output_views,

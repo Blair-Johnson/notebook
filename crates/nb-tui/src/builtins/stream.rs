@@ -3,7 +3,7 @@
 use nb_core::output::TRUNCATION_MARKER;
 use nb_core::{OutputData, OutputItem, StreamBuffer};
 use nb_sdk::{
-    InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
+    ClipEnd, InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
 use ratatui::text::{Line, Span};
@@ -42,7 +42,8 @@ pub struct StreamOutputView {
     measured_truncated: usize,
     total_rows: u32,
     shown_rows: u32,
-    scroll_offset: Option<u32>, // None = follow tail
+    scroll_offset: Option<u32>, // None = rest at the `keep` end
+    keep: ClipEnd,
     rev: u64,
 }
 
@@ -64,8 +65,12 @@ impl StreamOutputView {
     }
 
     fn visible_start(&self) -> u32 {
-        self.scroll_offset
-            .unwrap_or_else(|| self.total_rows.saturating_sub(self.shown_rows))
+        self.scroll_offset.unwrap_or_else(|| self.default_start())
+    }
+
+    /// Where the view rests until scrolled: the end `keep` names.
+    fn default_start(&self) -> u32 {
+        self.keep.first_row(self.total_rows, self.shown_rows)
     }
 
     fn text(item: &OutputItem) -> &str {
@@ -202,12 +207,10 @@ impl StreamOutputView {
     }
 
     fn move_scroll(&mut self, delta: i64) {
-        let mut offset = i64::from(self.scroll_offset.unwrap_or_else(|| self.max_scroll()));
-        offset = (offset + delta).clamp(0, i64::from(self.max_scroll()));
-        self.scroll_offset = Some(offset as u32);
-        if offset as u32 == self.max_scroll() && delta >= 0 {
-            self.scroll_offset = None;
-        }
+        let current = i64::from(self.visible_start());
+        let next = (current + delta).clamp(0, i64::from(self.max_scroll())) as u32;
+        // Back at the resting end: rest there again (and follow it).
+        self.scroll_offset = (next != self.default_start()).then_some(next);
     }
 
     fn command_is(input: &ResolvedInput, name: &str) -> bool {
@@ -246,7 +249,9 @@ impl OutputView for StreamOutputView {
         width: u16,
         _theme: &Theme,
         cap_rows: Option<u16>,
+        keep: ClipEnd,
     ) -> OutputMetrics {
+        self.keep = keep;
         self.ensure_index(Self::buffer(item), width);
         self.shown_rows = cap_rows
             .map_or(self.total_rows, u32::from)
@@ -259,6 +264,7 @@ impl OutputView for StreamOutputView {
             total_rows: self.total_rows,
             shown_rows: self.shown_rows,
             clipped: self.total_rows > self.shown_rows,
+            first_shown: self.visible_start(),
         }
     }
 
@@ -546,9 +552,9 @@ mod tests {
         for (step, chunk) in chunks.iter().cycle().take(60).enumerate() {
             buffer.push_chunk(chunk);
             let item = item(&buffer);
-            let metrics = view.measure(&item, 10, &theme, None);
+            let metrics = view.measure(&item, 10, &theme, None, nb_sdk::ClipEnd::Bottom);
             let mut fresh = StreamOutputView::default();
-            let expected = fresh.measure(&item, 10, &theme, None);
+            let expected = fresh.measure(&item, 10, &theme, None, nb_sdk::ClipEnd::Bottom);
             assert_eq!(metrics, expected, "step {step}");
             assert_eq!(view.line_byte_starts, fresh.line_byte_starts, "step {step}");
             assert_eq!(view.line_row_starts, fresh.line_row_starts, "step {step}");

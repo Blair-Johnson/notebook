@@ -959,6 +959,17 @@ impl Plugin for BuiltinsPlugin {
         );
         setting(
             reg,
+            "display.output_preview_end",
+            "display",
+            "Preview shows",
+            "Which part of an output taller than the preview rows is shown: its first rows (top) or its last, following it as it grows (bottom)",
+            SettingKind::Choice {
+                default: "top",
+                options: &["top", "bottom"],
+            },
+        );
+        setting(
+            reg,
             "display.notice_secs",
             "display",
             "Notice duration",

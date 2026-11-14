@@ -23,6 +23,37 @@ pub struct OutputMetrics {
     pub total_rows: u32,
     pub shown_rows: u32,
     pub clipped: bool,
+    /// The first row shown when clipped (0 when the top is shown).
+    pub first_shown: u32,
+}
+
+/// Which end of an output taller than its preview stays visible
+/// (`display.output_preview_end`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ClipEnd {
+    /// The first rows.
+    #[default]
+    Top,
+    /// The last rows, following the output as it grows.
+    Bottom,
+}
+
+impl ClipEnd {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+
+    /// The first row shown of `total` rows when `shown` fit.
+    pub fn first_row(self, total: u32, shown: u32) -> u32 {
+        match self {
+            Self::Top => 0,
+            Self::Bottom => total.saturating_sub(shown),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,12 +96,15 @@ pub trait OutputView: Send {
         None
     }
     fn view_revision(&self) -> u64;
+    /// Measure at `width`, showing at most `cap_rows` (all when `None`) and,
+    /// when clipped, the `keep` end.
     fn measure(
         &mut self,
         item: &OutputItem,
         width: u16,
         theme: &Theme,
         cap_rows: Option<u16>,
+        keep: ClipEnd,
     ) -> OutputMetrics;
     fn render_slice(
         &self,

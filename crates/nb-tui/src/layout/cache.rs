@@ -14,7 +14,7 @@ use syntect::highlighting::{HighlightState, Highlighter, Theme as SyntectTheme, 
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use unicode_width::UnicodeWidthChar;
 use nb_core::{Cell, CellId, CellKind, CellRevisions, Document, OutputDisplay, OutputId};
-use nb_sdk::{OutputView, Theme};
+use nb_sdk::{ClipEnd, OutputView, Theme};
 
 pub const RENDER_CACHE_BUDGET_BYTES: usize = 64 << 20;
 
@@ -28,6 +28,7 @@ pub struct CellLayoutKey {
     pub raw_source: bool,
     pub default_view: OutputDisplay,
     pub preview_rows: u16,
+    pub preview_end: ClipEnd,
 }
 
 #[derive(Debug)]
@@ -58,6 +59,8 @@ pub struct OutputRows {
     pub first_row: u32,
     pub shown: u32,
     pub total: u32,
+    /// The output's first row shown (rows above it are clipped).
+    pub first_shown: u32,
 }
 
 impl CachedCellLayout {
@@ -91,6 +94,8 @@ pub struct LayoutCache {
     line_highlights: HashMap<CellId, LineHighlights>,
     /// `display.output_default_view`, set by the caller before syncing.
     pub default_output_view: OutputDisplay,
+    /// `display.output_preview_end`, set by the caller before syncing.
+    pub preview_end: ClipEnd,
 }
 
 struct LineHighlights {
@@ -121,6 +126,7 @@ impl Default for LayoutCache {
             theme_set: ThemeSet::load_defaults(),
             line_highlights: HashMap::new(),
             default_output_view: OutputDisplay::Preview,
+            preview_end: ClipEnd::default(),
         }
     }
 }
@@ -244,6 +250,7 @@ impl LayoutCache {
             raw_source,
             default_view: self.default_output_view,
             preview_rows: max_output_rows,
+            preview_end: self.preview_end,
         };
         if let Some(cached) = self.cells.get_mut(cell_id) {
             if cached.key == key {
@@ -273,7 +280,7 @@ impl LayoutCache {
                 .flat_map(|section| section.items.iter())
                 .any(|output| {
                     output_views.get_mut(&output.id).is_some_and(|view| {
-                        let metrics = view.measure(output, width, theme, preview);
+                        let metrics = view.measure(output, width, theme, preview, self.preview_end);
                         metrics.total_rows > metrics.shown_rows
                     })
                 });
@@ -294,15 +301,17 @@ impl LayoutCache {
                     for section in &sections {
                         row += 1;
                         for output in &section.items {
-                            let (shown, total) = output_views.get_mut(&output.id).map_or((1, 1), |view| {
-                                let metrics = view.measure(output, width, theme, cap);
-                                (metrics.shown_rows.max(1), metrics.total_rows)
-                            });
+                            let (shown, total, first_shown) =
+                                output_views.get_mut(&output.id).map_or((1, 1, 0), |view| {
+                                    let metrics = view.measure(output, width, theme, cap, self.preview_end);
+                                    (metrics.shown_rows.max(1), metrics.total_rows, metrics.first_shown)
+                                });
                             output_rows.push(OutputRows {
                                 output_id: output.id,
                                 first_row: row,
                                 shown,
                                 total,
+                                first_shown,
                             });
                             stops.extend(row..row + shown);
                             row += shown;

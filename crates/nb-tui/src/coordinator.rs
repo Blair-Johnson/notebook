@@ -468,6 +468,7 @@ impl Coordinator {
             _ => None,
         };
         self.layout_cache.default_output_view = snap.core.output_default_view;
+        self.layout_cache.preview_end = snap.core.output_preview_end;
         self.layout_cache.sync_viewport(
             &self.document,
             &mut self.output_views,
@@ -2555,6 +2556,7 @@ impl Coordinator {
     fn nb_layout(&mut self, index: usize) -> Option<(Vec<u32>, Option<u32>)> {
         let snap = self.settings.snapshot().clone();
         self.layout_cache.default_output_view = snap.core.output_default_view;
+        self.layout_cache.preview_end = snap.core.output_preview_end;
         let cached = self.layout_cache.ensure_measured(
             &self.document,
             index,
@@ -2892,8 +2894,8 @@ impl Coordinator {
             .find(|(id, _)| *id == rows.output_id)?
             .1;
         let segments = vim::wrap_segments(&item.plain_text(), self.text_width_now());
-        // Clipped outputs show their last rows.
-        let base = rows.total.saturating_sub(rows.shown) as usize;
+        // Rows above `first_shown` are clipped.
+        let base = rows.first_shown as usize;
         let &(line, col, _) = segments
             .get(base + offset as usize)
             .or_else(|| segments.last())?;
@@ -2922,7 +2924,7 @@ impl Coordinator {
             .iter()
             .position(|&(row, _, _)| row >= line - start)
             .unwrap_or(segments.len().saturating_sub(1)) as u32;
-        let base = rows.total.saturating_sub(rows.shown);
+        let base = rows.first_shown;
         let offset = wrapped.saturating_sub(base).min(rows.shown.saturating_sub(1));
         Some(rows.first_row + offset)
     }

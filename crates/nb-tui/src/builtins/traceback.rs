@@ -2,7 +2,7 @@
 
 use nb_core::{CellId, OutputData, OutputItem};
 use nb_sdk::{
-    InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
+    ClipEnd, InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
 use ratatui::{
@@ -42,6 +42,7 @@ pub struct TracebackView {
     total_rows: u32,
     shown_rows: u32,
     scroll_offset: Option<u32>,
+    keep: ClipEnd,
     /// Built lines for one (output revision, width, folding): building parses
     /// the ANSI of the whole traceback, too slow to repeat every frame.
     built: RefCell<Option<BuiltLines>>,
@@ -102,8 +103,12 @@ impl TracebackView {
     }
 
     fn visible_start(&self) -> u32 {
-        self.scroll_offset
-            .unwrap_or_else(|| self.total_rows.saturating_sub(self.shown_rows))
+        self.scroll_offset.unwrap_or_else(|| self.default_start())
+    }
+
+    /// Where the view rests until scrolled: the end `keep` names.
+    fn default_start(&self) -> u32 {
+        self.keep.first_row(self.total_rows, self.shown_rows)
     }
 
     fn max_scroll(&self) -> u32 {
@@ -242,7 +247,9 @@ impl OutputView for TracebackView {
         width: u16,
         _theme: &Theme,
         cap_rows: Option<u16>,
+        keep: ClipEnd,
     ) -> OutputMetrics {
+        self.keep = keep;
         let (total_rows, max_frame) = self.with_lines(item, width.max(1), |lines| {
             (lines.len() as u32, max_frame(lines))
         });
@@ -259,6 +266,7 @@ impl OutputView for TracebackView {
             total_rows: self.total_rows,
             shown_rows: self.shown_rows,
             clipped: self.total_rows > self.shown_rows,
+            first_shown: self.visible_start(),
         }
     }
 
@@ -320,7 +328,7 @@ impl OutputView for TracebackView {
         }
         if Self::motion(&input, "motion.bottom").is_some() {
             self.selected_frame = max_frame;
-            self.scroll_offset = None;
+            self.scroll_offset = Some(self.max_scroll());
             return InputOutcome::Consumed;
         }
         if let Some(count) = Self::motion(&input, "motion.down") {

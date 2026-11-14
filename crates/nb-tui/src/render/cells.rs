@@ -584,21 +584,22 @@ impl CellCtx<'_> {
         let mut local = top;
         let mut text_row = 0u32;
         for section in &sections {
-            let measured: Vec<(u32, u32)> = section
+            let keep = self.view.settings.output_preview_end;
+            let measured: Vec<(u32, u32, u32)> = section
                 .items
                 .iter()
                 .map(|output| match output_views.get_mut(&output.id) {
                     Some(view) => {
-                        let metrics = view.measure(output, self.text_w, theme, cap);
-                        (metrics.shown_rows.max(1), metrics.total_rows)
+                        let metrics = view.measure(output, self.text_w, theme, cap, keep);
+                        (metrics.shown_rows.max(1), metrics.total_rows, metrics.first_shown)
                     }
-                    None => (1, 1),
+                    None => (1, 1, 0),
                 })
                 .collect();
             if let Some(y) = self.screen_y(local) {
                 let clipped: u32 = measured
                     .iter()
-                    .map(|(shown, total)| total.saturating_sub(*shown))
+                    .map(|(shown, total, _)| total.saturating_sub(*shown))
                     .sum();
                 let mut right = Vec::new();
                 if clipped > 0 {
@@ -611,7 +612,7 @@ impl CellCtx<'_> {
                 }
             }
             local += 1;
-            for (output, (shown, _)) in section.items.iter().zip(measured) {
+            for (output, (shown, total, first_shown)) in section.items.iter().zip(measured) {
                 // Render only the rows on screen, so a long output in full
                 // view costs no more than what is visible.
                 let start = self.cell_start + local;
@@ -630,11 +631,13 @@ impl CellCtx<'_> {
                         if let Some(line) = rendered.get((row - first) as usize).cloned() {
                             frame.render_widget(Paragraph::new(line), self.text_rect(y));
                         }
-                        self.output_hit(geometry, y, output.id, text_row + row);
+                        // The row's place in the whole output text, clipped
+                        // rows included, so a click lands on its line.
+                        self.output_hit(geometry, y, output.id, text_row + first_shown + row);
                     }
                 }
                 local += shown;
-                text_row += shown;
+                text_row += total;
             }
         }
         None

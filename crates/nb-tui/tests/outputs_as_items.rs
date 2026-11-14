@@ -305,3 +305,43 @@ fn default_output_view_comes_from_settings() {
     assert!(c.layout_cache.heights().height(0) < preview);
     assert!(screen(&mut c).contains("40 lines"));
 }
+
+fn set_preview_end(c: &mut Coordinator, end: &str) {
+    let id = nb_sdk::SettingId(std::borrow::Cow::Borrowed("display.output_preview_end"));
+    c.settings
+        .set_value(&id, nb_sdk::SettingValue::Text(end.into()), &c.registry);
+    draw(c);
+}
+
+#[test]
+fn previews_show_the_top_of_a_long_output_unless_set_to_the_bottom() {
+    let long: String = (0..40).map(|n| format!("line {n}\n")).collect();
+    let mut c = coordinator(&[("loop()", &long)]);
+    let text = screen(&mut c);
+    assert!(text.contains("line 0 ") && text.contains("line 17 "), "{text}");
+    assert!(!text.contains("line 39"), "{text}");
+    assert!(text.contains("+22 lines"), "the clipped count stays: {text}");
+
+    set_preview_end(&mut c, "bottom");
+    let text = screen(&mut c);
+    assert!(text.contains("line 39") && text.contains("line 22 "), "{text}");
+    assert!(!text.contains("line 0 "), "{text}");
+}
+
+#[test]
+fn opening_a_preview_lands_on_the_line_shown() {
+    let long: String = (0..40).map(|n| format!("line {n}\n")).collect();
+    for (end, first) in [("top", 0), ("bottom", 22)] {
+        let mut c = coordinator(&[("loop()", &long)]);
+        set_preview_end(&mut c, end);
+        keys(&mut c, "jj");
+        keys(&mut c, "i");
+        let out = c.output_text.as_ref().expect("reading the output");
+        // `jj`: the source row, then the preview's first row, then its second.
+        assert_eq!(out.buffer.cursor().row, first + 1, "{end}");
+        press(&mut c, KeyCode::Esc);
+        keys(&mut c, "i");
+        let out = c.output_text.as_ref().expect("reading again");
+        assert_eq!(out.buffer.cursor().row, first + 1, "{end}: Esc kept the line");
+    }
+}

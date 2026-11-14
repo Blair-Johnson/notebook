@@ -18,6 +18,7 @@ pub use command::{
 };
 pub use key::{Key, KeyContextId, KeyContextSpec, KeySeq};
 pub use output_view::{
+    ClipEnd,
     InputOutcome, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
 };
 pub use plugin::{ExtensionRegistry, Plugin};

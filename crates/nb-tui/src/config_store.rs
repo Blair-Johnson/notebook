@@ -24,6 +24,8 @@ pub struct CoreSettings {
     pub max_output_rows: u16,
     /// View for outputs whose cell has no view of its own.
     pub output_default_view: nb_core::OutputDisplay,
+    /// Which end of a clipped (preview) output stays visible.
+    pub output_preview_end: nb_sdk::ClipEnd,
     pub notice_secs: u64,
     pub follow_output: bool,
     pub scrolloff: u16,
@@ -53,6 +55,7 @@ impl Default for CoreSettings {
         Self {
             max_output_rows: 18,
             output_default_view: nb_core::OutputDisplay::Preview,
+            output_preview_end: nb_sdk::ClipEnd::Top,
             notice_secs: 4,
             follow_output: true,
             scrolloff: 2,
@@ -497,6 +500,9 @@ fn build_snapshot(
             .clamp(0, u16::MAX as i64) as u16,
         output_default_view: setting_text(&values, "display.output_default_view")
             .and_then(|name| nb_core::OutputDisplay::from_name(&name))
+            .unwrap_or_default(),
+        output_preview_end: setting_text(&values, "display.output_preview_end")
+            .and_then(|name| nb_sdk::ClipEnd::from_name(&name))
             .unwrap_or_default(),
         notice_secs: setting_int(&values, "display.notice_secs", 4).max(1) as u64,
         follow_output: setting_bool(&values, "display.follow_output", true),

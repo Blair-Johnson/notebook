@@ -3,7 +3,7 @@
 use super::stream::{render_rows, wrapped_row_count};
 use nb_core::{OutputData, OutputItem};
 use nb_sdk::{
-    InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
+    ClipEnd, InputOutcome, KeyContextId, MountCtx, OutputHost, OutputMetrics, OutputRenderer, OutputView,
     ResolvedInput, Theme,
 };
 use ratatui::text::Line;
@@ -50,6 +50,7 @@ pub struct PlainTextView {
     total_rows: u32,
     shown_rows: u32,
     scroll_offset: Option<u32>,
+    keep: ClipEnd,
 }
 
 impl PlainTextView {
@@ -62,8 +63,12 @@ impl PlainTextView {
     }
 
     fn visible_start(&self) -> u32 {
-        self.scroll_offset
-            .unwrap_or_else(|| self.total_rows.saturating_sub(self.shown_rows))
+        self.scroll_offset.unwrap_or_else(|| self.default_start())
+    }
+
+    /// Where the view rests until scrolled: the end `keep` names.
+    fn default_start(&self) -> u32 {
+        self.keep.first_row(self.total_rows, self.shown_rows)
     }
 
     fn max_scroll(&self) -> u32 {
@@ -71,13 +76,10 @@ impl PlainTextView {
     }
 
     fn move_scroll(&mut self, delta: i64) {
-        let current = i64::from(self.scroll_offset.unwrap_or_else(|| self.max_scroll()));
+        let current = i64::from(self.visible_start());
         let next = (current + delta).clamp(0, i64::from(self.max_scroll())) as u32;
-        self.scroll_offset = if next == self.max_scroll() && delta >= 0 {
-            None
-        } else {
-            Some(next)
-        };
+        // Back at the resting end: rest there again (and follow it).
+        self.scroll_offset = (next != self.default_start()).then_some(next);
     }
 
     /// The text shown: borrowed when `text/plain` is one string, else the
@@ -131,7 +133,9 @@ impl OutputView for PlainTextView {
         width: u16,
         _theme: &Theme,
         cap_rows: Option<u16>,
+        keep: ClipEnd,
     ) -> OutputMetrics {
+        self.keep = keep;
         let width = width.max(1);
         if self.indexed != Some((item.rev, width)) {
             let direct = matches!(
@@ -158,6 +162,7 @@ impl OutputView for PlainTextView {
             total_rows: self.total_rows,
             shown_rows: self.shown_rows,
             clipped: self.total_rows > self.shown_rows,
+            first_shown: self.visible_start(),
         }
     }
 

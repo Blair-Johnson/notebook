@@ -250,8 +250,10 @@ impl OutputView for RecordingView {
         _width: u16,
         _theme: &Theme,
         _cap_rows: Option<u16>,
+        _keep: nb_sdk::ClipEnd,
     ) -> OutputMetrics {
         OutputMetrics {
+            first_shown: 0,
             total_rows: 1,
             shown_rows: 1,
             clipped: false,

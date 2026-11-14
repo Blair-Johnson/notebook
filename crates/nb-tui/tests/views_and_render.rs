@@ -77,7 +77,7 @@ fn stream_view_indexes_and_slices_large_output_without_copying_text() {
     let item = stream_item(&text);
     let theme = Theme::default();
     let mut view = StreamOutputView::default();
-    let metrics = view.measure(&item, 32, &theme, Some(7));
+    let metrics = view.measure(&item, 32, &theme, Some(7), nb_sdk::ClipEnd::Bottom);
 
     assert_eq!(view.line_row_starts().len(), 50_001);
     assert_eq!(metrics.shown_rows, 7);
@@ -91,7 +91,7 @@ fn stream_view_indexes_and_slices_large_output_without_copying_text() {
 
     let ansi = stream_item("\x1b[33mwarning\x1b[0m\nplain");
     let mut ansi_view = StreamOutputView::default();
-    ansi_view.measure(&ansi, 40, &theme, None);
+    ansi_view.measure(&ansi, 40, &theme, None, nb_sdk::ClipEnd::Bottom);
     let mut ansi_lines = Vec::new();
     ansi_view.render_slice(&ansi, 40, 0..2, false, &theme, &mut ansi_lines);
     assert_eq!(line_text(&ansi_lines[0]), "warning");
@@ -117,7 +117,7 @@ fn plain_view_renders_text_plain_and_mime_fallback_with_tail_follow() {
     );
     let theme = Theme::default();
     let mut view = PlainTextView::default();
-    let metrics = view.measure(&item, 20, &theme, Some(2));
+    let metrics = view.measure(&item, 20, &theme, Some(2), nb_sdk::ClipEnd::Bottom);
     assert_eq!(metrics.total_rows, 3);
     assert_eq!(metrics.shown_rows, 2);
     let mut lines = Vec::new();
@@ -138,7 +138,7 @@ fn plain_view_renders_text_plain_and_mime_fallback_with_tail_follow() {
         false,
     );
     let mut fallback_view = PlainTextView::default();
-    fallback_view.measure(&fallback, 40, &theme, None);
+    fallback_view.measure(&fallback, 40, &theme, None, nb_sdk::ClipEnd::Bottom);
     let mut fallback_lines = Vec::new();
     fallback_view.render_slice(&fallback, 40, 0..1, false, &theme, &mut fallback_lines);
     assert_eq!(
@@ -173,7 +173,7 @@ fn traceback_view_folds_internal_frames_fixes_yellow_background_and_jumps() {
     let mut view = TracebackView::default();
     view.on_output_updated(&item, &ctx);
     view.set_fold_internal_frames(true);
-    let metrics = view.measure(&item, 100, &theme, None);
+    let metrics = view.measure(&item, 100, &theme, None, nb_sdk::ClipEnd::Bottom);
     assert!(metrics.total_rows >= 3);
 
     let mut lines = Vec::new();
@@ -188,7 +188,7 @@ fn traceback_view_folds_internal_frames_fixes_yellow_background_and_jumps() {
     }));
 
     view.set_fold_internal_frames(false);
-    view.measure(&item, 100, &theme, None);
+    view.measure(&item, 100, &theme, None, nb_sdk::ClipEnd::Bottom);
     let mut host = RecordingHost::default();
     let outcome = view.handle_input(
         &item,

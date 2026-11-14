@@ -6,6 +6,8 @@ theme = "midnight"
 syntect_theme = "auto"
 max_output_rows = 18
 output_default_view = "preview"
+# Which end of a clipped preview is shown: "top" or "bottom".
+output_preview_end = "top"
 notice_secs = 4
 follow_output = true
 scrolloff = 2
