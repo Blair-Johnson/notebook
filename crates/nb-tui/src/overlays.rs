@@ -784,19 +784,19 @@ impl SettingsModalState {
                 SettingsModalOutcome::FilterChanged
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected_row = step_back(self.selected_row, count, 1);
+                self.selected_row = self.selected_row.saturating_sub(1);
                 SettingsModalOutcome::Noop
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected_row = step_forward(self.selected_row, count, 1);
+                self.selected_row = (self.selected_row + 1).min(count.saturating_sub(1));
                 SettingsModalOutcome::Noop
             }
             KeyCode::PageUp => {
-                self.selected_row = step_back(self.selected_row, count, 10);
+                self.selected_row = self.selected_row.saturating_sub(10);
                 SettingsModalOutcome::Noop
             }
             KeyCode::PageDown => {
-                self.selected_row = step_forward(self.selected_row, count, 10);
+                self.selected_row = (self.selected_row + 10).min(count.saturating_sub(1));
                 SettingsModalOutcome::Noop
             }
             KeyCode::Home | KeyCode::Char('g') => {

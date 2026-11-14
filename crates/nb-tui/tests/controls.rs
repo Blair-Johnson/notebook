@@ -444,3 +444,19 @@ fn the_scroll_margin_percentage_is_a_setting() {
     let row = 1 + cursor(&c, 0).0 as u32;
     assert_eq!(c.scroll_row + height - 1 - row, margin, "the cursor sits {margin} rows above the bottom");
 }
+
+#[test]
+fn the_controls_selection_stops_at_both_ends() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    open_controls(&mut c);
+    keys(&mut c, "k");
+    assert_eq!(c.overlays.settings.selected_row, 0, "k on the first row stays there");
+    press(&mut c, KeyCode::PageUp);
+    assert_eq!(c.overlays.settings.selected_row, 0);
+    let last = c.overlays.settings.control_rows(&c.settings.snapshot().keymap).len() - 1;
+    keys(&mut c, "G");
+    keys(&mut c, "j");
+    assert_eq!(c.overlays.settings.selected_row, last, "j on the last row stays there");
+    press(&mut c, KeyCode::PageDown);
+    assert_eq!(c.overlays.settings.selected_row, last);
+}
