@@ -101,13 +101,20 @@ async fn main() -> Result<()> {
         existing_connection_file: cli.existing,
     });
 
+    // `NB_CLIPBOARD=memory`: copies stay in the process (scripted tests).
+    let clipboard: Box<dyn nb_tui::platform::ClipboardSink> =
+        if std::env::var("NB_CLIPBOARD").is_ok_and(|value| value == "memory") {
+            Box::new(nb_tui::platform::MemoryClipboard::default())
+        } else {
+            Box::new(SystemClipboard::default())
+        };
     let mut coordinator = Coordinator::new(
         notebook_path,
         doc,
         registry,
         settings,
         Box::new(kernel),
-        Box::new(SystemClipboard::default()),
+        clipboard,
         Box::new(terminal::CrosstermTerminalEffects::default()),
     );
     coordinator.notice = config_warning;
@@ -193,6 +200,8 @@ async fn run_loop(
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let mut trace = LoopTrace::from_env();
+    let mut state_dump = StateDump::from_env();
+    state_dump.write(coordinator);
     let dog = watchdog::Watchdog::spawn();
     dog.enter(watchdog::Phase::Draw);
     draw_frame(terminal, coordinator)?;
@@ -286,8 +295,38 @@ async fn run_loop(
             }
         }
         trace.record(coordinator, kind, handled, started.elapsed() - handled);
+        state_dump.write(coordinator);
     }
     Ok(())
+}
+
+/// With `NB_STATE_FILE=FILE`, the coordinator's state (`debug_state`) is
+/// written to FILE whenever it changes, for scripted tests of the running
+/// app: they send real keys through a terminal and read what happened.
+struct StateDump {
+    path: Option<PathBuf>,
+    last: String,
+}
+
+impl StateDump {
+    fn from_env() -> Self {
+        Self {
+            path: std::env::var_os("NB_STATE_FILE").map(PathBuf::from),
+            last: String::new(),
+        }
+    }
+
+    fn write(&mut self, coordinator: &mut Coordinator) {
+        let Some(path) = &self.path else { return };
+        let text = coordinator.debug_state().to_string();
+        if text != self.last {
+            let temp = path.with_extension("tmp");
+            if fs::write(&temp, &text).is_ok() {
+                let _ = fs::rename(&temp, path);
+            }
+            self.last = text;
+        }
+    }
 }
 
 /// Redraws caused by kernel output or ticks come at most this often.

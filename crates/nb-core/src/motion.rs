@@ -336,11 +336,19 @@ pub fn text_object(buf: &TextBuffer, object: TextObject, around: bool) -> Option
             let (open, close) = quote_pair(&line, buf.cursor().col, quote)?;
             let line_start = text.offset(CursorPos { row, col: 0 });
             if around {
+                // Trailing blanks go with the string; with none, the
+                // leading ones do (vim's `a"`).
+                let mut start = open;
                 let mut end = close + 1;
                 while end < line.len() && matches!(line[end], ' ' | '\t') {
                     end += 1;
                 }
-                Some(charwise(line_start + open, line_start + end))
+                if end == close + 1 {
+                    while start > 0 && matches!(line[start - 1], ' ' | '\t') {
+                        start -= 1;
+                    }
+                }
+                Some(charwise(line_start + start, line_start + end))
             } else {
                 Some(charwise(line_start + open + 1, line_start + close))
             }
@@ -764,6 +772,9 @@ mod tests {
         let buf = at("call(\"a b\", x[0]) end", 0, 7);
         assert_eq!(span(&buf, TextObject::Quote('"'), false), "a b");
         assert_eq!(span(&buf, TextObject::Quote('"'), true), "\"a b\"");
+        // No blank after the closing quote: the blank before it goes instead.
+        let tail = at("f(x, \"a b\")", 0, 7);
+        assert_eq!(span(&tail, TextObject::Quote('"'), true), " \"a b\"");
         assert_eq!(span(&buf, TextObject::Bracket('('), false), "\"a b\", x[0]");
         assert_eq!(span(&buf, TextObject::Bracket('('), true), "(\"a b\", x[0])");
         let word = at("alpha beta gamma", 0, 7);

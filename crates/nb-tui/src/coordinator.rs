@@ -177,6 +177,8 @@ pub struct Coordinator {
     disk_watch: MtimeWatch,
     /// A step of the current key failed: the rest of its steps are skipped.
     step_failed: bool,
+    /// Answers sent to `input()` and pdb prompts this session, oldest first.
+    pdb_history: Vec<String>,
     /// While a key runs: each cell buffer it touched and its undo depth
     /// before, so the whole key undoes as one step.
     undo_marks: Option<Vec<(CellId, usize)>>,
@@ -271,6 +273,7 @@ impl Coordinator {
             autosave_write: None,
             disk_watch,
             step_failed: false,
+            pdb_history: Vec::new(),
             undo_marks: None,
         };
         coordinator.sync_settings();
@@ -298,6 +301,92 @@ impl Coordinator {
     /// Text in the unnamed register (last yank or delete).
     pub fn vim_register_text(&self) -> &str {
         &self.vim.register.text
+    }
+
+    /// Everything a key can change, as JSON, for scripted tests of the
+    /// running app (`NB_STATE_FILE`, see `notebook/src/main.rs`).
+    pub fn debug_state(&mut self) -> Value {
+        let nb_cursor = self.nb_cursor();
+        let index_of = |id: &CellId| self.document.position_of(id);
+        let pos = |p: CursorPos| serde_json::json!([p.row, p.col]);
+        let selection = |buffer: &nb_core::TextBuffer| {
+            buffer.selection().map(|s| {
+                serde_json::json!({
+                    "kind": format!("{:?}", s.kind),
+                    "anchor": [s.anchor.row, s.anchor.col],
+                    "head": [s.head.row, s.head.col],
+                })
+            })
+        };
+        let default_view = self.settings.snapshot().core.output_default_view;
+        let cells: Vec<Value> = self
+            .document
+            .cells_in_order()
+            .map(|cell| {
+                serde_json::json!({
+                    "kind": format!("{:?}", cell.kind),
+                    "source": cell.buffer.as_str(),
+                    "cursor": pos(cell.buffer.cursor()),
+                    "selection": selection(&cell.buffer),
+                    "collapsed": cell.collapsed,
+                    "execution_count": cell.execution_count,
+                    "outputs": cell.outputs.iter().map(|o| o.plain_text()).collect::<Vec<_>>(),
+                    "output_view": format!("{:?}", cell.output_display(default_view)),
+                    "stream_tab": format!("{:?}", cell.stream_tab),
+                    "run_state": self.run_states.get(&cell.id).map(|state| format!("{state:?}")),
+                })
+            })
+            .collect();
+        let layers: Vec<Value> = self
+            .focus
+            .layers()
+            .iter()
+            .map(|layer| match layer {
+                FocusLayer::Notebook { mode_id } => serde_json::json!({ "layer": "notebook", "mode": mode_id }),
+                FocusLayer::CellEdit { cell_id, mode_id, expanded_split, .. } => serde_json::json!({
+                    "layer": "cell", "mode": mode_id, "cell": index_of(cell_id), "expanded_split": expanded_split,
+                }),
+                FocusLayer::OutputFocus { cell_id, mode_id, .. } => {
+                    serde_json::json!({ "layer": "output", "mode": mode_id, "cell": index_of(cell_id) })
+                }
+                FocusLayer::PdbInput => serde_json::json!({ "layer": "pdb" }),
+                FocusLayer::Modal(kind) => serde_json::json!({ "layer": "modal", "kind": format!("{kind:?}") }),
+            })
+            .collect();
+        let snap = self.settings.snapshot().clone();
+        serde_json::json!({
+            "mode": self.focus.top().mode_id(),
+            "badge": self.focus.top().badge(&snap.keymap.controls),
+            "layers": layers,
+            "selected_cell": index_of(&self.selected_cell),
+            "selected_part": format!("{:?}", self.selected_part),
+            "nb_row": nb_cursor.map(|(_, row)| row),
+            "scroll_row": self.scroll_row,
+            "cells": cells,
+            "output_text": self.output_text.as_ref().map(|out| serde_json::json!({
+                "cell": index_of(&out.cell_id),
+                "cursor": pos(out.buffer.cursor()),
+                "selection": selection(&out.buffer),
+                "text": out.buffer.as_str(),
+            })),
+            "register": { "text": self.vim.register.text, "linewise": self.vim.register.linewise },
+            "yank_text": self.yank_text,
+            "yank_cells": self.yank_cells.len(),
+            "notice": self.notice,
+            "marks": self.marks.iter().map(|(c, (id, row))| (c.to_string(), serde_json::json!([index_of(id), row]))).collect::<Map<String, Value>>(),
+            "search_query": self.search_query,
+            "prompt": self.overlays.prompt.as_ref().map(|p| serde_json::json!({ "kind": format!("{:?}", p.kind), "input": p.input })),
+            "palette": self.overlays.palette.as_ref().map(|p| p.query.clone()),
+            "settings_tab": self.overlays.settings.active_tab,
+            "pdb": self.overlays.pdb_dock.as_ref().map(|d| serde_json::json!({ "prompt": d.prompt, "input": d.composer.as_str(), "history": d.history })),
+            "completion": self.completion.as_ref().map(|c| c.filtered.len()),
+            "inspect": self.inspect_pager.as_ref().map(|p| p.title.clone()),
+            "kernel": { "busy": self.kernel_busy, "alive": self.kernel_alive, "phase": format!("{:?}", self.kernel_phase) },
+            "mouse_capture": snap.core.mouse_capture,
+            "dirty": self.document.dirty_source || self.document.dirty_outputs,
+            "should_quit": self.should_quit,
+            "grammar_pending": self.grammar.is_pending(),
+        })
     }
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -1004,7 +1093,8 @@ impl Coordinator {
                 if !matches!(self.focus.top(), FocusLayer::PdbInput) {
                     self.focus.push(FocusLayer::PdbInput);
                 }
-                self.overlays.pdb_dock = Some(PdbDockState::new(prompt, password, Vec::new()));
+                self.overlays.pdb_dock =
+                    Some(PdbDockState::new(prompt, password, self.pdb_history.clone()));
                 self.term_effects.set_cursor_shape(CursorShape::SteadyBar);
             }
             KernelEvent::CommOpened { .. } => {}
@@ -1200,6 +1290,7 @@ impl Coordinator {
         else {
             return;
         };
+        let new_source = keep_final_newline(&old_source, new_source);
         if old_source != new_source {
             self.document.apply(DocOp::CommitCellSource {
                 cell_id: cell_id.clone(),
@@ -1503,7 +1594,10 @@ impl Coordinator {
             let id = id.0.as_ref();
             let pdb_interrupt =
                 id == "kernel.interrupt" && matches!(self.focus.top(), FocusLayer::PdbInput);
-            if is_global_command(id)
+            // Search opens the same prompt everywhere; where it searches
+            // depends on the level (see `jump_search`).
+            let search = id.starts_with("search.");
+            if (is_global_command(id) || search)
                 && !pdb_interrupt
                 && !matches!(self.focus.top(), FocusLayer::Modal(_))
             {
@@ -1948,7 +2042,10 @@ impl Coordinator {
             ResolvedInput::InsertText(text) => pdb.composer.insert_str(&text),
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "pdb.submit" => {
                 let (value, history) = pdb.take_submission();
-                pdb.history = history;
+                pdb.history = history.clone();
+                // Later prompts (the next `input()`, pdb's next command)
+                // reach the same history with Up.
+                self.pdb_history = history;
                 self.send_command(KernelCmd::ReplyInput { value });
             }
             ResolvedInput::Command { id, .. } if id.0.as_ref() == "pdb.newline" => {
@@ -2280,7 +2377,7 @@ impl Coordinator {
                     vim.command(buf, vim_mode, &id, count.unwrap_or(1), arg, false)
                 });
                 if !outcome.handled {
-                    self.dispatch_cell_command(cell_id, &id);
+                    return self.dispatch_cell_command(cell_id, &id);
                 }
             }
             ResolvedInput::InsertText(_) | ResolvedInput::RollbackChars(_) => {}
@@ -2320,7 +2417,7 @@ impl Coordinator {
     }
 
     /// Cell commands that are not text edits.
-    fn dispatch_cell_command(&mut self, cell_id: &CellId, id: &str) {
+    fn dispatch_cell_command(&mut self, cell_id: &CellId, id: &str) -> Effect {
         match id {
             "cell.run" => {
                 self.commit_cell(cell_id);
@@ -2328,11 +2425,17 @@ impl Coordinator {
                 self.cell_baselines
                     .insert(cell_id.clone(), self.cell_source(cell_id));
             }
+            // The editor gets the source as committed, cursor and all.
+            "cell.edit_external" => {
+                self.commit_cell(cell_id);
+                return Effect::OpenExternalEditor(cell_id.clone());
+            }
             "cell.toggle_expand_split" => self.toggle_split(),
             "cell.split_at_cursor" => self.split_cell(cell_id),
             "intel.inspect_doc" => self.request_inspect(cell_id, false),
             _ => {}
         }
+        Effect::None
     }
 
     /// Keys inside an entered output: vim motions, visual mode and yank over
@@ -3701,6 +3804,7 @@ impl Coordinator {
         match run_with_timeout(&mut command, source.as_bytes(), FORMATTER_TIMEOUT) {
             Ok(output) if output.status.success() => {
                 let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+                let formatted = keep_final_newline(&source, formatted);
                 if formatted != source {
                     self.document.apply(DocOp::CommitCellSource {
                         cell_id: id,
@@ -3909,6 +4013,14 @@ impl Coordinator {
         if query.is_empty() || self.document.order().is_empty() {
             return;
         }
+        // In a cell or an entered output, search its text (cells are strict
+        // boundaries, like motions).
+        if matches!(self.focus.base(), FocusLayer::CellEdit { .. } | FocusLayer::OutputFocus { .. }) {
+            if !self.search_in_text(query, forward) {
+                self.notice = Some(format!("pattern not found here: {query}"));
+            }
+            return;
+        }
         let start = self.selected_index();
         let len = self.document.order().len();
         for step in 1..=len {
@@ -3927,6 +4039,47 @@ impl Coordinator {
             }
         }
         self.notice = Some(format!("pattern not found: {query}"));
+    }
+
+    /// The next (or previous) match of `query` in the edited cell's or the
+    /// entered output's text, wrapping around. In visual mode the selection
+    /// head moves with the cursor.
+    fn search_in_text(&mut self, query: &str, forward: bool) -> bool {
+        let buffer = match self.focus.base().clone() {
+            FocusLayer::CellEdit { cell_id, .. } => {
+                self.document.cell_mut(&cell_id).map(|cell| &mut cell.buffer)
+            }
+            FocusLayer::OutputFocus { .. } => self.output_text.as_mut().map(|out| &mut out.buffer),
+            _ => None,
+        };
+        let Some(buffer) = buffer else {
+            return false;
+        };
+        let text = buffer.as_str();
+        let here = buffer.char_offset_of(buffer.cursor());
+        let matches: Vec<usize> = text
+            .match_indices(query)
+            .map(|(byte, _)| text[..byte].chars().count())
+            .collect();
+        let found = if forward {
+            matches.iter().copied().find(|&at| at > here).or(matches.first().copied())
+        } else {
+            matches.iter().rev().copied().find(|&at| at < here).or(matches.last().copied())
+        };
+        let Some(found) = found else {
+            return false;
+        };
+        let target = cursor_at_char_offset(buffer, found);
+        let selection = buffer.selection();
+        buffer.set_cursor(target);
+        if let Some(selection) = selection {
+            buffer.set_selection(nb_core::Selection {
+                head: buffer.cursor(),
+                ..selection
+            });
+        }
+        self.vim.reset_column();
+        true
     }
 
     fn execute_ex_command(&mut self, raw: String) -> Effect {
@@ -4364,6 +4517,17 @@ fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {
 }
 
 /// Commands that mean the same thing whichever layer has focus.
+/// Editors and formatters end files with a newline; a cell's source does not
+/// gain one unless it already had it.
+fn keep_final_newline(old: &str, new: String) -> String {
+    if !old.ends_with('\n') {
+        if let Some(stripped) = new.strip_suffix('\n') {
+            return stripped.to_string();
+        }
+    }
+    new
+}
+
 /// Keys typed for `:explain`: space-separated key names (`ctrl+d`, `esc`),
 /// and any other word taken as one key per character (`gg`, `diw`).
 pub fn parse_explain_keys(text: &str) -> Vec<Key> {

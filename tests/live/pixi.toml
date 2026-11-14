@@ -1,0 +1,14 @@
+# The kernel environment for the live key tests (`harness.py`).
+[workspace]
+channels = ["conda-forge"]
+name = "nb-live"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+# Build nb, then check every default binding in a running instance.
+live = { cmd = "cargo build -q -p notebook && python3 -I tests/live/harness.py target/debug/nb", cwd = "../.." }
+
+[dependencies]
+python = "3.12.*"
+ipykernel = ">=7.4.0,<8"

@@ -45,3 +45,7 @@ on and off, and open a rule in `$EDITOR`. `:explain <keys>` shows what keys
 would do where the cursor is. The defaults, in the same format as your
 `config.toml`, are in
 [`crates/nb-tui/assets/default_controls.toml`](crates/nb-tui/assets/default_controls.toml).
+
+`pixi run --manifest-path tests/live/pixi.toml live` checks every default
+binding in a running `nb`: real keys through tmux, a real kernel, and
+expectations written from vim semantics (`tests/live/cases.py`).

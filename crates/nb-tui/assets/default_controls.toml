@@ -231,13 +231,24 @@ line_end_motions = ["motion.line_end"]
 "edit.insert_line_start" = ["I"]
 "edit.append_line_end" = ["A"]
 
-# Outputs are read-only text: every motion, visual mode, and yank.
+# Outputs are read-only text: every motion, visual mode, and yank. The
+# editing keys they would inherit from vim.normal are unbound here.
 [keys."output.normal"]
 "output.jump" = ["enter"]
 "output.next_tab" = ["tab"]
+"op.delete" = []
+"edit.paste_after" = []
+"edit.paste_before" = []
+"edit.undo" = []
+"edit.redo" = []
 
 [keys."output.visual"]
 "visual.swap_ends" = ["o"]
+"op.delete" = []
+"edit.paste_after" = []
+"edit.paste_before" = []
+"edit.undo" = []
+"edit.redo" = []
 
 [keys."text.pending"]
 "textobj.inner_word" = ["i w"]
@@ -463,7 +474,7 @@ id = "cell.visual_insert_end"
 title = "Types at the end of the selection"
 mode = ["cell.visual", "cell.visual_line"]
 on = ["edit.append_line_end"]
-do = ["selection.end", "mode.cell.insert"]
+do = ["selection.end", "mode.cell.insert", "motion.right"]
 
 [[rules]]
 id = "cell.back_to_notebook"

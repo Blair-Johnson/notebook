@@ -460,3 +460,89 @@ fn the_controls_selection_stops_at_both_ends() {
     press(&mut c, KeyCode::PageDown);
     assert_eq!(c.overlays.settings.selected_row, last);
 }
+
+// Regressions found by the live key tests (tests/live).
+
+#[test]
+fn ctrl_g_opens_the_external_editor_from_cell_normal_mode() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    keys(&mut c, "i");
+    let effect = c.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL), Instant::now());
+    assert!(matches!(effect, nb_tui::Effect::OpenExternalEditor(_)), "{effect:?}");
+}
+
+#[test]
+fn an_editors_final_newline_does_not_reach_the_cell() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    let id = c.document.order()[0].clone();
+    c.apply_external_edit(&id, "x = 2\n".into());
+    assert_eq!(source(&c, 0), "x = 2");
+}
+
+#[test]
+fn search_inside_a_cell_moves_the_cursor_there() {
+    let mut c = coordinator(&[("one\n  two two\nthree", "")]);
+    keys(&mut c, "i/two");
+    press(&mut c, KeyCode::Enter);
+    assert_eq!(mode(&c), Some(CellMode::Normal));
+    assert_eq!(cursor(&c, 0), (1, 2));
+    keys(&mut c, "n");
+    assert_eq!(cursor(&c, 0), (1, 6));
+    keys(&mut c, "N");
+    assert_eq!(cursor(&c, 0), (1, 2));
+    assert_eq!(source(&c, 0), "one\n  two two\nthree", "the query was not typed as commands");
+}
+
+#[test]
+fn visual_paste_replaces_the_selection_in_place() {
+    let mut c = coordinator(&[("abc def\nnext", "")]);
+    keys(&mut c, "iylvlp");
+    assert_eq!(source(&c, 0), "ac def\nnext");
+    let mut c = coordinator(&[("abc def\nnext", "")]);
+    keys(&mut c, "iylVp");
+    assert_eq!(source(&c, 0), "a\nnext", "a charwise register replaces whole lines as a line");
+}
+
+#[test]
+fn visual_a_types_after_the_selection() {
+    let mut c = coordinator(&[("abc def", "")]);
+    keys(&mut c, "illvlA");
+    assert_eq!(mode(&c), Some(CellMode::Insert));
+    assert_eq!(cursor(&c, 0), (0, 4));
+    let mut c = coordinator(&[("abc def", "")]);
+    keys(&mut c, "ilVA");
+    assert_eq!(cursor(&c, 0), (0, 7), "linewise: after the line's end");
+}
+
+#[test]
+fn input_prompts_share_their_history() {
+    let mut c = coordinator(&[("x = 1", "")]);
+    let ask = |c: &mut Coordinator| {
+        c.apply_kernel_event(nb_kernel::KernelEvent::InputRequested {
+            prompt: "? ".into(),
+            password: false,
+        });
+        draw(c);
+    };
+    ask(&mut c);
+    keys(&mut c, "hi");
+    press(&mut c, KeyCode::Enter);
+    ask(&mut c);
+    press(&mut c, KeyCode::Up);
+    let pdb = c.overlays.pdb_dock.as_ref().expect("a prompt");
+    assert_eq!(pdb.composer.as_str(), "hi");
+}
+
+#[test]
+fn outputs_bind_no_editing_keys() {
+    let mut registry = ExtensionRegistry::default();
+    registry.install(BuiltinsPlugin);
+    let keymap = nb_tui::Keymap::compile(&registry, "");
+    for mode in ["output.normal", "output.visual", "output.visual_line"] {
+        let ctx = nb_sdk::KeyContextId(std::borrow::Cow::Borrowed(mode));
+        for action in ["op.delete", "edit.paste_after", "edit.paste_before", "edit.undo", "edit.redo"] {
+            assert!(keymap.keys_for(&ctx, action).is_empty(), "{action} is bound in {mode}");
+        }
+        assert!(!keymap.keys_for(&ctx, "op.yank").is_empty(), "y stays in {mode}");
+    }
+}

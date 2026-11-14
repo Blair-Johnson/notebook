@@ -314,10 +314,25 @@ impl VimState {
         };
         // Selection moves and yanks work on read-only buffers too.
         match id {
+            // The selection's first character, or last; a linewise selection
+            // starts at its first line's first non-blank and ends on its last
+            // line's last character (`I` and `A` in visual mode).
             "selection.start" | "selection.end" => {
                 if let Some(selection) = buf.selection() {
                     let (start, end) = ordered(selection.anchor, selection.head);
-                    buf.set_cursor(if id == "selection.start" { start } else { end });
+                    let target = match (selection.kind, id == "selection.start") {
+                        (VisualKind::Char, true) => start,
+                        (VisualKind::Char, false) => end,
+                        (VisualKind::Line, true) => CursorPos {
+                            row: start.row,
+                            col: buf.first_nonblank_col(start.row),
+                        },
+                        (VisualKind::Line, false) => CursorPos {
+                            row: end.row,
+                            col: buf.line_char_len(end.row).saturating_sub(1),
+                        },
+                    };
+                    buf.set_cursor(target);
                 }
                 return Outcome::handled();
             }
@@ -443,12 +458,17 @@ impl VimState {
                     }
                     outcome.with_normal()
                 }
+                // The register replaces the selection, which goes into the
+                // register in turn (as in vim).
                 ("edit.paste_after" | "edit.paste_before", Some(range)) => {
                     let register = self.register.clone();
                     buf.checkpoint();
+                    let at_end = match range {
+                        Range::Lines(_, last) => last + 1 >= buf.line_count(),
+                        Range::Chars(..) => false,
+                    };
                     self.register = delete_range(buf, range);
-                    let after = matches!(range, Range::Lines(..)) && !register.linewise;
-                    paste(buf, &register, !after && register.linewise, 1);
+                    put_over(buf, &register, range, at_end);
                     outcome.changed = true;
                     outcome.yanked = true;
                     outcome.with_normal()
@@ -885,6 +905,58 @@ fn paste(buf: &mut TextBuffer, register: &Register, before: bool, count: usize) 
             row: end.row,
             col: end.col.saturating_sub(1),
         });
+    }
+}
+
+/// Put `register` where `range` was just deleted. Over characters, text
+/// goes in at the cursor (a linewise register on lines of its own); over
+/// lines, it takes the deleted lines' place as whole lines. `at_end`: the
+/// deleted lines were the buffer's last.
+fn put_over(buf: &mut TextBuffer, register: &Register, range: Range, at_end: bool) {
+    let body = register.text.strip_suffix('\n').unwrap_or(&register.text).to_string();
+    match range {
+        Range::Chars(start, _) => {
+            buf.set_cursor(start);
+            if register.linewise {
+                buf.insert_str(&format!("\n{body}\n"));
+                buf.set_cursor(CursorPos {
+                    row: start.row + 1,
+                    col: buf.first_nonblank_col(start.row + 1),
+                });
+            } else {
+                buf.insert_str(&body);
+                let end = buf.cursor();
+                buf.set_cursor(CursorPos {
+                    row: end.row,
+                    col: end.col.saturating_sub(1),
+                });
+            }
+        }
+        Range::Lines(first, _) => {
+            let emptied = buf.as_str().is_empty() && first == 0;
+            let row = if emptied {
+                buf.set_cursor(CursorPos { row: 0, col: 0 });
+                buf.insert_str(&body);
+                0
+            } else if at_end {
+                // The deleted lines were last: the new ones go below what is left.
+                let above = buf.line_count() - 1;
+                buf.set_cursor(CursorPos {
+                    row: above,
+                    col: buf.line_char_len(above),
+                });
+                buf.insert_str(&format!("\n{body}"));
+                above + 1
+            } else {
+                buf.set_cursor(CursorPos { row: first, col: 0 });
+                buf.insert_str(&format!("{body}\n"));
+                first
+            };
+            buf.set_cursor(CursorPos {
+                row,
+                col: buf.first_nonblank_col(row),
+            });
+        }
     }
 }
 

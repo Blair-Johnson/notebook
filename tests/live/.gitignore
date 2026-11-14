@@ -1,0 +1,4 @@
+.pixi/
+runs/
+failures.txt
+__pycache__/
