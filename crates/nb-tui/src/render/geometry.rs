@@ -21,6 +21,10 @@ pub enum HitTarget {
     FoldToggle {
         cell_id: CellId,
     },
+    /// The bottom rail's `↓ show N more lines ↓` / `↑ collapse ↑`.
+    OutputFold {
+        cell_id: CellId,
+    },
     Hyperlink {
         url: String,
     },

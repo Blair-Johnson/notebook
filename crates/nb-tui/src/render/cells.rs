@@ -210,15 +210,94 @@ impl CellCtx<'_> {
             } else {
                 look.source_border
             };
-            self.hline(frame, y, ("╰", "╯"), color, &[], &[]);
+            let fold = (rows.outputs > 0).then(|| self.output_fold(&look)).flatten();
+            match &fold {
+                Some(label) => {
+                    let style = Style::default()
+                        .fg(self.theme.palette.accent_code)
+                        .bg(self.theme.palette.bg)
+                        .add_modifier(Modifier::BOLD);
+                    let label = [Span::styled(format!(" {label} "), style)];
+                    self.hline_centered(frame, y, ("╰", "╯"), color, &label);
+                }
+                None => self.hline(frame, y, ("╰", "╯"), color, &[], &[]),
+            }
             geometry.row_hits.push(RowHit {
                 screen_y: y,
-                target: HitTarget::CellHeader {
-                    cell_id: self.cell.id.clone(),
+                target: if fold.is_some() {
+                    HitTarget::OutputFold {
+                        cell_id: self.cell.id.clone(),
+                    }
+                } else {
+                    HitTarget::CellHeader {
+                        cell_id: self.cell.id.clone(),
+                    }
                 },
             });
         }
         cursor
+    }
+
+    /// The bottom rail's fold label, when the outputs show less (or, expanded,
+    /// more) than all of them: `↓ show 22 more lines ↓`, `↑ collapse ↑`, or
+    /// `↓ show 40 lines ↓` when hidden. None while the output is entered (it
+    /// scrolls instead) or when there is nothing to fold.
+    fn output_fold(&self, look: &Look) -> Option<String> {
+        if look.output_mode.is_some() || self.cell.outputs.is_empty() {
+            return None;
+        }
+        let display = self
+            .cell
+            .output_display(self.view.settings.output_default_view)
+            .effective(self.cached.clips);
+        match display {
+            OutputDisplay::Hidden => {
+                let lines: usize = self
+                    .cell
+                    .outputs
+                    .iter()
+                    .map(|output| output.line_count().max(1))
+                    .sum();
+                Some(format!("↓ show {lines} {} ↓", plural(lines, "line")))
+            }
+            OutputDisplay::Preview => {
+                let clipped: u32 = self
+                    .cached
+                    .output_rows
+                    .iter()
+                    .map(|rows| rows.total.saturating_sub(rows.shown))
+                    .sum();
+                (clipped > 0).then(|| {
+                    format!("↓ show {clipped} more {} ↓", plural(clipped as usize, "line"))
+                })
+            }
+            OutputDisplay::Full => self.cached.clips.then(|| "↑ collapse ↑".to_string()),
+        }
+    }
+
+    /// A horizontal border row with `label` centered in the rule.
+    fn hline_centered(
+        &self,
+        frame: &mut Frame<'_>,
+        y: u16,
+        (left, right): (&str, &str),
+        color: Color,
+        label: &[Span<'static>],
+    ) {
+        let width = usize::from(self.text_w + 4);
+        let label_w: usize = label.iter().map(|span| span.width()).sum();
+        if label_w + 6 > width {
+            return self.hline(frame, y, (left, right), color, &[], &[]);
+        }
+        let border = Style::default().fg(color).bg(self.theme.palette.bg);
+        let fill = width - 2 - label_w;
+        let mut spans = vec![Span::styled(format!("{left}{}", "─".repeat(fill / 2)), border)];
+        spans.extend(label.iter().cloned());
+        spans.push(Span::styled(format!("{}{right}", "─".repeat(fill - fill / 2)), border));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(self.area.x, y, self.text_w + 4, 1),
+        );
     }
 
     /// A horizontal border row: `left` + title + rule + right label + `right`.
@@ -545,7 +624,6 @@ impl CellCtx<'_> {
         let top = rows.outputs_top();
         let sections = output_sections(self.cell);
         let first_id = sections.first()?.items.first()?.id;
-        let muted = |text: String| Span::styled(text, Style::default().fg(p.muted).bg(p.bg));
         let display = self
             .cell
             .output_display(self.view.settings.output_default_view)
@@ -553,15 +631,8 @@ impl CellCtx<'_> {
 
         if display == OutputDisplay::Hidden {
             if let Some(y) = self.screen_y(top) {
-                let lines: usize = self
-                    .cell
-                    .outputs
-                    .iter()
-                    .map(|output| output.line_count().max(1))
-                    .sum();
-                let right = vec![muted(format!(" ▸ {lines} lines "))];
                 let labels = self.all_labels(&sections, look);
-                self.hline(frame, y, ("├", "┤"), look.output_border, &labels, &right);
+                self.hline(frame, y, ("├", "┤"), look.output_border, &labels, &[]);
                 self.output_hit(geometry, y, first_id, 0);
             }
             return None;
@@ -597,16 +668,8 @@ impl CellCtx<'_> {
                 })
                 .collect();
             if let Some(y) = self.screen_y(local) {
-                let clipped: u32 = measured
-                    .iter()
-                    .map(|(shown, total, _)| total.saturating_sub(*shown))
-                    .sum();
-                let mut right = Vec::new();
-                if clipped > 0 {
-                    right.push(muted(format!(" +{clipped} lines ")));
-                }
                 let label = self.section_label(section, look);
-                self.hline(frame, y, ("├", "┤"), look.output_border, &label, &right);
+                self.hline(frame, y, ("├", "┤"), look.output_border, &label, &[]);
                 if let Some(output) = section.items.first() {
                     self.output_hit(geometry, y, output.id, text_row);
                 }
@@ -829,4 +892,8 @@ pub(super) fn draw_scrollbar(
         thumb_y,
         thumb_height,
     });
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 { word.to_string() } else { format!("{word}s") }
 }

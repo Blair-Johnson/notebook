@@ -958,6 +958,24 @@ impl Coordinator {
                 }
                 self.document.dirty_source = true;
             }
+            // `↓ show N more lines ↓` expands; `↑ collapse ↑` returns to the
+            // preview; a hidden output shows again.
+            HitTarget::OutputFold { cell_id } => {
+                let default = self.settings.snapshot().core.output_default_view;
+                let clips = self.layout_cache.cached(&cell_id).is_none_or(|cached| cached.clips);
+                if let Some(cell) = self.document.cell_mut(&cell_id) {
+                    use nb_core::OutputDisplay::{Full, Hidden, Preview};
+                    let next = match cell.output_display(default).effective(clips) {
+                        Preview => Full,
+                        Full | Hidden if clips => Preview,
+                        Full | Hidden => Full,
+                    };
+                    cell.set_output_display(next);
+                    self.document.dirty_source = true;
+                }
+                self.select_cell(cell_id);
+                self.selected_part = CellPart::Output;
+            }
             HitTarget::Hyperlink { url } => self.notice = Some(url),
         }
     }

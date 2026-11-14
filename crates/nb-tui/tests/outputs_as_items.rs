@@ -320,7 +320,7 @@ fn previews_show_the_top_of_a_long_output_unless_set_to_the_bottom() {
     let text = screen(&mut c);
     assert!(text.contains("line 0 ") && text.contains("line 17 "), "{text}");
     assert!(!text.contains("line 39"), "{text}");
-    assert!(text.contains("+22 lines"), "the clipped count stays: {text}");
+    assert!(text.contains("↓ show 22 more lines ↓"), "the clipped count is on the rail: {text}");
 
     set_preview_end(&mut c, "bottom");
     let text = screen(&mut c);
@@ -344,4 +344,59 @@ fn opening_a_preview_lands_on_the_line_shown() {
         let out = c.output_text.as_ref().expect("reading again");
         assert_eq!(out.buffer.cursor().row, first + 1, "{end}: Esc kept the line");
     }
+}
+
+/// The screen row holding `text`.
+fn row_of(c: &mut Coordinator, text: &str) -> (u16, String) {
+    let screen = screen(c);
+    screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(text))
+        .map(|(y, line)| (y as u16, line.to_string()))
+        .unwrap_or_else(|| panic!("{text:?} is not on screen:\n{screen}"))
+}
+
+#[test]
+fn the_bottom_rail_says_how_much_output_is_folded() {
+    let long: String = (0..20).map(|n| format!("line {n}\n")).collect();
+    let mut c = coordinator(&[("loop()", &long), ("short()", "only\n")]);
+    // Centered in the card's bottom border, under a preview that clips.
+    let (_, rail) = row_of(&mut c, "↓ show 2 more lines ↓");
+    assert!(rail.starts_with('╰') && rail.trim_end().ends_with('╯'), "{rail}");
+    let at = rail.chars().position(|ch| ch == '↓').unwrap();
+    let left = rail.chars().take(at).filter(|ch| *ch == '─').count();
+    let right = rail.chars().skip(at).filter(|ch| *ch == '─').count();
+    assert!(left.abs_diff(right) <= 2, "centered: {rail}");
+    // An output that fits has a plain rail.
+    assert!(!screen(&mut c).contains("1 more line"));
+
+    keys(&mut c, "j");
+    keys(&mut c, " ");
+    row_of(&mut c, "↑ collapse ↑");
+    keys(&mut c, " ");
+    row_of(&mut c, "↓ show 20 lines ↓");
+}
+
+#[test]
+fn clicking_the_rail_expands_and_collapses_the_output() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let long: String = (0..20).map(|n| format!("line {n}\n")).collect();
+    let mut c = coordinator(&[("loop()", &long)]);
+    let click = |c: &mut Coordinator, y: u16| {
+        c.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        draw(c);
+    };
+    let (y, _) = row_of(&mut c, "↓ show 2 more lines ↓");
+    click(&mut c, y);
+    assert!(screen(&mut c).contains("line 19"), "expanded");
+    let (y, _) = row_of(&mut c, "↑ collapse ↑");
+    click(&mut c, y);
+    assert!(!screen(&mut c).contains("line 19"), "collapsed again");
+    row_of(&mut c, "↓ show 2 more lines ↓");
 }
