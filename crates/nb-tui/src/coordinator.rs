@@ -10,8 +10,8 @@ use crate::intelligence::{
 use crate::keymap::normalize_crossterm_key;
 use crate::layout::{CardRows, LayoutCache, text_width};
 use crate::overlays::{
-    CommandPaletteState, ConfirmAction, OverlayStates, PdbDockState, PromptBar, PromptKind,
-    SettingsModalOutcome,
+    CommandPaletteState, ConfirmAction, EditTarget, OverlayStates, PdbDockState, PromptBar,
+    PromptKind, SettingsModalOutcome,
 };
 use crate::platform::{
     ClipboardSink, CursorShape, MemoryClipboard, NoopTerminalEffects, TerminalEffects,
@@ -1066,6 +1066,17 @@ impl Coordinator {
             changed = true;
         }
         changed |= self.check_external_disk_change(false);
+        if matches!(self.focus.top(), FocusLayer::Modal(ModalKind::Settings)) {
+            // A key sequence being captured is saved after a pause.
+            let outcome = self
+                .overlays
+                .settings
+                .on_tick(now, &mut self.settings, &self.registry);
+            if !matches!(outcome, SettingsModalOutcome::Noop) {
+                self.apply_settings_outcome(outcome);
+                changed = true;
+            }
+        }
         if self.settings.save_if_due().is_err() {
             self.notice = Some("could not save settings".into());
             changed = true;
@@ -1511,13 +1522,81 @@ impl Coordinator {
             self.overlays
                 .settings
                 .handle_raw_key(key, &mut self.settings, &self.registry);
+        self.apply_settings_outcome(outcome)
+    }
+
+    fn apply_settings_outcome(&mut self, outcome: SettingsModalOutcome) -> Effect {
+        let effect = match &outcome {
+            SettingsModalOutcome::ExplainRequested { mode, keys } => {
+                self.overlays.settings.explain = self.explain_keys(mode, keys);
+                Effect::None
+            }
+            SettingsModalOutcome::EditRequested(target) => self.edit_controls(target.clone()),
+            SettingsModalOutcome::Notice(text) => {
+                self.notice = Some(text.clone());
+                Effect::None
+            }
+            _ => Effect::None,
+        };
         if !matches!(outcome, SettingsModalOutcome::Noop) {
             self.sync_settings();
         }
         if matches!(outcome, SettingsModalOutcome::Close) {
             self.focus.pop();
         }
-        Effect::None
+        effect
+    }
+
+    /// Open the config file at a rule (adding it first: a copy of the
+    /// default, or a new rule that does what the action does now).
+    fn edit_controls(&mut self, target: EditTarget) -> Effect {
+        let Some(path) = self.settings.config_path().map(Path::to_path_buf) else {
+            self.notice = Some("settings are in memory only: there is no config file to edit".into());
+            return Effect::None;
+        };
+        let snap = self.settings.snapshot().clone();
+        let controls = &snap.keymap.controls;
+        let id = match target {
+            EditTarget::Rule(id) => {
+                let Some(rule) = controls.rule(&id) else {
+                    return Effect::None;
+                };
+                self.settings.ensure_rule(&id, &rule.source, &self.registry);
+                id
+            }
+            EditTarget::NewRule { mode, action } => {
+                let base = format!("my.{mode}.{action}");
+                let mut id = base.clone();
+                let mut suffix = 2;
+                while controls.rule(&id).is_some() {
+                    id = format!("{base}.{suffix}");
+                    suffix += 1;
+                }
+                let steps: Vec<toml::Value> = match controls.macro_for(&action) {
+                    Some(action_macro) => action_macro.steps.iter().map(Step::to_config).collect(),
+                    None => vec!["@action".to_string()],
+                }
+                .into_iter()
+                .map(toml::Value::String)
+                .collect();
+                let mut table = toml::Table::new();
+                table.insert("mode".into(), toml::Value::String(mode));
+                table.insert("on".into(), toml::Value::Array(vec![toml::Value::String(action)]));
+                table.insert("do".into(), toml::Value::Array(steps));
+                self.settings.ensure_rule(&id, &table, &self.registry);
+                id
+            }
+        };
+        if let Err(error) = self.settings.flush() {
+            self.notice = Some(format!("could not save settings: {error}"));
+            return Effect::None;
+        }
+        let needle = format!("id = \"{id}\"");
+        let line = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.lines().position(|line| line.trim() == needle))
+            .map_or(1, |index| index + 1);
+        Effect::EditConfig { path, line }
     }
 
     fn on_modal_key(&mut self, key: KeyEvent) -> Option<Effect> {
@@ -1920,6 +1999,11 @@ impl Coordinator {
                 Effect::None
             }
             "app.settings" => {
+                // The Controls tab opens on the mode the user was in.
+                if let Some(mode) = self.focus.base().mode_id().map(str::to_string) {
+                    let snap = self.settings.snapshot().clone();
+                    self.overlays.settings.show_mode(&snap.keymap, &mode);
+                }
                 self.focus.push(FocusLayer::Modal(ModalKind::Settings));
                 Effect::None
             }

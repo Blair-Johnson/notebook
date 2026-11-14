@@ -33,3 +33,14 @@ environment with `ipykernel` installed.
 Inside: `?` lists keys, `Ctrl+/` searches commands and settings, and
 `:w`, `:wq`, `:q!` work as in vim. `nb --help` lists the command-line
 options.
+
+## Controls
+
+Keys trigger actions; rules decide what an action does in a given mode and
+on a given target; a rule's steps can switch modes. All of it is
+configurable: the Controls tab of the settings screen (`Ctrl+,`) shows, for
+each mode, what every key does there, and lets you rebind keys, turn rules
+on and off, and open a rule in `$EDITOR`. `:explain <keys>` shows what keys
+would do where the cursor is. The defaults, in the same format as your
+`config.toml`, are in
+[`crates/nb-tui/assets/default_controls.toml`](crates/nb-tui/assets/default_controls.toml).

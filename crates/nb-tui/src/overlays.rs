@@ -1,13 +1,18 @@
 //! State models for modals, prompts, logs, settings menu, and the docked `pdb` input bar.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nb_core::TextBuffer;
-use nb_sdk::{ActionSpec, ExtensionRegistry, KeyContextId, SettingKind, SettingSpec, SettingValue};
+use nb_sdk::{
+    ActionSpec, ExtensionRegistry, Key, KeyContextId, SettingKind, SettingSpec, SettingValue,
+};
 
 use crate::config_store::SettingsStore;
-use crate::keymap::{Keymap, format_key, normalize_crossterm_key};
+use crate::controls::{Case, ModeSpec};
+use crate::keymap::{Keymap, format_key_sequence_toml, normalize_crossterm_key};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromptKind {
@@ -303,20 +308,74 @@ pub enum SettingsModalOutcome {
     CaptureStarted,
     CaptureCancelled,
     KeybindCaptured { action_id: String, key: String },
+    /// Show what these keys do in this mode (the Controls tab's "try keys").
+    ExplainRequested { mode: String, keys: Vec<Key> },
+    /// Open the config file in an editor at this rule.
+    EditRequested(EditTarget),
+    Notice(String),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditTarget {
+    Rule(String),
+    /// A new rule for `action` in `mode`, starting from what it does now.
+    NewRule { mode: String, action: String },
+}
+
+/// What a key capture in the Controls tab is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePurpose {
+    Rebind,
+    AddKey,
+    Try,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeyCapture {
+    pub purpose: CapturePurpose,
+    pub keys: Vec<Key>,
+    pub last: Instant,
+}
+
+/// A captured key sequence is saved this long after its last key.
+pub const CAPTURE_PAUSE: Duration = Duration::from_millis(1000);
+
+/// One action in the Controls tab, for the selected mode.
+#[derive(Clone, Debug)]
+pub struct ControlRow {
+    pub action: String,
+    pub title: String,
+    pub category: String,
+    /// Keys in this mode, inherited ones included, as config files spell them.
+    pub keys: Vec<String>,
+    pub cases: Vec<Case>,
+    pub cannot_unbind: bool,
+}
+
+/// The Controls tab's index among `SettingsModalState::tabs()`.
+pub const CONTROLS_TAB: usize = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct SettingsModalState {
     pub active_tab: usize,
     pub filter: String,
     pub selected_row: usize,
-    pub capturing_keybind: bool,
+    /// Controls tab: typed characters edit the filter (after `/`).
+    pub filtering: bool,
+    /// Controls tab: the mode shown, an index into `Controls::modes`.
+    pub mode_index: usize,
+    pub capture: Option<KeyCapture>,
+    /// Controls tab: the rules panel for the selected action is open, on
+    /// this rule.
+    pub rules_view: Option<usize>,
+    /// The last "try keys" trace.
+    pub explain: Vec<String>,
 }
 
 impl SettingsModalState {
     pub fn tabs() -> &'static [&'static str] {
         &[
-            "Display", "Editor", "Kernel", "Theme", "Keybinds", "Plugins",
+            "Display", "Editor", "Kernel", "Theme", "Controls", "Plugins",
         ]
     }
 
@@ -327,13 +386,30 @@ impl SettingsModalState {
             .unwrap_or(0);
         self.filter = spec.title.to_string();
         self.selected_row = 0;
-        self.capturing_keybind = false;
+        self.reset_controls_state();
+    }
+
+    /// Open the Controls tab on `mode` (the mode the user was in).
+    pub fn show_mode(&mut self, keymap: &Keymap, mode: &str) {
+        if let Some(index) = keymap.controls.modes().position(|spec| spec.id == mode) {
+            if index != self.mode_index {
+                self.mode_index = index;
+                self.selected_row = 0;
+            }
+        }
+    }
+
+    fn reset_controls_state(&mut self) {
+        self.capture = None;
+        self.rules_view = None;
+        self.filtering = false;
+        self.explain.clear();
     }
 
     pub fn next_tab(&mut self) {
         self.active_tab = (self.active_tab + 1) % Self::tabs().len();
         self.selected_row = 0;
-        self.capturing_keybind = false;
+        self.reset_controls_state();
     }
 
     pub fn prev_tab(&mut self) {
@@ -343,7 +419,7 @@ impl SettingsModalState {
             self.active_tab - 1
         };
         self.selected_row = 0;
-        self.capturing_keybind = false;
+        self.reset_controls_state();
     }
 
     pub fn filtered_settings<'a>(&self, reg: &'a ExtensionRegistry) -> Vec<&'a SettingSpec> {
@@ -363,23 +439,70 @@ impl SettingsModalState {
             .collect()
     }
 
-    pub fn filtered_actions<'a>(&self, reg: &'a ExtensionRegistry) -> Vec<&'a ActionSpec> {
-        if self.active_tab != 4 {
+    /// The mode the Controls tab shows.
+    pub fn controls_mode<'a>(&self, keymap: &'a Keymap) -> Option<&'a ModeSpec> {
+        let count = keymap.controls.modes().count();
+        keymap
+            .controls
+            .modes()
+            .nth(self.mode_index.min(count.saturating_sub(1)))
+    }
+
+    /// The actions bound in the shown mode, and with a filter, every
+    /// matching action (bound or not), in help order.
+    pub fn control_rows(&self, keymap: &Keymap) -> Vec<ControlRow> {
+        let Some(mode) = self.controls_mode(keymap) else {
             return Vec::new();
+        };
+        let ctx = KeyContextId(Cow::Owned(mode.id.clone()));
+        let mut ids: BTreeSet<String> = keymap.bound_actions(&ctx).into_iter().collect();
+        if !self.filter.trim().is_empty() {
+            ids.extend(keymap.action_specs().map(|spec| spec.id.clone()));
         }
-        reg.actions
-            .iter()
-            .filter(|action| {
+        let mut rows: Vec<(u16, ControlRow)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let spec = keymap.action_spec(&id)?;
+                // Text objects only follow an operator.
+                if spec.kind == nb_sdk::ActionKind::TextObject {
+                    return None;
+                }
+                let keys: Vec<String> = keymap
+                    .sequences_for(&ctx, &id)
+                    .iter()
+                    .map(|sequence| format_key_sequence_toml(sequence))
+                    .collect();
+                let cases = keymap.controls.cases(&mode.id, &id, false);
+                let what = cases.iter().map(|case| case.what.as_str()).collect::<Vec<_>>().join(" ");
+                let keys_text = keys.join(" ");
                 filter_matches(
                     &self.filter,
-                    [
-                        action.id.as_str(),
-                        action.title.as_ref(),
-                        action.category.as_ref(),
-                    ],
+                    [id.as_str(), spec.title.as_ref(), spec.category.as_ref(), keys_text.as_str(), what.as_str()],
                 )
+                .then(|| {
+                    (
+                        spec.order,
+                        ControlRow {
+                            action: id.clone(),
+                            title: spec.title.to_string(),
+                            category: spec.category.to_string(),
+                            keys,
+                            cases,
+                            cannot_unbind: spec.cannot_unbind,
+                        },
+                    )
+                })
             })
-            .collect()
+            .collect();
+        rows.sort_by(|(left_order, left), (right_order, right)| {
+            left.keys
+                .is_empty()
+                .cmp(&right.keys.is_empty())
+                .then(left.category.cmp(&right.category))
+                .then(left_order.cmp(right_order))
+                .then(left.title.cmp(&right.title))
+        });
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     /// Handle the emergency, non-configurable settings keys.  This path is
@@ -391,30 +514,28 @@ impl SettingsModalState {
         store: &mut SettingsStore,
         reg: &ExtensionRegistry,
     ) -> SettingsModalOutcome {
-        if self.capturing_keybind {
-            if key.code == KeyCode::Esc {
-                self.capturing_keybind = false;
+        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(capture) = self.capture.as_mut() {
+            if ctrl_c {
+                self.capture = None;
                 return SettingsModalOutcome::CaptureCancelled;
             }
             let Some(normalized) = normalize_crossterm_key(key) else {
                 return SettingsModalOutcome::Noop;
             };
-            let Some(action_id) = self
-                .filtered_actions(reg)
-                .get(self.selected_row)
-                .map(|action| action.id.clone())
-            else {
-                self.capturing_keybind = false;
-                return SettingsModalOutcome::CaptureCancelled;
-            };
-            let key_string = format_key(normalized);
-            let context = KeyContextId::new_static("global");
-            store.set_keybinding(&context, &action_id, [key_string.as_str()], reg);
-            self.capturing_keybind = false;
-            return SettingsModalOutcome::KeybindCaptured {
-                action_id,
-                key: key_string,
-            };
+            // The first key is always literal, so Enter and Esc can be bound.
+            if normalized == Key::Enter && !capture.keys.is_empty() {
+                return self.finish_capture(store, reg);
+            }
+            capture.keys.push(normalized);
+            capture.last = Instant::now();
+            return SettingsModalOutcome::Noop;
+        }
+        if ctrl_c {
+            return SettingsModalOutcome::Close;
+        }
+        if self.active_tab == CONTROLS_TAB {
+            return self.handle_controls_key(key, store, reg);
         }
 
         if key.code == KeyCode::Esc {
@@ -423,9 +544,6 @@ impl SettingsModalState {
                 self.selected_row = 0;
                 return SettingsModalOutcome::FilterChanged;
             }
-            return SettingsModalOutcome::Close;
-        }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return SettingsModalOutcome::Close;
         }
 
@@ -439,19 +557,19 @@ impl SettingsModalState {
                 SettingsModalOutcome::FilterChanged
             }
             KeyCode::Up => {
-                self.select_prev(reg, 1);
+                self.select_prev(store, reg, 1);
                 SettingsModalOutcome::Noop
             }
             KeyCode::Down => {
-                self.select_next(reg, 1);
+                self.select_next(store, reg, 1);
                 SettingsModalOutcome::Noop
             }
             KeyCode::PageUp => {
-                self.select_prev(reg, 5);
+                self.select_prev(store, reg, 5);
                 SettingsModalOutcome::Noop
             }
             KeyCode::PageDown => {
-                self.select_next(reg, 5);
+                self.select_next(store, reg, 5);
                 SettingsModalOutcome::Noop
             }
             KeyCode::Home => {
@@ -459,7 +577,7 @@ impl SettingsModalState {
                 SettingsModalOutcome::Noop
             }
             KeyCode::End => {
-                self.selected_row = self.row_count(reg).saturating_sub(1);
+                self.selected_row = self.row_count(store, reg).saturating_sub(1);
                 SettingsModalOutcome::Noop
             }
             KeyCode::Backspace => {
@@ -477,18 +595,7 @@ impl SettingsModalState {
             }
             KeyCode::Left => self.change_selected_setting(-1, store, reg),
             KeyCode::Right => self.change_selected_setting(1, store, reg),
-            KeyCode::Enter => {
-                if self.active_tab == 4 {
-                    if self.filtered_actions(reg).get(self.selected_row).is_some() {
-                        self.capturing_keybind = true;
-                        SettingsModalOutcome::CaptureStarted
-                    } else {
-                        SettingsModalOutcome::Noop
-                    }
-                } else {
-                    self.change_selected_setting(1, store, reg)
-                }
-            }
+            KeyCode::Enter => self.change_selected_setting(1, store, reg),
             KeyCode::Char('+') | KeyCode::Char('=') if plain_key(key) => {
                 self.change_selected_setting(1, store, reg)
             }
@@ -503,30 +610,261 @@ impl SettingsModalState {
         }
     }
 
-    fn row_count(&self, reg: &ExtensionRegistry) -> usize {
-        if self.active_tab == 4 {
-            self.filtered_actions(reg).len()
+    /// Save a capture whose last key was `CAPTURE_PAUSE` ago.
+    pub fn on_tick(
+        &mut self,
+        now: Instant,
+        store: &mut SettingsStore,
+        reg: &ExtensionRegistry,
+    ) -> SettingsModalOutcome {
+        let due = self.capture.as_ref().is_some_and(|capture| {
+            !capture.keys.is_empty()
+                && now
+                    .checked_duration_since(capture.last)
+                    .is_some_and(|elapsed| elapsed >= CAPTURE_PAUSE)
+        });
+        if due {
+            self.finish_capture(store, reg)
+        } else {
+            SettingsModalOutcome::Noop
+        }
+    }
+
+    fn start_capture(&mut self, purpose: CapturePurpose) -> SettingsModalOutcome {
+        self.capture = Some(KeyCapture {
+            purpose,
+            keys: Vec::new(),
+            last: Instant::now(),
+        });
+        SettingsModalOutcome::CaptureStarted
+    }
+
+    fn finish_capture(&mut self, store: &mut SettingsStore, reg: &ExtensionRegistry) -> SettingsModalOutcome {
+        let Some(capture) = self.capture.take() else {
+            return SettingsModalOutcome::Noop;
+        };
+        if capture.keys.is_empty() {
+            return SettingsModalOutcome::CaptureCancelled;
+        }
+        let snap = store.snapshot().clone();
+        let keymap = &snap.keymap;
+        let Some(mode) = self.controls_mode(keymap).map(|mode| mode.id.clone()) else {
+            return SettingsModalOutcome::CaptureCancelled;
+        };
+        if capture.purpose == CapturePurpose::Try {
+            return SettingsModalOutcome::ExplainRequested {
+                mode,
+                keys: capture.keys,
+            };
+        }
+        let Some(row) = self.control_rows(keymap).into_iter().nth(self.selected_row) else {
+            return SettingsModalOutcome::CaptureCancelled;
+        };
+        let sequence = format_key_sequence_toml(&capture.keys);
+        let mut keys = if capture.purpose == CapturePurpose::AddKey {
+            row.keys.clone()
+        } else {
+            Vec::new()
+        };
+        if !keys.contains(&sequence) {
+            keys.push(sequence.clone());
+        }
+        let ctx = KeyContextId(Cow::Owned(mode));
+        store.set_keybinding(&ctx, &row.action, &keys, reg);
+        SettingsModalOutcome::KeybindCaptured {
+            action_id: row.action,
+            key: sequence,
+        }
+    }
+
+    fn handle_controls_key(
+        &mut self,
+        key: KeyEvent,
+        store: &mut SettingsStore,
+        reg: &ExtensionRegistry,
+    ) -> SettingsModalOutcome {
+        let snap = store.snapshot().clone();
+        let keymap = &snap.keymap;
+        let Some(mode) = self.controls_mode(keymap).map(|mode| mode.id.clone()) else {
+            return SettingsModalOutcome::Close;
+        };
+        let rows = self.control_rows(keymap);
+        let row = rows.get(self.selected_row).cloned();
+        let ctx = KeyContextId(Cow::Owned(mode.clone()));
+
+        if let Some(selected) = self.rules_view {
+            let Some(row) = row else {
+                self.rules_view = None;
+                return SettingsModalOutcome::Noop;
+            };
+            let rules: Vec<(String, bool)> = keymap
+                .controls
+                .rules_for(&mode, &row.action)
+                .into_iter()
+                .map(|rule| (rule.id.clone(), rule.enabled))
+                .collect();
+            return match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.rules_view = Some(selected.saturating_sub(1));
+                    SettingsModalOutcome::Noop
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.rules_view = Some((selected + 1).min(rules.len().saturating_sub(1)));
+                    SettingsModalOutcome::Noop
+                }
+                KeyCode::Char(' ') => match rules.get(selected) {
+                    Some((id, enabled)) => {
+                        store.set_rule_enabled(id, !enabled, reg);
+                        SettingsModalOutcome::Changed
+                    }
+                    None => SettingsModalOutcome::Noop,
+                },
+                KeyCode::Char('e') | KeyCode::Enter => match rules.get(selected) {
+                    Some((id, _)) => SettingsModalOutcome::EditRequested(EditTarget::Rule(id.clone())),
+                    None => SettingsModalOutcome::Noop,
+                },
+                KeyCode::Char('n') => SettingsModalOutcome::EditRequested(EditTarget::NewRule {
+                    mode,
+                    action: row.action,
+                }),
+                KeyCode::Esc | KeyCode::Char('r') | KeyCode::Left | KeyCode::Char('h') => {
+                    self.rules_view = None;
+                    SettingsModalOutcome::Noop
+                }
+                _ => SettingsModalOutcome::Noop,
+            };
+        }
+
+        if self.filtering {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.filtering = false;
+                    return SettingsModalOutcome::FilterChanged;
+                }
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.selected_row = 0;
+                    return SettingsModalOutcome::FilterChanged;
+                }
+                KeyCode::Char(c) if plain_key(key) && !c.is_control() => {
+                    self.filter.push(c);
+                    self.selected_row = 0;
+                    return SettingsModalOutcome::FilterChanged;
+                }
+                _ => {}
+            }
+        }
+
+        let count = rows.len();
+        let mode_count = keymap.controls.modes().count().max(1);
+        self.explain.clear();
+        match key.code {
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                self.selected_row = 0;
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::Esc => SettingsModalOutcome::Close,
+            KeyCode::Tab => {
+                self.next_tab();
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::BackTab => {
+                self.prev_tab();
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected_row = step_back(self.selected_row, count, 1);
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected_row = step_forward(self.selected_row, count, 1);
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::PageUp => {
+                self.selected_row = step_back(self.selected_row, count, 10);
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::PageDown => {
+                self.selected_row = step_forward(self.selected_row, count, 10);
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.selected_row = 0;
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.selected_row = count.saturating_sub(1);
+                SettingsModalOutcome::Noop
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.mode_index = (self.mode_index.min(mode_count - 1) + mode_count - 1) % mode_count;
+                self.selected_row = 0;
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.mode_index = (self.mode_index.min(mode_count - 1) + 1) % mode_count;
+                self.selected_row = 0;
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::Char('/') => {
+                self.filtering = true;
+                self.filter.clear();
+                self.selected_row = 0;
+                SettingsModalOutcome::FilterChanged
+            }
+            KeyCode::Char('t') => self.start_capture(CapturePurpose::Try),
+            _ if row.is_none() => SettingsModalOutcome::Noop,
+            KeyCode::Enter => self.start_capture(CapturePurpose::Rebind),
+            KeyCode::Char('+') | KeyCode::Char('a') => self.start_capture(CapturePurpose::AddKey),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                let row = row.expect("checked above");
+                if row.cannot_unbind {
+                    return SettingsModalOutcome::Notice(format!("{} cannot be unbound", row.title));
+                }
+                store.set_keybinding(&ctx, &row.action, Vec::<String>::new(), reg);
+                SettingsModalOutcome::Changed
+            }
+            KeyCode::Char('u') => {
+                let row = row.expect("checked above");
+                store.remove_keybinding(&ctx, &row.action, reg);
+                SettingsModalOutcome::Changed
+            }
+            KeyCode::Char('r') | KeyCode::Char('e') => {
+                let row = row.expect("checked above");
+                if keymap.controls.rules_for(&mode, &row.action).is_empty() {
+                    if key.code == KeyCode::Char('e') {
+                        return SettingsModalOutcome::EditRequested(EditTarget::NewRule {
+                            mode,
+                            action: row.action,
+                        });
+                    }
+                    return SettingsModalOutcome::Notice(format!(
+                        "no rules for {} here: press e to write one",
+                        row.title
+                    ));
+                }
+                self.rules_view = Some(0);
+                SettingsModalOutcome::Noop
+            }
+            _ => SettingsModalOutcome::Noop,
+        }
+    }
+
+    fn row_count(&self, store: &SettingsStore, reg: &ExtensionRegistry) -> usize {
+        if self.active_tab == CONTROLS_TAB {
+            self.control_rows(&store.snapshot().keymap).len()
         } else {
             self.filtered_settings(reg).len()
         }
     }
 
-    fn select_next(&mut self, reg: &ExtensionRegistry, by: usize) {
-        let count = self.row_count(reg);
-        if count == 0 {
-            self.selected_row = 0;
-        } else {
-            self.selected_row = (self.selected_row + by) % count;
-        }
+    fn select_next(&mut self, store: &SettingsStore, reg: &ExtensionRegistry, by: usize) {
+        self.selected_row = step_forward(self.selected_row, self.row_count(store, reg), by);
     }
 
-    fn select_prev(&mut self, reg: &ExtensionRegistry, by: usize) {
-        let count = self.row_count(reg);
-        if count == 0 {
-            self.selected_row = 0;
-        } else {
-            self.selected_row = (self.selected_row + count - (by % count)) % count;
-        }
+    fn select_prev(&mut self, store: &SettingsStore, reg: &ExtensionRegistry, by: usize) {
+        self.selected_row = step_back(self.selected_row, self.row_count(store, reg), by);
     }
 
     fn change_selected_setting(
@@ -535,9 +873,6 @@ impl SettingsModalState {
         store: &mut SettingsStore,
         reg: &ExtensionRegistry,
     ) -> SettingsModalOutcome {
-        if self.active_tab == 4 {
-            return SettingsModalOutcome::Noop;
-        }
         let Some(spec) = self.filtered_settings(reg).get(self.selected_row).cloned() else {
             return SettingsModalOutcome::Noop;
         };
@@ -553,6 +888,14 @@ impl SettingsModalState {
         store.set_value(&spec.id, next, reg);
         SettingsModalOutcome::Changed
     }
+}
+
+fn step_forward(row: usize, count: usize, by: usize) -> usize {
+    if count == 0 { 0 } else { (row + by) % count }
+}
+
+fn step_back(row: usize, count: usize, by: usize) -> usize {
+    if count == 0 { 0 } else { (row + count - (by % count)) % count }
 }
 
 fn plain_key(event: KeyEvent) -> bool {

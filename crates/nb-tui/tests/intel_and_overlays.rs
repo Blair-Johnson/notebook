@@ -180,7 +180,7 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
     assert_eq!(
         SettingsModalState::tabs(),
         &[
-            "Display", "Editor", "Kernel", "Theme", "Keybinds", "Plugins"
+            "Display", "Editor", "Kernel", "Theme", "Controls", "Plugins"
         ]
     );
 
@@ -229,6 +229,7 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
         Some(&SettingValue::Text("light".into()))
     );
 
+    // Controls: rebinding writes the key into the shown mode's table.
     modal.active_tab = 4;
     modal.filter = "open settings".into();
     modal.selected_row = 0;
@@ -236,7 +237,12 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
         modal.handle_raw_key(key(KeyCode::Enter), &mut store, &registry),
         SettingsModalOutcome::CaptureStarted
     );
-    let outcome = modal.handle_raw_key(key(KeyCode::F(8)), &mut store, &registry);
+    assert_eq!(
+        modal.handle_raw_key(key(KeyCode::F(8)), &mut store, &registry),
+        SettingsModalOutcome::Noop,
+        "a capture waits for more keys"
+    );
+    let outcome = modal.handle_raw_key(key(KeyCode::Enter), &mut store, &registry);
     assert_eq!(
         outcome,
         SettingsModalOutcome::KeybindCaptured {
@@ -244,7 +250,46 @@ fn settings_modal_edits_values_filters_and_captures_keybinds() {
             key: "f8".into(),
         }
     );
-    assert!(store.document().to_string().contains("f8"));
+    let config = store.document().to_string();
+    assert!(config.contains("[keys.\"notebook.normal\"]") && config.contains("f8"), "{config}");
+
+    // Sequences: `g s` then a pause saves both keys.
+    modal.filter = "save notebook".into();
+    modal.selected_row = 0;
+    modal.handle_raw_key(key(KeyCode::Char('+')), &mut store, &registry);
+    modal.handle_raw_key(key(KeyCode::Char('g')), &mut store, &registry);
+    modal.handle_raw_key(key(KeyCode::Char('s')), &mut store, &registry);
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    assert!(matches!(
+        modal.on_tick(later, &mut store, &registry),
+        SettingsModalOutcome::KeybindCaptured { .. }
+    ));
+    let keymap = &store.snapshot().keymap;
+    let notebook = KeyContextId::new_static("notebook.normal");
+    assert_eq!(keymap.keys_for(&notebook, "doc.save"), ["w", "gs"]);
+
+    // Rules: the panel lists the rules for an action; space turns one off.
+    modal.filter = "open cell".into();
+    modal.selected_row = 0;
+    modal.handle_raw_key(key(KeyCode::Char('r')), &mut store, &registry);
+    assert_eq!(modal.rules_view, Some(0));
+    modal.handle_raw_key(key(KeyCode::Char(' ')), &mut store, &registry);
+    let rule = store.snapshot().keymap.controls.rule("notebook.open_output").cloned().unwrap();
+    assert!(!rule.enabled && rule.from_user);
+    modal.handle_raw_key(key(KeyCode::Esc), &mut store, &registry);
+    assert_eq!(modal.rules_view, None);
+
+    // Try keys: the captured keys are explained, not run.
+    modal.handle_raw_key(key(KeyCode::Char('t')), &mut store, &registry);
+    modal.handle_raw_key(key(KeyCode::Char('$')), &mut store, &registry);
+    assert_eq!(
+        modal.handle_raw_key(key(KeyCode::Enter), &mut store, &registry),
+        SettingsModalOutcome::ExplainRequested {
+            mode: "notebook.normal".into(),
+            keys: vec![nb_sdk::Key::Char('$')],
+        }
+    );
+    modal.filter.clear();
 
     modal.active_tab = 0;
     modal.filter = "stale".into();

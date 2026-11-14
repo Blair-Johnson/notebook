@@ -141,6 +141,16 @@ pub fn format_key_sequence(sequence: &[Key]) -> String {
     parts.join(separator)
 }
 
+/// Format a sequence the way config files spell it: `g g`, `ctrl+d`.
+pub fn format_key_sequence_toml(sequence: &[Key]) -> String {
+    sequence
+        .iter()
+        .copied()
+        .map(format_key)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Compatibility alias for callers that prefer an explicit string suffix.
 pub fn format_key_string(key: Key) -> String {
     format_key(key)
@@ -586,6 +596,37 @@ impl Keymap {
             .collect();
         keys.sort_by_key(|sequence| (sequence.len(), format_key_sequence(sequence)));
         keys.into_iter().map(|sequence| format_key_sequence(sequence)).collect()
+    }
+
+    /// Key sequences bound to `action_id` in `ctx`, shortest first.
+    pub fn sequences_for(&self, ctx: &KeyContextId, action_id: &str) -> Vec<KeySeq> {
+        let mut keys: Vec<KeySeq> = self
+            .tables
+            .get(ctx)
+            .into_iter()
+            .flat_map(|table| table.iter())
+            .filter(|(_, action)| action.as_str() == action_id)
+            .map(|(sequence, _)| sequence.clone())
+            .collect();
+        keys.sort_by_key(|sequence| (sequence.len(), format_key_sequence(sequence)));
+        keys
+    }
+
+    /// Every action with a key in `ctx` (inherited keys included).
+    pub fn bound_actions(&self, ctx: &KeyContextId) -> Vec<String> {
+        let mut actions: Vec<String> = self
+            .tables
+            .get(ctx)
+            .into_iter()
+            .flat_map(|table| table.values().cloned())
+            .collect();
+        actions.sort();
+        actions.dedup();
+        actions
+    }
+
+    pub fn action_specs(&self) -> impl Iterator<Item = &ActionSpec> {
+        self.actions.values()
     }
 
     /// Every distinct key sequence bound to `action_id` in any context.

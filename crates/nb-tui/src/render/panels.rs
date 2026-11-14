@@ -6,7 +6,7 @@ use super::style::{centered, key_style, panel};
 use super::AppView;
 use crate::focus::{FocusLayer, ModalKind};
 use crate::keymap::Keymap;
-use crate::overlays::SettingsModalState;
+use crate::overlays::{CONTROLS_TAB, CapturePurpose, SettingsModalState};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -208,6 +208,20 @@ fn draw_help(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, theme: 
             Span::styled(format!("  {}", fit(&row.keys, key_w)), key_style(theme)),
             Span::styled(format!("  {}", row.title), Style::default().fg(p.fg)),
         ]));
+        // Where rules or a macro decide what the key does, say so, case by case.
+        if keymap.controls.is_customized(context.as_str(), &row.action) {
+            for case in keymap.controls.cases(context.as_str(), &row.action, false) {
+                let text = if case.when.is_empty() {
+                    case.what
+                } else {
+                    format!("{}: {}", case.when, case.what)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {}    {text}", " ".repeat(key_w)),
+                    Style::default().fg(p.muted),
+                )));
+            }
+        }
     }
     let body_h = usize::from(inner.height.saturating_sub(1));
     let max_scroll = lines.len().saturating_sub(body_h);
@@ -333,6 +347,9 @@ fn draw_settings(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, the
         tabs.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), Rect::new(inner.x, inner.y, inner.width, 1));
+    if state.active_tab == CONTROLS_TAB {
+        return draw_controls_tab(frame, state, keymap, theme, inner);
+    }
     let filter = if state.filter.is_empty() {
         Span::styled(" type to filter", Style::default().fg(p.muted))
     } else {
@@ -360,25 +377,7 @@ fn draw_settings(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, the
             row,
         );
     };
-    if state.active_tab == 4 {
-        let actions = state.filtered_actions(view.registry);
-        let top = state.selected_row.saturating_sub(rows.saturating_sub(1));
-        for (offset, action) in actions.iter().skip(top).take(rows).enumerate() {
-            let selected = top + offset == state.selected_row;
-            let keys = keymap.bindings_for(&action.id).join(", ");
-            let value = if selected && state.capturing_keybind {
-                "press a key…".to_string()
-            } else if keys.is_empty() {
-                "unbound".to_string()
-            } else {
-                keys
-            };
-            render_row(frame, offset, selected, &action.title, value);
-            if selected {
-                description = format!("{} · {}", action.category, action.id);
-            }
-        }
-    } else {
+    {
         let settings = state.filtered_settings(view.registry);
         let top = state.selected_row.saturating_sub(rows.saturating_sub(1));
         for (offset, spec) in settings.iter().skip(top).take(rows).enumerate() {
@@ -401,14 +400,237 @@ fn draw_settings(frame: &mut Frame<'_>, view: &AppView<'_>, keymap: &Keymap, the
             .wrap(Wrap { trim: true }),
         Rect::new(inner.x, inner.bottom().saturating_sub(3), inner.width, 2),
     );
-    let pairs: &[(&str, &str)] = if state.capturing_keybind {
-        &[("any key", "bind"), ("esc", "cancel")]
-    } else if state.active_tab == 4 {
-        &[("↑/↓", "select"), ("enter", "rebind"), ("tab", "next tab"), ("esc", "close")]
-    } else {
-        &[("↑/↓", "select"), ("←/→", "change"), ("tab", "next tab"), ("esc", "close")]
+    footer(
+        frame,
+        inner,
+        &[("↑/↓", "select"), ("←/→", "change"), ("tab", "next tab"), ("esc", "close")],
+        theme,
+    );
+}
+
+/// The Controls tab: for one mode at a time, what each key does there.
+fn draw_controls_tab(
+    frame: &mut Frame<'_>,
+    state: &SettingsModalState,
+    keymap: &Keymap,
+    theme: &Theme,
+    inner: Rect,
+) {
+    let p = &theme.palette;
+    let muted = Style::default().fg(p.muted);
+    let Some(mode) = state.controls_mode(keymap) else {
+        return;
     };
-    footer(frame, inner, pairs, theme);
+
+    // Mode strip: every mode, the shown one highlighted; scrolled so the
+    // shown one is visible.
+    let modes: Vec<_> = keymap.controls.modes().collect();
+    let selected_mode = state.mode_index.min(modes.len().saturating_sub(1));
+    let labels: Vec<String> = modes.iter().map(|spec| format!(" {} ", spec.title)).collect();
+    let mut first = 0;
+    let fits = |from: usize| {
+        labels[from..=selected_mode].iter().map(|label| text_width(label) + 1).sum::<u16>() + 7
+            <= inner.width
+    };
+    while first < selected_mode && !fits(first) {
+        first += 1;
+    }
+    let mut strip = vec![Span::styled(" Mode ", muted)];
+    if first > 0 {
+        strip.push(Span::styled("‹ ", muted));
+    }
+    for (index, label) in labels.iter().enumerate().skip(first) {
+        let style = if index == selected_mode {
+            Style::default().fg(p.panel_bg).bg(p.accent_code).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.fg)
+        };
+        strip.push(Span::styled(label.clone(), style));
+        strip.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(strip)), Rect::new(inner.x, inner.y + 1, inner.width, 1));
+
+    let rows = state.control_rows(keymap);
+    let row = rows.get(state.selected_row);
+    let status = if let Some(capture) = &state.capture {
+        let keys = crate::keymap::format_key_sequence_toml(&capture.keys);
+        let what = match capture.purpose {
+            CapturePurpose::Try => "Type keys to try".to_string(),
+            CapturePurpose::Rebind => format!("Press the new keys for {}", row.map_or("", |row| row.title.as_str())),
+            CapturePurpose::AddKey => format!("Press keys to add to {}", row.map_or("", |row| row.title.as_str())),
+        };
+        Line::from(vec![
+            Span::styled(format!(" {what} (pause or enter to finish, ctrl+c cancels): "), Style::default().fg(p.warning)),
+            Span::styled(keys, key_style(theme)),
+        ])
+    } else if state.filtering || !state.filter.is_empty() {
+        Line::from(vec![
+            Span::styled(" filter: ", muted),
+            Span::styled(
+                format!("{}{}", state.filter, if state.filtering { "▏" } else { "" }),
+                Style::default().fg(p.fg),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " Keys trigger actions; rules decide what an action does in this mode and on this target.",
+            muted,
+        ))
+    };
+    frame.render_widget(Paragraph::new(status), Rect::new(inner.x, inner.y + 2, inner.width, 1));
+
+    let detail_h = 6u16;
+    let list = Rect::new(
+        inner.x,
+        inner.y + 4,
+        inner.width,
+        inner.height.saturating_sub(5 + detail_h),
+    );
+    let visible = usize::from(list.height);
+    let keys_w = 14usize;
+    let title_w = 28usize;
+    let base_style = |selected: bool| {
+        if selected {
+            Style::default().bg(p.panel_selection).fg(p.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(p.panel_bg).fg(p.fg)
+        }
+    };
+
+    if let (Some(rule_index), Some(row)) = (state.rules_view, row) {
+        let header = format!(" Rules for {} in {}, checked in order (the first match runs):", row.title, mode.title);
+        frame.render_widget(
+            Paragraph::new(Span::styled(header, muted)),
+            Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        );
+        let rules = keymap.controls.rules_for(&mode.id, &row.action);
+        let top = rule_index.saturating_sub(visible.saturating_sub(1));
+        for (offset, rule) in rules.iter().skip(top).take(visible).enumerate() {
+            let selected = top + offset == rule_index;
+            let style = base_style(selected);
+            let area = Rect::new(list.x, list.y + offset as u16, list.width, 1);
+            frame.buffer_mut().set_style(area, style);
+            let when = crate::controls::describe_conditions(&rule.when);
+            let line = Line::from(vec![
+                Span::styled(if rule.enabled { "  [on]  " } else { "  [off] " }, style.fg(if rule.enabled { p.success } else { p.muted })),
+                Span::styled(rule.id.clone(), style),
+                Span::styled(if rule.from_user { " (yours)" } else { " (default)" }, style.fg(p.muted)),
+                Span::styled(if when.is_empty() { String::new() } else { format!("  when {when}") }, style.fg(p.accent_markdown)),
+                Span::styled(format!("  do: {}", keymap.controls.describe_steps(&rule.steps, &row.action)), style.fg(p.accent_code)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        footer(
+            frame,
+            inner,
+            &[("↑/↓", "select"), ("space", "on/off"), ("e", "edit in $EDITOR"), ("n", "new rule"), ("esc", "back")],
+            theme,
+        );
+    } else {
+        let header = format!(
+            "  {}{}What happens in {}",
+            fit("Keys", keys_w),
+            fit("Action", title_w + 2),
+            mode.title
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(header, muted.add_modifier(Modifier::BOLD))),
+            Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        );
+        if rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled("  nothing matches", muted)),
+                list,
+            );
+        }
+        let top = state.selected_row.saturating_sub(visible.saturating_sub(1));
+        for (offset, entry) in rows.iter().skip(top).take(visible).enumerate() {
+            let selected = top + offset == state.selected_row;
+            let style = base_style(selected);
+            let area = Rect::new(list.x, list.y + offset as u16, list.width, 1);
+            frame.buffer_mut().set_style(area, style);
+            let keys = if entry.keys.is_empty() {
+                "—".to_string()
+            } else {
+                entry.keys.join(" · ")
+            };
+            let what = entry
+                .cases
+                .iter()
+                .map(|case| {
+                    if case.when.is_empty() {
+                        case.what.clone()
+                    } else {
+                        format!("{}: {}", case.when, case.what)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let customized = keymap.controls.is_customized(&mode.id, &entry.action);
+            let what = if customized { what } else { "built-in".to_string() };
+            let line = Line::from(vec![
+                Span::styled(format!("  {}", fit(&keys, keys_w)), style.fg(p.accent_code)),
+                Span::styled(fit(&entry.title, title_w), style),
+                Span::styled(if customized { " ◆" } else { "  " }, style.fg(p.accent_markdown)),
+                Span::styled(format!(" {what}"), style.fg(if customized { p.fg } else { p.muted })),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        footer(
+            frame,
+            inner,
+            &[
+                ("←/→", "mode"),
+                ("enter", "rebind"),
+                ("+", "add key"),
+                ("x", "unbind"),
+                ("u", "default keys"),
+                ("r", "rules"),
+                ("e", "edit"),
+                ("t", "try keys"),
+                ("/", "filter"),
+            ],
+            theme,
+        );
+    }
+
+    // Detail: the try-keys trace, config warnings, or the selected action.
+    let mut detail: Vec<Line> = Vec::new();
+    if !state.explain.is_empty() {
+        detail.extend(state.explain.iter().map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(p.fg)))));
+    } else {
+        for warning in keymap.warnings.iter().take(2) {
+            detail.push(Line::from(Span::styled(
+                format!(" ⚠ {}: {}", warning.source_key, warning.message),
+                Style::default().fg(p.warning),
+            )));
+        }
+        if let Some(row) = row {
+            detail.push(Line::from(Span::styled(
+                format!(" {} · {} · {}", row.title, row.category, row.action),
+                Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
+            )));
+            for case in &row.cases {
+                let text = if case.when.is_empty() {
+                    format!("   {}", case.what)
+                } else {
+                    format!("   {}: {}", case.when, case.what)
+                };
+                detail.push(Line::from(Span::styled(text, muted)));
+            }
+        }
+    }
+    let area = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(1 + detail_h),
+        inner.width,
+        detail_h,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled("─".repeat(usize::from(inner.width)), Style::default().fg(p.border))),
+        Rect::new(area.x, area.y.saturating_sub(1), area.width, 1),
+    );
+    frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_logs(frame: &mut Frame<'_>, view: &AppView<'_>, theme: &Theme, screen: Rect) {

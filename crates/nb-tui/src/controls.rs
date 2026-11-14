@@ -43,9 +43,9 @@ impl Level {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum ModeKind {
     Normal,
+    Insert,
     Visual,
     VisualLine,
-    Insert,
 }
 
 impl ModeKind {
@@ -116,6 +116,18 @@ pub enum Step {
     Mode(String),
     /// Any other action, optionally with a character argument (`edit.replace_char:x`).
     Action { id: String, arg: Option<char> },
+}
+
+impl Step {
+    /// The step as written in a config file.
+    pub fn to_config(&self) -> String {
+        match self {
+            Self::Trigger => "@action".into(),
+            Self::Mode(mode) => format!("mode.{mode}"),
+            Self::Action { id, arg: Some(c) } => format!("{id}:{c}"),
+            Self::Action { id, arg: None } => id.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

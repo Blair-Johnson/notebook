@@ -221,9 +221,29 @@ impl SettingsStore {
         for key in keys {
             array.push(key.as_ref());
         }
-        self.doc["keys"][ctx.as_str()][action] = Item::Value(Value::Array(array));
+        self.section(&["keys", ctx.as_str()])
+            .insert(action, Item::Value(Value::Array(array)));
         self.rebuild(reg, Vec::new());
         self.save_deadline = Some(Instant::now() + SAVE_DEBOUNCE);
+    }
+
+    /// The table at `path`, created as `[a."b.c"]` sections (not inline
+    /// tables) when missing, so new entries land at the end of the file.
+    fn section(&mut self, path: &[&str]) -> &mut dyn toml_edit::TableLike {
+        let mut table: &mut dyn toml_edit::TableLike = self.doc.as_table_mut();
+        for (depth, key) in path.iter().enumerate() {
+            if !table.contains_key(key) {
+                let mut new = toml_edit::Table::new();
+                // Parents with only subtables need no header of their own.
+                new.set_implicit(depth + 1 < path.len());
+                table.insert(key, Item::Table(new));
+            }
+            table = table
+                .get_mut(key)
+                .and_then(Item::as_table_like_mut)
+                .expect("a config section must be a table");
+        }
+        table
     }
 
     /// Drop the user's binding for `action` in `ctx`, so the defaults apply.
@@ -299,12 +319,8 @@ impl SettingsStore {
             for step in steps {
                 array.push(step.as_str());
             }
-            if !self.doc.contains_key("actions") {
-                let mut actions = toml_edit::Table::new();
-                actions.set_implicit(true);
-                self.doc["actions"] = Item::Table(actions);
-            }
-            self.doc["actions"][id]["do"] = Item::Value(Value::Array(array));
+            self.section(&["actions", id])
+                .insert("do", Item::Value(Value::Array(array)));
         }
         self.rebuild(reg, Vec::new());
     }
