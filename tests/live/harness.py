@@ -28,6 +28,7 @@ import tempfile
 import time
 import traceback
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cases import CASES  # noqa: E402
 
@@ -118,8 +119,10 @@ class Session:
             "HOME": os.environ["HOME"],
         }
         exports = " ".join(f"{k}='{v}'" for k, v in env.items())
-        command = f"cd '{self.dir}' && env -i {exports} '{NB}' --config '{config}' '{self.notebook}'"
+        # `exec`: the pane's process is nb itself, so `close` can wait for it.
+        command = f"cd '{self.dir}' && exec env -i {exports} '{NB}' --config '{config}' '{self.notebook}'"
         tmux("new-session", "-d", "-s", self.name, "-x", str(WIDTH), "-y", str(HEIGHT), command)
+        self.pid = int(tmux("display", "-p", "-t", self.name, "#{pane_pid}").stdout.strip())
 
     def alive(self):
         return tmux("has-session", "-t", self.name, check=False).returncode == 0
@@ -184,6 +187,15 @@ class Session:
 
     def close(self):
         tmux("kill-session", "-t", self.name, check=False)
+        # nb keeps writing its state while it shuts the kernel down (up to
+        # 3 s): delete the directory only once it has exited.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -229,6 +241,8 @@ def main():
     pattern = args[1] if len(args) > 1 else ""
     if not os.path.isdir(ENV_PREFIX):
         sys.exit(f"no kernel environment: run `pixi install --manifest-path {ROOT}/pixi.toml`")
+    # Case directories left by an interrupted run.
+    shutil.rmtree(os.path.join(ROOT, "runs"), ignore_errors=True)
     os.makedirs(os.path.join(ROOT, "runs"), exist_ok=True)
     tmux("kill-server", check=False)
     tmux("start-server", ";", "set", "-s", "exit-empty", "off", check=False)

@@ -196,17 +196,6 @@ def unchanged_doc():
     )
 
 
-def does_something():
-    """For bindings whose effect is hard to pin: anything observable changed."""
-
-    def run(b, a, s, alive):
-        ignore = ("scroll_row",)
-        changed = {k for k in a if a.get(k) != b.get(k) and k not in ignore}
-        return ok(changed, "nothing changed")
-
-    return run
-
-
 def quits():
     return lambda b, a, s, alive: ok(not alive or (a and a["should_quit"]), "nb is still running")
 
@@ -224,13 +213,7 @@ def case(name, keys, check, setup="", fixture=MAIN, **extra):
     CASES.append(dict(name=name, keys=keys, check=check, setup=setup, fixture=fixture, **extra))
 
 
-def each(name, keyset, make, **extra):
-    """One case per key alias: `make(key)` returns the case arguments."""
-    for key in keyset:
-        args = make(key)
-        case(f"{name} [{key}]", **args, **extra)
-
-
+# How to reach each mode from the notebook, on cell 0.
 ENTER = {
     "notebook.normal": "",
     "cell.normal": "i",
@@ -459,7 +442,6 @@ OBJ = [
     ("aW", "", "`bt`, {k: v}, <ab>)"),
     ("i'", "lll", "f('', `bt`, {k: v}, <ab>)"),
     ("a'", "lll", "f(, `bt`, {k: v}, <ab>)"),
-    ('i"', None, None),
     ("i`", "lllllllll", "f('sq', ``, {k: v}, <ab>)"),
     # No white space after the closing quote: the space before goes too.
     ("a`", "lllllllll", "f('sq',, {k: v}, <ab>)"),
@@ -483,8 +465,6 @@ OBJ = [
     ("ap", "", "next para"),
 ]
 for obj, place, want in OBJ:
-    if place is None:
-        continue
     case(f"text.pending.d{obj}", "d" + obj, line_is(0, want, "cell.normal"), setup="i" + place, fixture=OBJECTS)
 # Double quotes and brackets live in the main fixture's lines 0 and 2.
 case('text.pending.di"', 'di"', line_is(0, 'alpha = beta(gamma, "")', "cell.normal"), setup="i" + "l" * 21)
@@ -702,8 +682,9 @@ def pdb_input(text):
     return check(lambda b, a: a["pdb"] and a["pdb"]["input"] == text, lambda b, a: f"pdb {a['pdb']}")
 
 
-def pdb_case(name, keys, chk, pre="", **extra):
-    case(f"pdb.input.{name}", keys, chk, setup="<cr>", fixture=PDB, kernel=True, setup_until=PDB_READY, pre=pre, **extra)
+def pdb_case(name, keys, chk, **extra):
+    """Run the cell that calls input(), then test keys at its prompt."""
+    case(f"pdb.input.{name}", keys, chk, setup="<cr>", fixture=PDB, kernel=True, setup_until=PDB_READY, **extra)
 
 
 pdb_case("typing", "hi", pdb_input("hi"))
