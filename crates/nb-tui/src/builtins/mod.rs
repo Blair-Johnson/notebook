@@ -5,6 +5,7 @@
 
 pub mod markdown;
 pub mod plain;
+pub mod rich;
 pub mod stream;
 pub mod traceback;
 
@@ -81,6 +82,20 @@ pub struct BuiltinsPlugin;
 impl Plugin for BuiltinsPlugin {
     fn id(&self) -> &'static str {
         "core.builtins"
+    }
+
+    fn python_bootstrap(&self) -> Option<&'static str> {
+        Some(concat!(
+            "import os as _nb_os, sys as _nb_sys\n",
+            "_nb_os.environ['MPLBACKEND'] = 'module://matplotlib_inline.backend_inline'\n",
+            "try:\n",
+            "    _nb_ip = get_ipython()\n",
+            "    if _nb_ip is not None and 'matplotlib' in _nb_sys.modules:\n",
+            "        _nb_ip.enable_matplotlib('inline')\n",
+            "except Exception:\n",
+            "    pass\n",
+            "del _nb_os, _nb_sys\n",
+        ))
     }
 
     fn register(&self, reg: &mut ExtensionRegistry) {
@@ -936,6 +951,17 @@ impl Plugin for BuiltinsPlugin {
         );
         setting(
             reg,
+            "display.images",
+            "display",
+            "Terminal images",
+            "Kitty Unicode graphics for plots, images, LaTeX math, and Mermaid diagrams",
+            SettingKind::Choice {
+                default: "auto",
+                options: crate::images::ImageMode::OPTIONS,
+            },
+        );
+        setting(
+            reg,
             "display.max_output_rows",
             "display",
             "Preview rows",
@@ -1170,6 +1196,10 @@ impl Plugin for BuiltinsPlugin {
         reg.add_default_keys_toml("core.builtins", DEFAULT_CONTROLS_TOML)
             .add_renderer(stream::StreamRenderer)
             .add_renderer(plain::PlainTextRenderer)
+            .add_renderer(rich::MarkdownOutputRenderer)
+            .add_renderer(rich::LatexOutputRenderer)
+            .add_renderer(rich::MermaidOutputRenderer)
+            .add_renderer(rich::RichImageRenderer)
             .add_renderer(traceback::TracebackRenderer);
     }
 }

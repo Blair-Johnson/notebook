@@ -4,6 +4,8 @@
 [display]
 theme = "midnight"
 syntect_theme = "auto"
+# Terminal graphics for plots, images, LaTeX, and Mermaid: "auto", "kitty", or "off".
+images = "auto"
 max_output_rows = 18
 output_default_view = "preview"
 # Which end of a clipped preview is shown: "top" or "bottom".

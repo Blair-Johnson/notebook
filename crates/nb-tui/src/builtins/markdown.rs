@@ -1,4 +1,4 @@
-//! Markdown cell source renderer (headings, fenced code blocks, and width-shrinking box tables).
+//! Markdown cell and output renderer (headings, fenced code, Mermaid, LaTeX math, images, and box tables).
 
 use ratatui::{
     style::{Modifier, Style},
@@ -8,9 +8,56 @@ use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::OnceLock;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 use nb_sdk::Theme;
+
+fn char_width(ch: char) -> usize {
+    if crate::math::is_sentinel(ch) {
+        1
+    } else {
+        UnicodeWidthChar::width(ch).unwrap_or(0)
+    }
+}
+
+fn str_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+fn fence_open(line: &str) -> Option<(u8, usize, &str)> {
+    let trimmed_cr = line.trim_end_matches('\r');
+    let indent = trimmed_cr.len() - trimmed_cr.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &trimmed_cr[indent..];
+    let &first = rest.as_bytes().first()?;
+    if !matches!(first, b'`' | b'~') {
+        return None;
+    }
+    let run = rest.bytes().take_while(|byte| *byte == first).count();
+    if run < 3 || (first == b'`' && rest[run..].contains('`')) {
+        return None;
+    }
+    Some((first, run, rest[run..].trim()))
+}
+
+fn fence_closes(line: &str, ch: u8, open_len: usize) -> bool {
+    let trimmed_cr = line.trim_end_matches('\r');
+    let indent = trimmed_cr.len() - trimmed_cr.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &trimmed_cr[indent..];
+    let run = rest.bytes().take_while(|byte| *byte == ch).count();
+    run >= open_len && rest[run..].trim_matches([' ', '\t']).is_empty()
+}
+
+fn standalone_image_source(line: &str) -> Option<&str> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    (indent <= 3).then(|| crate::pictures::block_image_source(line.trim()))?
+}
 
 pub struct RenderedMarkdown {
     pub lines: Vec<Line<'static>>,
@@ -18,30 +65,76 @@ pub struct RenderedMarkdown {
     pub source_line_map: Vec<usize>,
 }
 
-/// Inline parsing context: the theme, and the reference ids the cell
-/// defines (`[id]: url`), so `[label][id]` renders as `label`.
+/// Inline parsing context: the theme, reference link ids (`[id]: url`), and
+/// optional base directory for relative image paths.
 struct Cx<'a> {
     theme: &'a Theme,
     refs: &'a HashSet<String>,
+    base_dir: Option<&'a Path>,
+}
+
+/// Whether `source` contains constructs whose rendered form changes when
+/// terminal images turn on/off or finish rendering in the background.
+pub fn may_contain_rich_media(source: &str) -> bool {
+    crate::math::may_contain_math(source)
+        || crate::mermaid::may_contain_mermaid(source)
+        || crate::pictures::may_contain_pictures(source)
 }
 
 pub fn render_markdown_cell(source: &str, width: u16, theme: &Theme) -> RenderedMarkdown {
+    render_markdown_cell_with_base_dir(source, width, theme, None)
+}
+
+pub fn render_markdown_cell_with_base_dir(
+    source: &str,
+    width: u16,
+    theme: &Theme,
+    base_dir: Option<&Path>,
+) -> RenderedMarkdown {
+    let sanitized = crate::images::sanitize_placeholders(source);
+    let source = sanitized.as_ref();
     let width = usize::from(width.max(1));
     let (lines, refs) = visible_lines(source);
-    let cx = Cx { theme, refs: &refs };
+    let cx = Cx {
+        theme,
+        refs: &refs,
+        base_dir,
+    };
     let mut rendered = Vec::<(Line<'static>, usize)>::new();
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index].0.as_str();
-        if let Some(language) = line.trim_start().strip_prefix("```") {
-            let language = language.trim();
+        if let Some((fence_ch, fence_len, info)) = fence_open(line) {
+            let language = info.split_whitespace().next().unwrap_or("");
             let fence_line = lines[index].1;
             index += 1;
             let code_start = index;
-            while index < lines.len() && !lines[index].0.trim_start().starts_with("```") {
+            while index < lines.len() && !fence_closes(&lines[index].0, fence_ch, fence_len) {
                 index += 1;
             }
             let code_end = index;
+            let code = lines[code_start..code_end]
+                .iter()
+                .map(|(line, _)| line.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let has_closing_fence = index < lines.len();
+            if has_closing_fence {
+                if language.eq_ignore_ascii_case("mermaid")
+                    && let Some(diagram) = crate::mermaid::diagram_lines(&code, width, theme)
+                {
+                    rendered.extend(diagram.into_iter().map(|row| (row, fence_line)));
+                    index += 1;
+                    continue;
+                }
+                if crate::math::is_math_fence_lang(language)
+                    && let Some(math_rows) = crate::math::display_block_lines(&code, width, theme)
+                {
+                    rendered.extend(math_rows.into_iter().map(|row| (row, fence_line)));
+                    index += 1;
+                    continue;
+                }
+            }
             rendered.push((
                 Line::from(Span::styled(
                     format!(
@@ -58,14 +151,11 @@ pub fn render_markdown_cell(source: &str, width: u16, theme: &Theme) -> Rendered
                 )),
                 fence_line,
             ));
-            let code = lines[code_start..code_end]
-                .iter()
-                .map(|(line, _)| line.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let first = lines.get(code_start).map_or(fence_line + 1, |(_, source)| *source);
+            let first = lines
+                .get(code_start)
+                .map_or(fence_line + 1, |(_, source)| *source);
             rendered.extend(render_fenced_code(language, &code, first, width, theme));
-            if index < lines.len() {
+            if has_closing_fence {
                 rendered.push((
                     Line::from(Span::styled(
                         "└─".to_string(),
@@ -75,6 +165,25 @@ pub fn render_markdown_cell(source: &str, width: u16, theme: &Theme) -> Rendered
                 ));
                 index += 1;
             }
+            continue;
+        }
+
+        if let Some((tex, end)) = crate::math::display_block_in_visible(&lines, index)
+            && let Some(math_rows) = crate::math::display_block_lines(&tex, width, theme)
+        {
+            let math_source = lines[index].1;
+            rendered.extend(math_rows.into_iter().map(|row| (row, math_source)));
+            index = end + 1;
+            continue;
+        }
+
+        if let Some(img_src) = standalone_image_source(line)
+            && let Some(pic_rows) =
+                crate::pictures::picture_lines(img_src, width, cx.base_dir, theme)
+        {
+            let img_source = lines[index].1;
+            rendered.extend(pic_rows.into_iter().map(|row| (row, img_source)));
+            index += 1;
             continue;
         }
 
@@ -126,15 +235,10 @@ pub fn render_markdown_cell(source: &str, width: u16, theme: &Theme) -> Rendered
 fn visible_lines(source: &str) -> (Vec<(String, usize)>, HashSet<String>) {
     let mut lines = Vec::new();
     let mut refs = HashSet::new();
-    let mut in_fence = false;
+    let mut fence = crate::images::FenceTracker::default();
     let mut in_comment = false;
     for (index, line) in source.lines().enumerate() {
-        if !in_comment && line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            lines.push((line.to_string(), index));
-            continue;
-        }
-        if in_fence {
+        if !in_comment && fence.step(line) {
             lines.push((line.to_string(), index));
             continue;
         }
@@ -146,7 +250,7 @@ fn visible_lines(source: &str) -> (Vec<(String, usize)>, HashSet<String>) {
             continue;
         }
         if let Some(id) = reference_definition(&text) {
-            refs.insert(id);
+            let _ = refs.insert(id);
             continue;
         }
         lines.push((text, index));
@@ -280,13 +384,20 @@ fn numbered_marker(trimmed: &str) -> Option<usize> {
 /// wrapped across source lines still parses.
 fn block_end(lines: &[(String, usize)], start: usize) -> usize {
     let (kind, _) = classify(&lines[start].0);
-    if matches!(kind, Kind::Blank | Kind::Heading(_) | Kind::Rule) {
+    if matches!(kind, Kind::Blank | Kind::Heading(_) | Kind::Rule)
+        || standalone_image_source(&lines[start].0).is_some()
+        || crate::math::display_block_in_visible(lines, start).is_some()
+    {
         return start + 1;
     }
     let mut end = start + 1;
     while end < lines.len() {
         let line = lines[end].0.as_str();
-        if line.trim_start().starts_with("```") || starts_table(lines, end) {
+        if fence_open(line).is_some()
+            || starts_table(lines, end)
+            || standalone_image_source(line).is_some()
+            || crate::math::display_block_in_visible(lines, end).is_some()
+        {
             break;
         }
         let (next, _) = classify(line);
@@ -306,17 +417,27 @@ fn block_end(lines: &[(String, usize)], start: usize) -> usize {
 /// so each rendered line still maps to its source line.
 fn render_block(block: &[(String, usize)], width: usize, cx: &Cx<'_>) -> Vec<(Line<'static>, usize)> {
     let parts: Vec<(Kind, &str)> = block.iter().map(|(line, _)| classify(line)).collect();
-    let joined = parts.iter().map(|(_, content)| *content).collect::<Vec<_>>().join("\n");
-    let per_line = split_at_newlines(parse_inline(&joined, cx), block.len());
-    let mut out = Vec::new();
+    let joined = parts
+        .iter()
+        .map(|(_, content)| *content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let inline_max_cols = width.saturating_sub(8).max(1);
+    let (substituted, inline_math) =
+        crate::math::substitute_inline_math(&joined, inline_max_cols, cx.theme);
+    let per_line = split_at_newlines(parse_inline(&substituted, cx), block.len());
+    let mut rendered_lines = Vec::new();
+    let mut sources = Vec::new();
     for (((line, source), (kind, _)), spans) in block.iter().zip(parts).zip(per_line) {
-        out.extend(
-            render_line(line, kind, spans, width, cx.theme)
-                .into_iter()
-                .map(|rendered| (rendered, *source)),
-        );
+        for rendered in render_line(line, kind, spans, width, cx.theme) {
+            rendered_lines.push(rendered);
+            sources.push(*source);
+        }
     }
-    out
+    if !inline_math.is_empty() {
+        crate::math::place_inline_math(&mut rendered_lines, &inline_math);
+    }
+    rendered_lines.into_iter().zip(sources).collect()
 }
 
 /// Spans split at the newlines inside them, one list per line.
@@ -631,40 +752,44 @@ fn render_table(
     if columns == 0 {
         return Vec::new();
     }
-    let make_cells = |row: &[String], bold: bool| -> Vec<Vec<Span<'static>>> {
-        (0..columns)
-            .map(|column| {
-                let value = row.get(column).map(String::as_str).unwrap_or("");
-                let mut spans = parse_inline(value, cx);
-                if bold {
-                    for span in &mut spans {
-                        span.style = span.style.add_modifier(Modifier::BOLD);
+    let target = width.saturating_sub(columns * 3 + 1).max(columns);
+    let cell_inline_cap = (target / columns.max(1)).max(4);
+    let make_cells =
+        |row: &[String], bold: bool| -> Vec<(Vec<Span<'static>>, crate::math::InlineImages)> {
+            (0..columns)
+                .map(|column| {
+                    let value = row.get(column).map(String::as_str).unwrap_or("");
+                    let (substituted, inline_math) =
+                        crate::math::substitute_inline_math(value, cell_inline_cap, theme);
+                    let mut spans = parse_inline(&substituted, cx);
+                    if bold {
+                        for span in &mut spans {
+                            span.style = span.style.add_modifier(Modifier::BOLD);
+                        }
                     }
-                }
-                spans
-            })
-            .collect()
-    };
+                    (spans, inline_math)
+                })
+                .collect()
+        };
     let header_cells = make_cells(headers, true);
     let body_cells: Vec<_> = rows.iter().map(|row| make_cells(row, false)).collect();
     let mut natural = vec![1usize; columns];
     let mut floors = vec![1usize; columns];
     for row in std::iter::once(&header_cells).chain(body_cells.iter()) {
-        for (column, spans) in row.iter().enumerate() {
+        for (column, (spans, _)) in row.iter().enumerate() {
             let text = spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
-            natural[column] = natural[column].max(UnicodeWidthStr::width(text.as_str()));
+            natural[column] = natural[column].max(str_width(text.as_str()));
             floors[column] = floors[column].max(
                 text.split_whitespace()
-                    .map(UnicodeWidthStr::width)
+                    .map(str_width)
                     .max()
                     .unwrap_or(1),
             );
         }
     }
-    let target = width.saturating_sub(columns * 3 + 1).max(columns);
     let mut widths = natural;
     shrink_widths(&mut widths, &floors, target);
     shrink_widths(&mut widths, &vec![1; columns], target);
@@ -672,14 +797,22 @@ fn render_table(
     let header_lines: Vec<_> = header_cells
         .iter()
         .zip(widths.iter())
-        .map(|(cell, width)| wrap_styled(cell.clone(), *width))
+        .map(|((cell, inline_math), width)| {
+            let mut lines = wrap_styled(cell.clone(), *width);
+            crate::math::place_inline_math(&mut lines, inline_math);
+            lines
+        })
         .collect();
     let body_lines: Vec<Vec<_>> = body_cells
         .iter()
         .map(|row| {
             row.iter()
                 .zip(widths.iter())
-                .map(|(cell, width)| wrap_styled(cell.clone(), *width))
+                .map(|((cell, inline_math), width)| {
+                    let mut lines = wrap_styled(cell.clone(), *width);
+                    crate::math::place_inline_math(&mut lines, inline_math);
+                    lines
+                })
                 .collect()
         })
         .collect();
@@ -706,7 +839,7 @@ fn render_table(
                         .unwrap_or_default();
                     let used = content
                         .iter()
-                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                        .map(|span| str_width(span.content.as_ref()))
                         .sum::<usize>();
                     spans.push(Span::raw(" ".to_string()));
                     spans.extend(content);
@@ -771,7 +904,7 @@ fn wrap_words(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<
     let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
     let mut current: Vec<(char, Style)> = Vec::new();
     let mut used = 0usize;
-    let width_of = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    let width_of = char_width;
     let break_line = |lines: &mut Vec<Vec<(char, Style)>>, current: &mut Vec<(char, Style)>, used: &mut usize| {
         while current.last().is_some_and(|(c, _)| *c == ' ') {
             current.pop();
@@ -833,7 +966,7 @@ fn wrap_styled(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
     let mut used = 0usize;
     for span in spans {
         for ch in span.content.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let cw = char_width(ch);
             if cw > 0 && used > 0 && used + cw > width {
                 lines.push(Line::from(std::mem::take(&mut current)));
                 used = 0;
@@ -988,5 +1121,55 @@ mod tests {
         // Not inside code.
         assert_eq!(text("`<!-- kept -->`"), ["<!-- kept -->"]);
         assert_eq!(text("```\n<!-- kept -->\n```")[1], "<!-- kept -->");
+    }
+
+    #[test]
+    fn ready_mermaid_math_and_pictures_emit_kitty_placeholders_with_source_map() {
+        let theme = Theme::default();
+        crate::images::enable_for_test((12, 24));
+        crate::mermaid::insert_ready_for_test(
+            "graph TD\nA-->B",
+            80,
+            &theme,
+            vec![1, 2, 3],
+            10,
+            3,
+        );
+        crate::math::insert_ready_for_test("E = mc^2", false, &theme, vec![4, 5, 6], 6, 2);
+        crate::math::insert_ready_for_test("x^2", true, &theme, vec![7, 8, 9], 2, 1);
+        crate::pictures::insert_markdown_ready_for_test(
+            "data:image/png;base64,AAAA",
+            80,
+            vec![10, 11, 12],
+            8,
+            2,
+        );
+
+        let md = concat!(
+            "# Inline $x^2$ math\n",
+            "\n",
+            "$$\nE = mc^2\n$$\n",
+            "\n",
+            "```mermaid\ngraph TD\nA-->B\n```\n",
+            "\n",
+            "![fig](data:image/png;base64,AAAA)"
+        );
+        let rendered = render_markdown_cell(md, 80, &theme);
+        assert_eq!(rendered.lines.len(), rendered.source_line_map.len());
+        let has_placeholder = |row: usize| {
+            rendered.lines[row]
+                .spans
+                .iter()
+                .any(|s| s.content.contains(crate::images::PLACEHOLDER))
+        };
+        assert!(has_placeholder(0), "heading inline math rendered");
+        assert!(has_placeholder(2) && has_placeholder(3), "display math rendered");
+        assert_eq!(rendered.source_line_map[2], 2);
+        assert!(has_placeholder(5) && has_placeholder(7), "mermaid diagram rendered");
+        assert_eq!(rendered.source_line_map[5], 6);
+        assert!(has_placeholder(9) && has_placeholder(10), "block picture rendered");
+        assert_eq!(rendered.source_line_map[9], 11);
+
+        let _ = crate::images::configure(crate::images::ImageMode::Off);
     }
 }

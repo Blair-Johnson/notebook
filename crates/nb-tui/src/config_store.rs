@@ -21,6 +21,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Debug)]
 pub struct CoreSettings {
+    pub images: crate::images::ImageMode,
     pub max_output_rows: u16,
     /// View for outputs whose cell has no view of its own.
     pub output_default_view: nb_core::OutputDisplay,
@@ -53,6 +54,7 @@ pub struct CoreSettings {
 impl Default for CoreSettings {
     fn default() -> Self {
         Self {
+            images: crate::images::ImageMode::Auto,
             max_output_rows: 18,
             output_default_view: nb_core::OutputDisplay::Preview,
             output_preview_end: nb_sdk::ClipEnd::Top,
@@ -496,6 +498,9 @@ fn build_snapshot(
         theme = theme.rehash();
     }
     let core = CoreSettings {
+        images: setting_text(&values, "display.images")
+            .and_then(|name| crate::images::ImageMode::from_name(&name))
+            .unwrap_or_default(),
         max_output_rows: setting_int(&values, "display.max_output_rows", 18)
             .clamp(0, u16::MAX as i64) as u16,
         output_default_view: setting_text(&values, "display.output_default_view")

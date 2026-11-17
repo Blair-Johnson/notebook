@@ -1046,6 +1046,9 @@ async fn prepare_kernel(
     command
         .current_dir(&spec.working_dir)
         .env("JPY_PARENT_PID", std::process::id().to_string())
+        // Force Matplotlib into IPython's non-interactive inline backend even
+        // when the user's shell exported a GUI backend (MacOSX, TkAgg, QtAgg).
+        .env("MPLBACKEND", "module://matplotlib_inline.backend_inline")
         .stdin(ProcessStdio::null())
         .stdout(ProcessStdio::piped())
         .stderr(ProcessStdio::piped())

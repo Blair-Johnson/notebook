@@ -77,6 +77,9 @@ impl ClipboardSink for SystemClipboard {
             ));
         }
         let sequence = format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()));
+        if crate::terminal_output::write_escape_via_active_writer(sequence.as_bytes()) {
+            return Ok(ClipboardBackend::Osc52);
+        }
         let mut stdout = io::stdout().lock();
         stdout
             .write_all(sequence.as_bytes())

@@ -47,6 +47,46 @@ use std::borrow::Cow;
 /// A formatter that has not finished by then is killed: formatting runs on
 /// the UI thread.
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(10);
+const SCROLL_IMAGE_SETTLE: Duration = Duration::from_millis(160);
+const MAX_READY_PER_TICK: usize = 48;
+
+#[derive(Debug, Default)]
+struct ImageSyncState {
+    last_scroll_input: Option<Instant>,
+    last_drawn_scroll: Option<u32>,
+    hidden_placeholder_ids: Vec<u32>,
+    missing_packet_placeholder: bool,
+    deferred_ready: Vec<String>,
+    deferred_mode_change: bool,
+    terminal_wake_pending: bool,
+    last_client_epoch: u64,
+}
+
+impl ImageSyncState {
+    fn note_scroll(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_scroll_input
+            .is_none_or(|prev| now.duration_since(prev) >= Duration::from_millis(2))
+        {
+            self.last_scroll_input = Some(now);
+        }
+    }
+
+    fn recently_scrolled(&self) -> bool {
+        self.last_scroll_input
+            .is_some_and(|at| at.elapsed() < SCROLL_IMAGE_SETTLE)
+    }
+
+    fn has_newly_sent_hidden_placeholders(
+        &self,
+        writer: &crate::terminal_output::TerminalWriter,
+    ) -> bool {
+        self.hidden_placeholder_ids
+            .iter()
+            .any(|&id| id != 0 && writer.is_image_sent(id))
+    }
+}
 
 /// How long a status-bar notice stays before the key hints come back.
 fn notice_ttl(core: &crate::config_store::CoreSettings) -> Duration {
@@ -143,7 +183,9 @@ pub struct Coordinator {
     pub registry: ExtensionRegistry,
     pub settings: SettingsStore,
     pub output_views: HashMap<OutputId, Box<dyn OutputView>>,
+    output_renderer_ids: HashMap<OutputId, &'static str>,
     pub layout_cache: LayoutCache,
+    image_sync: ImageSyncState,
     pub last_geometry: FrameGeometry,
     pub completion: Option<CompletionPopup>,
     pub signature: Option<SignaturePopup>,
@@ -215,6 +257,14 @@ impl Coordinator {
             settings
         };
         let disk_watch = MtimeWatch::spawn(path.clone());
+        let mut layout_cache = LayoutCache::default();
+        layout_cache.base_dir = path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        crate::pictures::set_notebook_dir(layout_cache.base_dir.clone());
         let mut coordinator = Self {
             path,
             document,
@@ -244,7 +294,9 @@ impl Coordinator {
             registry,
             settings,
             output_views: HashMap::new(),
-            layout_cache: LayoutCache::default(),
+            output_renderer_ids: HashMap::new(),
+            layout_cache,
+            image_sync: ImageSyncState::default(),
             last_geometry: FrameGeometry::default(),
             completion: None,
             signature: None,
@@ -842,12 +894,14 @@ impl Coordinator {
             MouseEventKind::ScrollUp => {
                 self.follow_focus = false;
                 self.user_scrolled = true;
+                self.image_sync.note_scroll();
                 self.scroll_row = self.scroll_row.saturating_sub(wheel_lines);
                 return;
             }
             MouseEventKind::ScrollDown => {
                 self.follow_focus = false;
                 self.user_scrolled = true;
+                self.image_sync.note_scroll();
                 self.scroll_row = self.scroll_row.saturating_add(wheel_lines);
                 return;
             }
@@ -1196,6 +1250,7 @@ impl Coordinator {
             self.notice = Some("could not save settings".into());
             changed = true;
         }
+        changed |= self.poll_images();
         let snap = self.settings.snapshot().clone();
         changed |= self.layout_cache.warm_idle_chunk(
             &self.document,
@@ -1270,13 +1325,198 @@ impl Coordinator {
         }
     }
 
-    pub fn on_resize(&mut self) {}
+    pub fn on_resize(&mut self) {
+        self.note_terminal_changed();
+    }
 
     pub fn on_focus_gained(&mut self) {
+        self.note_terminal_changed();
         if self.settings.poll_external_reload(&self.registry) {
             self.sync_settings();
         }
         self.check_external_disk_change(true);
+    }
+
+    pub fn sync_terminal_images(&mut self) {
+        let mode = self.settings.snapshot().core.images;
+        if crate::images::configure(mode) {
+            self.image_sync.deferred_mode_change = true;
+        }
+    }
+
+    pub fn note_terminal_changed(&mut self) {
+        self.image_sync.terminal_wake_pending = true;
+        if crate::images::terminal_changed() {
+            self.image_sync.deferred_mode_change = true;
+        }
+    }
+
+    pub fn is_scrolling_actively(&self) -> bool {
+        self.image_sync.recently_scrolled()
+    }
+
+    pub fn images_need_active_poll(
+        &self,
+        writer: &crate::terminal_output::TerminalWriter,
+    ) -> bool {
+        crate::images::probe_pending()
+            || crate::images::has_pending_jobs()
+            || crate::images::client_epoch() != self.image_sync.last_client_epoch
+            || self.image_sync.deferred_mode_change
+            || !self.image_sync.deferred_ready.is_empty()
+            || self.image_sync.recently_scrolled()
+            || self.image_sync.missing_packet_placeholder
+            || self.image_sync.has_newly_sent_hidden_placeholders(writer)
+    }
+
+    /// Collect asynchronous tmux probe updates and finished background images,
+    /// deferring layout invalidations while scrolling is active so viewport
+    /// gestures never jump mid-motion.
+    pub fn poll_images(&mut self) -> bool {
+        if crate::images::poll_probe() {
+            self.image_sync.deferred_mode_change = true;
+        }
+        let epoch = crate::images::client_epoch();
+        let client_reattached = epoch != self.image_sync.last_client_epoch;
+        if client_reattached {
+            self.image_sync.last_client_epoch = epoch;
+            self.image_sync.terminal_wake_pending = true;
+        }
+        let ready = crate::images::poll_prepared();
+        if !ready.is_empty() {
+            self.image_sync.deferred_ready.extend(ready);
+        }
+
+        if self.is_scrolling_actively() {
+            return client_reattached;
+        }
+
+        if self.image_sync.deferred_mode_change || self.image_sync.missing_packet_placeholder {
+            self.image_sync.deferred_mode_change = false;
+            self.image_sync.missing_packet_placeholder = false;
+            self.image_sync.deferred_ready.clear();
+            self.invalidate_all_rich_cells();
+            return true;
+        }
+
+        if self.image_sync.deferred_ready.is_empty() {
+            return client_reattached;
+        }
+
+        let take = self.image_sync.deferred_ready.len().min(MAX_READY_PER_TICK);
+        let batch: Vec<String> = self.image_sync.deferred_ready.drain(..take).collect();
+        let cell_ids: Vec<CellId> = self.document.order().to_vec();
+        for cell_id in cell_ids {
+            let Some(cell) = self.document.cell(&cell_id) else {
+                continue;
+            };
+            if cell.kind == CellKind::Markdown {
+                let src = cell.buffer.as_str();
+                if crate::builtins::markdown::may_contain_rich_media(src)
+                    && batch
+                        .iter()
+                        .any(|needle| !needle.is_empty() && src.contains(needle.as_str()))
+                {
+                    self.layout_cache.invalidate_cell(&cell_id);
+                }
+            }
+            let matching_outputs: Vec<OutputItem> = cell
+                .outputs
+                .iter()
+                .filter(|item| {
+                    batch.iter().any(|needle| {
+                        crate::builtins::rich::rich_output_matches_needle(item, needle)
+                    })
+                })
+                .cloned()
+                .collect();
+            for item in matching_outputs {
+                if let Some(view) = self.output_views.get_mut(&item.id) {
+                    let ctx = MountCtx {
+                        cell_id: cell_id.clone(),
+                        output_id: item.id,
+                    };
+                    view.on_output_updated(&item, &ctx);
+                }
+            }
+        }
+        true
+    }
+
+    fn invalidate_all_rich_cells(&mut self) {
+        let cell_ids: Vec<CellId> = self.document.order().to_vec();
+        for cell_id in cell_ids {
+            let Some(cell) = self.document.cell(&cell_id) else {
+                continue;
+            };
+            if cell.kind == CellKind::Markdown
+                && crate::builtins::markdown::may_contain_rich_media(cell.buffer.as_str())
+            {
+                self.layout_cache.invalidate_cell(&cell_id);
+            }
+            let outputs: Vec<OutputItem> = cell
+                .outputs
+                .iter()
+                .filter(|item| matches!(item.data, OutputData::Rich { .. }))
+                .cloned()
+                .collect();
+            for item in outputs {
+                if let Some(view) = self.output_views.get_mut(&item.id) {
+                    let ctx = MountCtx {
+                        cell_id: cell_id.clone(),
+                        output_id: item.id,
+                    };
+                    view.on_output_updated(&item, &ctx);
+                }
+            }
+        }
+    }
+
+    /// Render a frame into `terminal`, strip not-yet-uploaded `U+10EEEE`
+    /// placeholder cells so missing-glyph boxes never flash, and hand the
+    /// synchronized frame + visible image set to `TerminalWriter`.
+    pub fn draw_with_images(
+        &mut self,
+        terminal: &mut crate::terminal_output::AppTerminal,
+    ) -> std::io::Result<()> {
+        let writer = terminal.writer().clone();
+        let mut desired_visible = Vec::new();
+        let mut scrolling = false;
+        let _ = terminal.draw(|frame| {
+            self.draw(frame);
+            if let Some(previous) = self.image_sync.last_drawn_scroll.replace(self.scroll_row)
+                && previous != self.scroll_row
+            {
+                self.image_sync.note_scroll();
+            }
+            scrolling = self.is_scrolling_actively();
+            let buf = frame.buffer_mut();
+            if crate::images::enabled() {
+                let (visible, hidden_ids) = crate::images::collect_and_strip_placeholders(
+                    buf,
+                    |id| !writer.is_image_sent(id),
+                );
+                self.image_sync.missing_packet_placeholder = hidden_ids
+                    .iter()
+                    .any(|&id| id != 0 && crate::images::packets_for(id).is_none());
+                desired_visible = visible;
+                self.image_sync.hidden_placeholder_ids = hidden_ids;
+            } else {
+                self.image_sync.hidden_placeholder_ids.clear();
+                self.image_sync.missing_packet_placeholder = false;
+            }
+        })?;
+        writer.commit_frame(
+            desired_visible,
+            crate::images::enabled(),
+            crate::images::is_tmux(),
+            scrolling,
+        );
+        if self.image_sync.terminal_wake_pending {
+            self.image_sync.terminal_wake_pending = false;
+            writer.wake();
+        }
+        Ok(())
     }
 
     pub fn on_signal(&mut self, _signal_name: &str) {
@@ -1355,6 +1595,9 @@ impl Coordinator {
 
     fn sync_settings(&mut self) {
         let snap = self.settings.snapshot().clone();
+        if crate::images::configure(snap.core.images) {
+            self.image_sync.deferred_mode_change = true;
+        }
         self.grammar.insert_escape_chord = Duration::from_millis(snap.core.insert_escape_chord_ms);
         self.term_effects.set_mouse_capture(snap.core.mouse_capture);
         self.vim.indent_width = usize::from(snap.core.indent_width).max(1);
@@ -3566,18 +3809,19 @@ impl Coordinator {
     /// Mount a view for every output (call after changing outputs directly).
     pub fn remount_output_views(&mut self) {
         self.output_views.clear();
+        self.output_renderer_ids.clear();
         for cell in self.document.cells_in_order() {
             for item in &cell.outputs {
-                if let Some(view) = mount_view(&self.registry, &cell.id, item) {
-                    self.output_views.insert(item.id, view);
+                if let Some((renderer_id, view)) = mount_view(&self.registry, &cell.id, item) {
+                    let _ = self.output_renderer_ids.insert(item.id, renderer_id);
+                    let _ = self.output_views.insert(item.id, view);
                 }
             }
         }
     }
 
-    /// Tell views their outputs changed, mounting views for new outputs.
-    /// Appends only ever change the cell's last output; display updates
-    /// can change any of them.
+    /// Tell views their outputs changed, mounting views for new outputs and
+    /// remounting when `UpdateDisplayData` changes an output's winning MIME renderer.
     fn update_views_for_cell(&mut self, cell_id: &CellId, last_only: bool) {
         let Some(cell) = self.document.cell(cell_id) else {
             return;
@@ -3588,14 +3832,19 @@ impl Coordinator {
             0
         };
         for item in cell.outputs.iter().skip(skip) {
-            if let Some(view) = self.output_views.get_mut(&item.id) {
+            let wanted_id = best_renderer_id(&self.registry, item);
+            let current_id = self.output_renderer_ids.get(&item.id).copied();
+            if current_id == wanted_id
+                && let Some(view) = self.output_views.get_mut(&item.id)
+            {
                 let ctx = MountCtx {
                     cell_id: cell_id.clone(),
                     output_id: item.id,
                 };
                 view.on_output_updated(item, &ctx);
-            } else if let Some(view) = mount_view(&self.registry, cell_id, item) {
-                self.output_views.insert(item.id, view);
+            } else if let Some((renderer_id, view)) = mount_view(&self.registry, cell_id, item) {
+                let _ = self.output_renderer_ids.insert(item.id, renderer_id);
+                let _ = self.output_views.insert(item.id, view);
             }
         }
     }
@@ -3626,7 +3875,8 @@ impl Coordinator {
     fn clear_outputs(&mut self, cell_id: &CellId) {
         let cleared = self.document.clear_cell_outputs(cell_id);
         for item in cleared {
-            self.output_views.remove(&item.id);
+            let _ = self.output_views.remove(&item.id);
+            let _ = self.output_renderer_ids.remove(&item.id);
         }
     }
 
@@ -3642,7 +3892,8 @@ impl Coordinator {
             return;
         };
         for item in &outputs {
-            self.output_views.remove(&item.id);
+            let _ = self.output_views.remove(&item.id);
+            let _ = self.output_renderer_ids.remove(&item.id);
         }
         self.document.apply(DocOp::ClearOutputs {
             cleared: vec![(cell_id.clone(), outputs)],
@@ -4484,23 +4735,33 @@ impl OutputHost for CoordinatorOutputHost<'_> {
     }
 }
 
+fn best_renderer_index(registry: &ExtensionRegistry, item: &OutputItem) -> Option<usize> {
+    registry
+        .output_renderers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, renderer)| renderer.can_render(item).map(|priority| (priority, index)))
+        .max_by_key(|(priority, index)| (*priority, *index))
+        .map(|(_, index)| index)
+}
+
+fn best_renderer_id(registry: &ExtensionRegistry, item: &OutputItem) -> Option<&'static str> {
+    best_renderer_index(registry, item).map(|index| registry.output_renderers[index].id())
+}
+
 /// Mount a view from the highest-priority renderer that accepts `item`.
 fn mount_view(
     registry: &ExtensionRegistry,
     cell_id: &CellId,
     item: &OutputItem,
-) -> Option<Box<dyn OutputView>> {
-    let (_, renderer) = registry
-        .output_renderers
-        .iter()
-        .enumerate()
-        .filter_map(|(index, renderer)| renderer.can_render(item).map(|priority| (priority, index)))
-        .max_by_key(|(priority, index)| (*priority, *index))?;
+) -> Option<(&'static str, Box<dyn OutputView>)> {
+    let renderer = best_renderer_index(registry, item)?;
     let ctx = MountCtx {
         cell_id: cell_id.clone(),
         output_id: item.id,
     };
-    Some(registry.output_renderers[renderer].mount(item, &ctx))
+    let entry = &registry.output_renderers[renderer];
+    Some((entry.id(), entry.mount(item, &ctx)))
 }
 
 fn wire_output_item(payload: WireOutput, late: bool) -> OutputItem {

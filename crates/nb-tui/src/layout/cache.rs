@@ -1,6 +1,6 @@
 //! `CellId`-keyed layout cache with 64 MiB LRU eviction, idle resize warming, and per-line syntax cache.
 
-use crate::builtins::markdown::render_markdown_cell;
+use crate::builtins::markdown::render_markdown_cell_with_base_dir;
 use crate::layout::{CardRows, output_cap, output_sections};
 use crate::layout::fenwick::FenwickTree;
 use ratatui::{
@@ -9,6 +9,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
+use std::path::PathBuf;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{HighlightState, Highlighter, Theme as SyntectTheme, ThemeSet};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
@@ -24,6 +25,7 @@ pub struct CellLayoutKey {
     pub output_views_rev: u64,
     pub width: u16,
     pub theme_rev: u64,
+    pub image_epoch: u64,
     /// Markdown shown as raw source (while it is being edited).
     pub raw_source: bool,
     pub default_view: OutputDisplay,
@@ -96,6 +98,8 @@ pub struct LayoutCache {
     pub default_output_view: OutputDisplay,
     /// `display.output_preview_end`, set by the caller before syncing.
     pub preview_end: ClipEnd,
+    /// Base directory for resolving relative markdown image paths.
+    pub base_dir: Option<PathBuf>,
 }
 
 struct LineHighlights {
@@ -127,11 +131,16 @@ impl Default for LayoutCache {
             line_highlights: HashMap::new(),
             default_output_view: OutputDisplay::Preview,
             preview_end: ClipEnd::default(),
+            base_dir: None,
         }
     }
 }
 
 impl LayoutCache {
+    pub fn invalidate_cell(&mut self, cell_id: &CellId) {
+        let _ = self.cells.remove(cell_id);
+    }
+
     pub fn heights(&self) -> &FenwickTree {
         &self.heights
     }
@@ -242,11 +251,17 @@ impl LayoutCache {
         let cell = doc.cell(cell_id)?;
         let output_views_rev = Self::output_revision(cell, output_views);
         let raw_source = cell.kind == CellKind::Markdown && editing == Some(cell_id);
+        let image_epoch = if cell.kind == CellKind::Markdown {
+            crate::images::layout_epoch()
+        } else {
+            0
+        };
         let key = CellLayoutKey {
             revs: cell.revs,
             output_views_rev,
             width,
             theme_rev: theme.revision,
+            image_epoch,
             raw_source,
             default_view: self.default_output_view,
             preview_rows: max_output_rows,
@@ -359,7 +374,12 @@ impl LayoutCache {
         raw_source: bool,
     ) -> (Vec<Line<'static>>, Vec<usize>) {
         if cell.kind == CellKind::Markdown && !raw_source {
-            let rendered = render_markdown_cell(cell.buffer.as_str(), width, theme);
+            let rendered = render_markdown_cell_with_base_dir(
+                cell.buffer.as_str(),
+                width,
+                theme,
+                self.base_dir.as_deref(),
+            );
             return (rendered.lines, rendered.source_line_map);
         }
         let mut lines = Vec::new();

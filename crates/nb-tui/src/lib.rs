@@ -14,13 +14,18 @@ pub mod coordinator;
 pub mod focus;
 pub mod grammar;
 pub mod highlight;
+pub mod images;
 pub mod intelligence;
 pub mod keymap;
 pub mod layout;
+pub mod math;
+pub mod mermaid;
 pub mod overlays;
+pub mod pictures;
 pub mod platform;
 pub mod render;
 pub mod scroll;
+pub mod terminal_output;
 pub mod vim;
 
 pub use builtins::BuiltinsPlugin;

@@ -9,8 +9,6 @@ mod watchdog;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
-use crossterm::queue;
-use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use futures::FutureExt;
 use std::fs;
 use std::path::PathBuf;
@@ -19,6 +17,7 @@ use nb_core::{CellKind, Document, FormatBacking};
 use nb_kernel::{KernelLaunchSpec, LocalZmqKernel};
 use nb_sdk::ExtensionRegistry;
 use nb_tui::platform::SystemClipboard;
+use nb_tui::terminal_output::AppTerminal;
 use nb_tui::{BuiltinsPlugin, Coordinator, Effect, SettingsStore};
 
 #[derive(Parser, Debug)]
@@ -121,22 +120,15 @@ async fn main() -> Result<()> {
     coordinator.check_autosave_recovery();
 
     let mouse_capture = coordinator.settings.snapshot().core.mouse_capture;
-    let mut terminal = ratatui::init();
-    terminal::clear_screen();
-    terminal::enter_extras(mouse_capture);
+    let mut terminal = terminal::init_app_terminal(mouse_capture)?;
+    coordinator.sync_terminal_images();
 
     let result =
         std::panic::AssertUnwindSafe(run_loop(&mut terminal, &mut coordinator, mouse_capture))
             .catch_unwind()
             .await;
 
-    terminal::leave_extras();
-    terminal::reset_cursor_shape();
-    let _ = ratatui::try_restore();
-    let _ = terminal.show_cursor();
-    // `Terminal::drop` reports restoration errors with `eprintln!`; on a closed
-    // PTY that can panic again through ratatui's panic hook.
-    std::mem::forget(terminal);
+    terminal::restore_app_terminal(terminal);
 
     // Usually the terminal closed mid-draw or mid-read.
     if !matches!(result, Ok(Ok(()))) {
@@ -183,11 +175,13 @@ mod tests {
 }
 
 async fn run_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
 ) -> Result<()> {
     let mut input = input::InputReader::spawn();
+    let mut image_tick = tokio::time::interval(FRAME_INTERVAL);
+    image_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fast_tick = tokio::time::interval(Duration::from_millis(50));
     fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let autosave_secs = coordinator.settings.snapshot().core.autosave_secs.max(1);
@@ -243,13 +237,22 @@ async fn run_loop(
                 )?;
                 redraw = !coordinator.should_quit;
             }
+            _ = image_tick.tick(), if coordinator.images_need_active_poll(terminal.writer()) || terminal.writer().has_newly_sent() => {
+                kind = "images";
+                dog.enter(watchdog::Phase::Tick);
+                started = Instant::now();
+                let newly_sent = terminal.writer().take_newly_sent();
+                let polled = coordinator.poll_images();
+                redraw = newly_sent || polled;
+            }
             // Ticks before kernel events: they are rarely ready, and a flood
             // of output must not starve them (autosave, notices).
             _ = fast_tick.tick() => {
                 kind = "tick";
                 dog.enter(watchdog::Phase::Tick);
                 started = Instant::now();
-                redraw = coordinator.on_tick(Instant::now());
+                let newly_sent = terminal.writer().take_newly_sent();
+                redraw = coordinator.on_tick(Instant::now()) || newly_sent;
             }
             _ = autosave_tick.tick() => {
                 kind = "autosave";
@@ -284,8 +287,11 @@ async fn run_loop(
         }
         let handled = started.elapsed();
         if redraw && !coordinator.should_quit {
-            // Input draws at once; output and ticks at most once a frame.
-            if kind == "input" || last_draw.elapsed() >= FRAME_INTERVAL {
+            // Input draws at once; output and ticks at most once a frame when
+            // the previous differential frame has drained.
+            if kind == "input"
+                || (!terminal.writer().is_busy() && last_draw.elapsed() >= FRAME_INTERVAL)
+            {
                 dog.enter(watchdog::Phase::Draw);
                 draw_frame(terminal, coordinator)?;
                 last_draw = Instant::now();
@@ -384,7 +390,7 @@ impl LoopTrace {
 /// Handle `first` and everything else already queued, then draw once: a
 /// burst of trackpad scroll events costs one frame, not one per event.
 fn handle_terminal_events(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
     input: &mut input::InputReader,
@@ -434,7 +440,7 @@ fn dispatch_event(coordinator: &mut Coordinator, event: Event) -> Effect {
 }
 
 fn handle_effect(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
     input: &input::InputReader,
@@ -478,19 +484,17 @@ fn editor_name() -> String {
 
 /// Open the config file itself at `line`; saving it reloads the controls.
 fn edit_config(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
     path: &std::path::Path,
     line: usize,
 ) -> Result<()> {
     let editor = editor_name();
-    terminal::leave_extras();
-    ratatui::restore();
+    terminal::suspend_for_editor(terminal);
     let status = editor::editor_command_at(&editor, path, line).status();
-    *terminal = ratatui::init();
-    terminal::clear_screen();
-    terminal::enter_extras(mouse_capture);
+    terminal::resume_from_editor(terminal, mouse_capture)?;
+    coordinator.note_terminal_changed();
     match status {
         Ok(status) if status.success() => {}
         Ok(status) if status.code() == Some(127) => {
@@ -506,22 +510,15 @@ fn edit_config(
 }
 
 fn draw_frame(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
 ) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    let begin = queue!(&mut stdout, BeginSynchronizedUpdate);
-    let drawn = terminal.draw(|frame| coordinator.draw(frame));
-    // Always attempt to close the synchronized update, even when drawing fails.
-    let end = crossterm::execute!(&mut stdout, EndSynchronizedUpdate);
-    begin?;
-    drawn?;
-    end?;
+    coordinator.draw_with_images(terminal)?;
     Ok(())
 }
 
 fn external_edit(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut AppTerminal,
     coordinator: &mut Coordinator,
     mouse_capture: bool,
     cell_id: nb_core::CellId,
@@ -542,14 +539,12 @@ fn external_edit(
         let _ = fs::remove_file(&temp_path);
         coordinator.notice = Some(format!("could not prepare external editor: {error}"));
         return Ok(());
-    }
+    };
 
-    terminal::leave_extras();
-    ratatui::restore();
+    terminal::suspend_for_editor(terminal);
     let status = editor::editor_command(&editor, &temp_path).status();
-    *terminal = ratatui::init();
-    terminal::clear_screen();
-    terminal::enter_extras(mouse_capture);
+    terminal::resume_from_editor(terminal, mouse_capture)?;
+    coordinator.note_terminal_changed();
 
     match status {
         Ok(status) if status.success() => match fs::read_to_string(&temp_path) {
